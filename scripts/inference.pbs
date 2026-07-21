@@ -1,0 +1,32 @@
+#!/bin/bash 
+#PBS -l walltime=24:00:00 
+#PBS -l mem=96GB 
+#PBS -l ncpus=12
+#PBS -l ngpus=1
+#PBS -l jobfs=10GB 
+#PBS -l storage=gdata/dk92+scratch/er8
+#PBS -l other=hyperthread 
+#PBS -q gpuhopper
+#PBS -P er8 
+#PBS -o /home/548/cd3022/repos/solar-nowcast/CPDiT/outputs/logs/training-hopper.log
+#PBS -j oe 
+
+
+
+# Set up directories
+cd /home/548/cd3022/repos/solar-nowcast/CPDiT
+
+# PBS Job Script for training CPDiT on HPC cluster
+source hpc_setup.sh
+
+
+# Run inference
+echo "Starting CPDiT inference on GPU..."
+python scripts/inference.py \
+    --checkpoint outputs/checkpoints/best_model.pt \
+    --data-paths /path/to/himawari/test/ \
+    --forecast-steps 6 \
+    --output-dir outputs/predictions \
+    --device cuda
+
+echo "Inference job completed!"

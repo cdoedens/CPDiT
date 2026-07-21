@@ -1,0 +1,32 @@
+#!/bin/bash 
+#PBS -l walltime=1:00:00 
+#PBS -l mem=96GB 
+#PBS -l ncpus=12
+#PBS -l ngpus=1
+#PBS -l jobfs=10GB 
+#PBS -l storage=gdata/dk92+scratch/er8
+#PBS -l other=hyperthread 
+#PBS -q gpuvolta
+#PBS -P er8 
+#PBS -o /home/548/cd3022/repos/solar-nowcast/CPDiT/outputs/logs/inference_single_day.log
+#PBS -j oe 
+
+
+
+# Set up directories
+cd /home/548/cd3022/repos/solar-nowcast/CPDiT
+
+# PBS Job Script for training CPDiT on HPC cluster
+source hpc_setup.sh
+
+
+# Run inference
+echo "Starting CPDiT inference on GPU..."
+python scripts/inference_single_day.py \
+  --checkpoint /scratch/er8/cd3022/CPDiT/checkpoints/checkpoint_epoch_005.pt \
+  --split val \
+  --date 2021-01-01 \
+  --max-samples 12 \
+  --output-dir outputs/inference_single_day
+
+echo "Inference single day job completed!"

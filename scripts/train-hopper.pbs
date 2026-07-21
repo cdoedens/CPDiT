@@ -1,0 +1,29 @@
+#!/bin/bash 
+#PBS -l walltime=48:00:00 
+#PBS -l mem=1022GB 
+#PBS -l ncpus=48
+#PBS -l ngpus=4
+#PBS -l jobfs=10GB 
+#PBS -l storage=gdata/dk92+scratch/er8
+#PBS -l other=hyperthread 
+#PBS -q gpuhopper
+#PBS -P er8 
+#PBS -o /home/548/cd3022/repos/solar-nowcast/CPDiT/outputs/logs/training-hopper.log
+#PBS -j oe 
+
+
+
+# Set up directories
+cd /home/548/cd3022/repos/solar-nowcast/CPDiT
+
+# PBS Job Script for training CPDiT on HPC cluster
+source hpc_setup.sh
+
+
+# Run training
+echo "Starting CPDiT training on GPU..."
+python -m src.training.train \
+    --config configs/train_config.yaml \
+    --device cuda
+
+echo "Training job completed!"

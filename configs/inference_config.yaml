@@ -1,0 +1,24 @@
+# Inference Configuration for Latent Diffusion Transformer
+
+# Model
+model:
+  checkpoint_path: outputs/checkpoints/best_model.pt
+  device: cuda
+
+# Inference Parameters
+inference:
+  num_forecast_steps: 6
+  num_samples: 1  # Number of diffusion samples
+  batch_size: 32
+  autoregressive: false
+
+# Input/Output
+io:
+  input_data_path: /path/to/input/data/
+  output_path: outputs/predictions/
+  save_format: netcdf  # netcdf or h5
+
+# Data Configuration
+data:
+  context_length: 12
+  channels: ['TBD']  # HIMAWARI channels to use

@@ -1,0 +1,160 @@
+
+model:
+  image_channels: 5
+  image_size: 256                # Spatial size of input patches (H = W)
+  latent_dim: 256                # VAE latent vector dimension
+  hidden_dim: 256                # VAE conv base channel width (D → 2D → 4D)
+
+  transformer:
+    num_layers: 4                # Depth of the temporal transformer
+    num_heads: 8                 # Number of attention heads
+    feedforward_dim: 1024        # FFN width inside each transformer layer
+    dropout: 0.1
+    max_seq_len: 64              # Must be >= context_length + forecast_length
+
+  diffusion:
+    num_steps: 1000              # Total diffusion timesteps T
+    denoiser_hidden_dim: 512     # Hidden width of the DenoiserNetwork MLP
+    beta_schedule: cosine        # cosine (Nichol & Dhariwal 2021) or linear
+
+  inference:
+    ddim_steps: 50               # Denoising steps at inference (~20x faster than DDPM)
+    eta: 0.0                     # 0.0 = deterministic, 1.0 = stochastic DDPM
+    num_ensemble_members: 1      # Set >1 to generate probabilistic ensembles
+
+
+data:
+  context_length: 12             # Number of past satellite frames (12 x 10min = 2hr)
+  forecast_length: 6             # Number of future frames to predict (6 x 10min = 1hr)
+  satellite_timestep_min: 10     # Temporal resolution of heliosat data (minutes)
+
+
+  heliosat_vars:
+    - surface_global_irradiance
+    - cloud_optical_depth
+    - solar_elevation 
+
+  barra_vars:
+    - KI
+    - hus500
+
+  # File paths
+  heliosat:
+    train: /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/train/
+    val:   /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/val/
+    test:  /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/test/
+
+  barra:
+    train: /scratch/er8/cd3022/CPDiT/DiT_data/barra/train/
+    val:   /scratch/er8/cd3022/CPDiT/DiT_data/barra/val/
+    test:  /scratch/er8/cd3022/CPDiT/DiT_data/barra/test/
+
+  # Precomputed assets
+  regrid_weights:
+    barra_to_heliosat: /scratch/er8/cd3022/CPDiT/regridders/barra_to_heliosat.nc
+
+  normalisation_stats:
+    heliosat: /scratch/er8/cd3022/CPDiT/stats/heliosat_stats.json
+    barra:    /scratch/er8/cd3022/CPDiT/stats/barra_stats.json
+
+  valid_timestamps:
+    train: /scratch/er8/cd3022/CPDiT/index/train_index.parquet
+    val:   /scratch/er8/cd3022/CPDiT/index/val_index.parquet
+    test:  /scratch/er8/cd3022/CPDiT/index/test_index.parquet
+
+  # DataLoader settings
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2             # Batches to prefetch per worker
+
+# -----------------------------------------------------------------------------
+# Training stages
+# Two-stage LDM recipe (Rombach et al. 2022):
+#   Stage 1 — train VAE alone until reconstruction loss converges
+#   Stage 2 — freeze VAE, train diffusion model in latent space
+# -----------------------------------------------------------------------------
+training:
+  stage: 2                       # 1 = VAE only, 2 = diffusion (VAE frozen)
+  freeze_vae: true               # Must be true when stage: 2
+  seed: 42
+
+  # Batch sizes — may need reducing if GPU memory is tight at 256x256
+  batch_size:
+    stage1: 32
+    stage2: 16
+
+  # Epochs
+  max_epochs:
+    stage1: 100
+    stage2: 200
+
+  early_stopping:
+    enabled: true
+    patience: 20                 # Epochs without improvement before stopping
+    monitor: val_loss            # Metric to monitor
+
+  # Gradient clipping — important for transformer stability
+  gradient_clip_norm: 1.0
+
+  # Mixed precision — recommended for A100/V100 GPUs on Gadi
+  mixed_precision: true          # Uses torch.cuda.amp automatically
+
+  # Checkpoint settings
+  checkpoint_dir: /scratch/er8/cd3022/CPDiT/checkpoints/
+  save_every_n_epochs: 5
+  keep_last_n_checkpoints: 3
+  resume_from: null              # Set to a checkpoint path to resume training
+
+# -----------------------------------------------------------------------------
+# Optimiser
+# -----------------------------------------------------------------------------
+optimiser:
+  name: adamw
+  stage1:
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+  stage2:
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]         # beta2=0.999 is standard for diffusion models
+
+  scheduler:
+    name: cosine_annealing      # Smooth LR decay over training
+    warmup_epochs: 5            # Linear warmup from 0 to lr over first 5 epochs
+    min_lr: 1.0e-6              # Floor for cosine decay
+
+# -----------------------------------------------------------------------------
+# Logging and evaluation
+# -----------------------------------------------------------------------------
+logging:
+  project_name: CPDiT
+  experiment_name: stage2_256px_12ctx_6fcast
+  log_dir: /scratch/er8/cd3022/CPDiT/logs/
+  log_every_n_steps: 50
+
+  # Metrics to track at validation time
+  metrics:
+    - mse
+    - mae
+    - ssim                      # Structural similarity — better for image quality
+    - crps                      # Continuous ranked probability score for ensembles
+
+  # Log sample forecast images to wandb/tensorboard every N epochs
+  visualise_every_n_epochs: 5
+  num_visualisation_samples: 4  # Number of sequences to visualise
+
+# -----------------------------------------------------------------------------
+# HPC / Gadi job settings
+# (used by scripts/train.pbs to set resource requests)
+# -----------------------------------------------------------------------------
+hpc:
+  ncpus: 8
+  ngpus: 4
+  mem_gb: 128
+  walltime: "48:00:00"
+  queue: gpuvolta
+  project: er8
+  modules:
+    - cuda/12.2
+    - python3/3.11

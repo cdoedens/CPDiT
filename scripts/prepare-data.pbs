@@ -1,0 +1,19 @@
+#!/bin/bash 
+#PBS -l walltime=1:00:00 
+#PBS -l mem=128GB 
+#PBS -l ncpus=48 
+#PBS -l jobfs=10GB 
+#PBS -l storage=gdata/dk92+gdata/rt52+scratch/nf33+gdata/rv74+gdata/rq0+gdata/ra22+gdata/xp65+gdata/er8+scratch/er8+gdata/ob53 
+#PBS -l other=hyperthread 
+#PBS -q normal 
+#PBS -P er8 
+#PBS -o /home/548/cd3022/repos/solar-nowcast/CPDiT/outputs/logs/prepare-data.oe
+#PBS -j oe 
+
+cd /home/548/cd3022/repos/solar-nowcast 
+
+source env.sh 
+
+python3 CPDiT/scripts/prepare-data.py val
+
+python3 CPDiT/scripts/prepare-data.py test
