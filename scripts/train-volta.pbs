@@ -8,13 +8,13 @@
 #PBS -l other=hyperthread 
 #PBS -q gpuvolta 
 #PBS -P er8 
-#PBS -o /home/548/cd3022/repos/solar-nowcast/CPDiT/outputs/logs/training-volta.log
+#PBS -o /home/548/cd3022/repos/CPDiT/outputs/logs/training-volta.log
 #PBS -j oe 
 
 
 
 # Set up directories
-cd /home/548/cd3022/repos/solar-nowcast/CPDiT
+cd /home/548/cd3022/repos/CPDiT
 
 # PBS Job Script for training CPDiT on HPC cluster
 source hpc_setup.sh
