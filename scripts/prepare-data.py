@@ -8,6 +8,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import sys, os
 import json
+import yaml
 
 from metpy.calc import dewpoint_from_specific_humidity
 from metpy.units import units
@@ -33,12 +34,11 @@ lat_max=-28.5
 lon_min=145
 lon_max=151.5
 
+with open(f"/home/548/cd3022/repos/CPDiT/configs/train_config.yaml") as f:
+    config = yaml.safe_load(f)
+
 # VARS FROM HIMAWARI HELIOSAT
-helio_vars = [
-    'surface_global_irradiance',
-    'cloud_optical_depth',
-    'solar_elevation',
-]
+helio_vars = config["data"]["heliosat_vars"]
 
 # STANDARD BARRA VARS
 std_vars = [
@@ -64,6 +64,14 @@ conv_vars = [
     'FZL',
     'MULCL'
 ]
+
+# BARRA VARS FOR MODEL
+# (separate from above, to allow for vars like KI to be calculated)
+barra_vars = config["data"]["barra_vars"]
+
+# TIMESTEPS NEEDED
+context_length  = config["data"]["context_length"]
+forecast_length = config["data"]["forecast_length"]
 
 #################################################################################
 # Functions to load and process data
@@ -283,7 +291,21 @@ if __name__ == "__main__":
     os.makedirs(helio_data_dir, exist_ok=True)
     os.makedirs(bar_data_dir, exist_ok=True)
 
-    for month in range(1, 13):
+    ####################################################################################
+    #!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!
+    ####################################################################################
+    '''
+    !!!
+    '''
+    # REDUCED TO ONE MONTH FOR QUICK TESTING
+    '''
+    !!!
+    '''
+    ####################################################################################
+    #!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!
+    ####################################################################################
+
+    for month in range(1, 2):
         
         date = f"{year}-{month:02d}"
 
@@ -313,7 +335,7 @@ if __name__ == "__main__":
         # load BARRA-R2 data
         bar = get_barra(date, std_vars, conv_vars, lat_min, lat_max, lon_min, lon_max)
 
-        bar = bar[['KI', 'hus500']] # start with small subset of vars
+        bar = bar[barra_vars] # start with small subset of vars
 
 
 

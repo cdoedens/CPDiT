@@ -1,5 +1,5 @@
 #!/bin/bash 
-#PBS -l walltime=1:00:00 
+#PBS -l walltime=2:00:00 
 #PBS -l mem=128GB 
 #PBS -l ncpus=48 
 #PBS -l jobfs=10GB 
@@ -7,13 +7,13 @@
 #PBS -l other=hyperthread 
 #PBS -q normal 
 #PBS -P er8 
-#PBS -o /home/548/cd3022/repos/solar-nowcast/CPDiT/outputs/logs/prepare-data.oe
+#PBS -o /home/548/cd3022/repos/CPDiT/outputs/logs/prepare-data.log
 #PBS -j oe 
 
-cd /home/548/cd3022/repos/solar-nowcast 
+cd /home/548/cd3022/repos/CPDiT 
 
-source env.sh 
+source hpc_setup.sh 
 
-python3 CPDiT/scripts/prepare-data.py val
-
-python3 CPDiT/scripts/prepare-data.py test
+python3 scripts/prepare-data.py train
+python3 scripts/prepare-data.py val
+python3 scripts/prepare-data.py test
