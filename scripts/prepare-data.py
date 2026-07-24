@@ -14,6 +14,7 @@ from metpy.calc import dewpoint_from_specific_humidity
 from metpy.units import units
 
 from dask.distributed import Client
+import dask.array as da
 
 import pvlib
 
@@ -331,7 +332,7 @@ if __name__ == "__main__":
     helio_list = []
     barra_list = []
     print("Starting month loop")
-    for month in range(1, 13):
+    for month in range(1, 7):
         
         date = f"{year}-{month:02d}"
     
@@ -347,7 +348,7 @@ if __name__ == "__main__":
         # himawari has some data from the previous UTC day, because of the AEST day. This aligns it with BARRA
         helio = helio.sel(time=slice(f"{date}-01", None))
         # chunk over time
-        helio = helio.chunk({'time':300, 'latitude':-1, 'longitude':-1})
+        
         # fill missing timestep
         helio = interp_himawari_gaps(helio) 
         
@@ -377,6 +378,13 @@ if __name__ == "__main__":
     
     full_helio = xr.concat(helio_list, dim='time')
     full_barra = xr.concat(barra_list, dim='time')
+
+    # Force Dask to reconcile the chunk graph from the concat seams
+    for var in full_helio.data_vars:
+        full_helio[var].data = da.rechunk(full_helio[var].data, chunks=(300, 256, 256))
+    for var in full_barra.data_vars:
+        full_barra[var].data = da.rechunk(full_barra[var].data, chunks=(10_000, full_barra.sizes['lat'], full_barra.sizes['lon']))
+
     
     # UPDATED TO ZARR
     helio_file_name = zarr_dir / f"heliosat_{dit_dataset}.zarr"
