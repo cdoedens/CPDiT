@@ -3,7 +3,7 @@ model:
   image_channels: 3
   image_size: 256                # Spatial size of input patches (H = W)
   latent_dim: 256                # VAE latent vector dimension
-  hidden_dim: 256                # VAE conv base channel width (D → 2D → 4D)
+  hidden_dim: 64                # VAE conv base channel width (D → 2D → 4D)
 
   transformer:
     num_layers: 4                # Depth of the temporal transformer
@@ -47,15 +47,15 @@ data:
     test:  /scratch/er8/cd3022/CPDiT/DiT_data/zarr/barra_test.zarr
 
   # File paths (REMOVE LATER, AND CONVERT TO ZARR ONLY)
-  heliosat:
-    train: /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/train/
-    val:   /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/val/
-    test:  /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/test/
+  # heliosat:
+  #   train: /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/train/
+  #   val:   /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/val/
+  #   test:  /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/test/
 
-  barra:
-    train: /scratch/er8/cd3022/CPDiT/DiT_data/barra/train/
-    val:   /scratch/er8/cd3022/CPDiT/DiT_data/barra/val/
-    test:  /scratch/er8/cd3022/CPDiT/DiT_data/barra/test/
+  # barra:
+  #   train: /scratch/er8/cd3022/CPDiT/DiT_data/barra/train/
+  #   val:   /scratch/er8/cd3022/CPDiT/DiT_data/barra/val/
+  #   test:  /scratch/er8/cd3022/CPDiT/DiT_data/barra/test/
 
   # Precomputed assets
   regrid_weights:
@@ -64,6 +64,7 @@ data:
   normalisation_stats:
     heliosat: /scratch/er8/cd3022/CPDiT/stats/heliosat_stats.json
     barra:    /scratch/er8/cd3022/CPDiT/stats/barra_stats.json
+    barra_quantile_transforms: /scratch/er8/cd3022/CPDiT/stats/barra_quantile_transforms.pkl
 
   valid_timestamps:
     train: /scratch/er8/cd3022/CPDiT/index/train_index.parquet
@@ -85,6 +86,9 @@ training:
   stage: 1                       # 1 = VAE only, 2 = diffusion (VAE frozen)
   freeze_vae: false               # Must be true when stage: 2
   seed: 42
+  # Mixed precision — recommended for A100/V100 GPUs on Gadi
+  # set to false when stage: 1
+  mixed_precision: false          # Uses torch.cuda.amp automatically
 
   # Batch sizes — may need reducing if GPU memory is tight at 256x256
   batch_size:
@@ -107,8 +111,7 @@ training:
   # Gradient clipping — important for transformer stability
   gradient_clip_norm: 1.0
 
-  # Mixed precision — recommended for A100/V100 GPUs on Gadi
-  mixed_precision: true          # Uses torch.cuda.amp automatically
+
 
   # Checkpoint settings
   checkpoint_dir: /scratch/er8/cd3022/CPDiT/checkpoints/

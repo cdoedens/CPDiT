@@ -132,7 +132,7 @@ class Trainer:
         with torch.cuda.amp.autocast(enabled=self.use_amp):
             x_recon, mu, logvar = self.model.vae(flat_images)
             loss, _, _ = self.model.vae.vae_loss(
-                flat_images, x_recon, mu, logvar, beta=1.0
+                flat_images, x_recon, mu, logvar, beta=0.01
             )
         return loss
 
@@ -147,14 +147,14 @@ class Trainer:
     # ------------------------------------------------------------------ #
 
     def train_epoch(self, train_loader: DataLoader) -> float:
-        """Train one epoch, return mean loss."""
         self.model.train()
         total_loss = 0.0
         pbar = tqdm(train_loader, desc="Training")
-
+    
         for context, forecast in pbar:
             context  = context.to(self.device)
             forecast = forecast.to(self.device)
+            
             self.optimizer.zero_grad()
 
             if self.stage == 1:
@@ -178,25 +178,36 @@ class Trainer:
 
         return total_loss / max(1, len(train_loader))
 
+    def _stage1_step_eval(self, context: torch.Tensor, forecast: torch.Tensor) -> torch.Tensor:
+        """Deterministic VAE forward for validation — uses mu directly, no sampling."""
+        images      = torch.cat([context, forecast], dim=1)
+        flat_images = images.reshape(-1, *images.shape[2:])
+        beta        = self.config["training"].get("vae_beta", 0.01)
+    
+        with torch.cuda.amp.autocast(enabled=False):
+            mu, logvar  = self.model.vae.encode(flat_images)
+            x_recon     = self.model.vae.decode(mu)           # use mu, not sampled z
+            loss, recon_loss, kl_loss = self.model.vae.vae_loss(
+                flat_images, x_recon, mu, logvar, beta=beta
+            )
+    
+        return loss
+    
     def validate(self, val_loader: Optional[DataLoader]) -> Optional[float]:
-        """Validate the current model, return mean loss."""
-        if val_loader is None:
-            return None
-
         self.model.eval()
         total_loss = 0.0
         with torch.no_grad():
             for context, forecast in tqdm(val_loader, desc="Validation"):
                 context  = context.to(self.device)
                 forecast = forecast.to(self.device)
-
+    
                 if self.stage == 1:
-                    loss = self._stage1_step(context, forecast)
+                    loss = self._stage1_step_eval(context, forecast)
                 else:
                     loss = self._stage2_step(context, forecast)
-
+    
                 total_loss += loss.item()
-
+    
         return total_loss / max(1, len(val_loader))
 
     # ------------------------------------------------------------------ #

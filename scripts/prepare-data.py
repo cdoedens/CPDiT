@@ -1,19 +1,21 @@
 import xarray as xr
 import matplotlib.pyplot as plt
 from pathlib import Path
-from dask.distributed import Client
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 import sys, os
 import json
 import yaml
+import xesmf as xe
+import shutil
 
 from metpy.calc import dewpoint_from_specific_humidity
 from metpy.units import units
 
-import xesmf as xe
+from dask.distributed import Client
 
+import pvlib
 
 dit_dataset = sys.argv[1]
 
@@ -22,7 +24,6 @@ ds_to_year = {
     "val": 2021,
     "test": 2022,
 }
-
 year = ds_to_year[dit_dataset]
 
 ##################################################################################
@@ -72,6 +73,22 @@ barra_vars = config["data"]["barra_vars"]
 context_length  = config["data"]["context_length"]
 forecast_length = config["data"]["forecast_length"]
 
+# USE TO FILTER TIMESTEPS WITH LOW SOLAR ELEVATION
+syd_lat = -31.75
+syd_lon = 148.25
+
+all_times = pd.date_range(
+    start=f"{year-1}-12-31 00:00",
+    end=f"{year}-12-31 23:50",
+    freq="10min"
+)
+
+solar_elevation = pvlib.solarposition.get_solarposition(
+    all_times, syd_lat, syd_lon
+).elevation
+
+daytime_times = set(solar_elevation[solar_elevation >= 10.0].index)
+
 #################################################################################
 # Functions to load and process data
 #################################################################################
@@ -115,7 +132,6 @@ def get_heliosat(date, variables, lat_min, lat_max, lon_min, lon_max, patch_size
             coords='minimal',
             compat='override',
             parallel=True,
-            # chunks={'time':100, 'latitude':-1, 'longitude':-1}
             chunks='auto'
         )
 
@@ -218,92 +234,107 @@ def interp_himawari_gaps(ds):
     return ds_filled
 
 
-def get_valid_start_times(ds, context_length, forecast_length):
-    '''
-    Find all times where the full range of data needed is available, i.e. the full context lenght and forecast length
+def get_valid_start_times(ds, context_length, forecast_length, daytime_times, min_solar_elevation=10.0):
+    total_length = context_length + forecast_length
+    times        = pd.DatetimeIndex(ds.time.values)
 
-    INPUTS
-    ds: dataset to find valid times for
-    context_legnth: number of timesteps the model uses to make the forecast
-    forecast_length: number of timesteps forecasted
+    # ------------------------------------------------------------------ #
+    # Step 1: Find bad days using only daytime timesteps                  #
+    # Spatial mean reduces (T, H, W) → (T,) before resampling,           #
+    # so the .compute() only pulls a tiny array.                          #
+    # ------------------------------------------------------------------ #
+    daytime_ds = ds.sel(time=[t for t in times if t in daytime_times])
 
-    OUTPUTS
-    xxxxxx
-    '''
-    total_length    = context_length + forecast_length
-    # Build a pandas DatetimeIndex from the helio time coordinate.        #
-    # This is a cheap .values call — no Dask compute needed.              #
-    times = pd.DatetimeIndex(ds.time.values)
-    
-    # Compute the gap between each consecutive pair of timestamps.        #
-    gaps = times.to_series().diff().fillna(pd.Timedelta("999h"))
-    
-    # A frame is "continuous" if the gap from the previous frame is exactly 10 minutes
-    is_continuous = (gaps == timestep)
-    
-    # For each position i, we need the (total_length - 1) frames that follow it to ALL be continuous
+    ghi_has_nan = (
+        ds["surface_global_irradiance"]
+        .sel(time=daytime_ds.time)
+        .isnull()
+        .any(dim=["latitude", "longitude"])   # (T,) bool — True if any pixel NaN
+        .resample(time="1D")
+        .any()                                # (days,) bool — True if any timestep NaN
+        .compute()
+    )
+
+    bad_days = set(
+        pd.DatetimeIndex(ghi_has_nan.time.values[ghi_has_nan.values])
+        .normalize()
+    )
+
+    print(f"  {len(bad_days)} bad days identified.")
+
+    # ------------------------------------------------------------------ #
+    # Step 2: Continuity filter                                           #
+    # ------------------------------------------------------------------ #
+    gaps              = times.to_series().diff().fillna(pd.Timedelta("999h"))
+    is_continuous     = (gaps == timestep)
     continuous_series = is_continuous.astype(int)
-    
-    # Rolling min over the NEXT (total_length - 1) frames:
-    # Reverse → rolling min over trailing window → reverse back.
-    # This gives, at position i, the minimum continuity of frames i+1..i+N-1.
+
     rolling_min = (
         continuous_series
-        .iloc[::-1]                                    # reverse
+        .iloc[::-1]
         .rolling(window=total_length - 1, min_periods=total_length - 1)
         .min()
-        .iloc[::-1]                                    # reverse back
-        .shift(-(total_length - 2))                    # align: result at i covers i+1..i+N-1
+        .iloc[::-1]
+        .shift(-(total_length - 2))
     )
-    
-    # A valid start frame is one where all subsequent frames are continuous
+
     valid_mask = rolling_min == 1.0
-    
-    # Also ensure the sequence doesn't run off the end of the array
     valid_mask.iloc[-(total_length - 1):] = False
-    
-    return times[valid_mask.values]
+    candidate_times = times[valid_mask.values]
+
+    # ------------------------------------------------------------------ #
+    # Step 3: Apply both filters — elevation first, then bad days         #
+    # Both checks are pure set lookups, no I/O                           #
+    # ------------------------------------------------------------------ #
+    valid_start_times = [
+        t0 for t0 in candidate_times
+        if all(
+            t0 + i * timestep in daytime_times
+            for i in range(total_length)
+        )
+        and not any(
+            (t0 + i * timestep).normalize() in bad_days
+            for i in range(total_length)
+        )
+    ]
+
+    print(f"  {len(candidate_times)} candidates → "
+          f"{len(valid_start_times)} after daytime + NaN filter.")
+
+    return pd.DatetimeIndex(valid_start_times)
 
 if __name__ == "__main__":
-        
     client = Client(
         n_workers=24,
         threads_per_worker=1
     )
+    
     ################################################################################
     # 
     # START DATA PROCESSING
     #
     ################################################################################
     all_valid_times = []
-
+    
     # to find valid times
     timestep        = pd.Timedelta("10min")
-
+    
     base_data_dir = Path("/scratch/er8/cd3022/CPDiT/DiT_data/")
-    helio_data_dir = base_data_dir / "heliosat" / dit_dataset
-    bar_data_dir = base_data_dir / "barra" / dit_dataset
-    os.makedirs(helio_data_dir, exist_ok=True)
-    os.makedirs(bar_data_dir, exist_ok=True)
-
-    ####################################################################################
-    #!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!
-    ####################################################################################
-    '''
-    !!!
-    '''
-    # REDUCED TO ONE MONTH FOR QUICK TESTING
-    '''
-    !!!
-    '''
-    ####################################################################################
-    #!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!!!!!!!!!!!!!#!!!!!!!!!!!
-    ####################################################################################
-
-    for month in range(1, 2):
+    zarr_dir = base_data_dir / "zarr"
+    os.makedirs(zarr_dir, exist_ok=True)
+    
+    # helio_data_dir = base_data_dir / "heliosat" / dit_dataset
+    # bar_data_dir = base_data_dir / "barra" / dit_dataset
+    # os.makedirs(helio_data_dir, exist_ok=True)
+    # os.makedirs(bar_data_dir, exist_ok=True)
+    
+    helio_list = []
+    barra_list = []
+    print("Starting month loop")
+    for month in range(1, 13):
         
         date = f"{year}-{month:02d}"
-
+    
         # load himawari heliosat data
         helio = get_heliosat(
             date,
@@ -319,9 +350,16 @@ if __name__ == "__main__":
         helio = helio.chunk({'time':300, 'latitude':-1, 'longitude':-1})
         # fill missing timestep
         helio = interp_himawari_gaps(helio) 
+        
         # record the valid times
-        all_valid_times.append(get_valid_start_times(helio, context_length, forecast_length))
-
+        print("Finding valid start times")
+        all_valid_times.append(
+            get_valid_start_times(helio, context_length, forecast_length, daytime_times)
+        )
+        
+        helio_list.append(helio)
+    
+    
         
         # now that heliosat data is 256x256, use that as target grid
         if month == 1: 
@@ -329,43 +367,48 @@ if __name__ == "__main__":
             lon_min, lon_max = helio.longitude.min().item(), helio.longitude.max().item()
         # load BARRA-R2 data
         bar = get_barra(date, std_vars, conv_vars, lat_min, lat_max, lon_min, lon_max)
-
+    
         bar = bar[barra_vars] # start with small subset of vars
-
-
-
-        # save monthly netcdf files for each dataset
-        # UPDATED TO ZARR
-        helio_file_name = helio_data_dir / f"heliosat_{date}.zarr"
-        helio.to_zarr(helio_file_name)
-        bar_file_name = bar_data_dir / f"barra_{date}.zarr"
-        bar.to_zarr(bar_file_name)
-
-
-
+        barra_list.append(bar)
+    
+        print(f"finished month: {month:02d}")
+    
+    
+    
+    full_helio = xr.concat(helio_list, dim='time')
+    full_barra = xr.concat(barra_list, dim='time')
+    
+    # UPDATED TO ZARR
+    helio_file_name = zarr_dir / f"heliosat_{dit_dataset}.zarr"
+    full_helio.to_zarr(helio_file_name, mode='w')
+    
+    bar_file_name = zarr_dir / f"barra_{dit_dataset}.zarr"
+    full_barra.to_zarr(bar_file_name, mode='w')
+    
     #######################################################################
     # Save the valid times to a parquet file for later use
     #######################################################################
     all_valid_times = pd.DatetimeIndex(np.concatenate(all_valid_times))
-
+    
     total_length = context_length + forecast_length
-
+    
     # save parquet file with valid times
     index_df = pd.DataFrame({
         "start_time":    all_valid_times,
         "context_end":   all_valid_times + (context_length - 1) * timestep,
         "forecast_end":  all_valid_times + (total_length   - 1) * timestep,
     })
-
+    
     index_dir = Path("/scratch/er8/cd3022/CPDiT/index/")
     os.makedirs(index_dir, exist_ok=True)
     index_df.to_parquet(index_dir / f"{dit_dataset}_index.parquet", index=False)
-
-
+    
+    
     #######################################################################
     # Save regridding weights for BARRA → Heliosat, to be reused across runs
     #######################################################################
     regridder = xe.Regridder(bar, helio, method='bilinear')
     regridder.to_netcdf('/scratch/er8/cd3022/CPDiT/regridders/barra_to_heliosat.nc')   # reuse across runs
-
+    
     print("Data preparation complete.")
+

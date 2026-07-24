@@ -179,7 +179,7 @@ class VariationalAutoencoder(nn.Module):
         Returns:
             z: (B, latent_dim) sampled latent vector.
         """
-        logvar = torch.clamp(logvar, min=-30.0, max=20.0)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         std    = torch.exp(0.5 * logvar)
         eps    = torch.randn_like(std)
         return mu + eps * std
@@ -284,7 +284,7 @@ class VariationalAutoencoder(nn.Module):
             recon_loss: MSE reconstruction loss       (scalar, for logging).
             kl_loss:    KL divergence                 (scalar, for logging).
         """
-        logvar = torch.clamp(logvar, min=-30.0, max=20.0)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
     
         # Mean over all elements — scale-invariant across image sizes
         recon_loss = F.mse_loss(x_recon, x, reduction="mean")
