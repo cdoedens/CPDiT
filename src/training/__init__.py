@@ -1,6 +1,6 @@
-"""Training module initialization"""
+"""Training module."""
 
-from .config import TrainingConfig
+from .config import load_config
 from .train import Trainer
 
-__all__ = ["TrainingConfig", "Trainer"]
+__all__ = ["load_config", "Trainer"]

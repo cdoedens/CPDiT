@@ -1,6 +1,6 @@
 
 model:
-  image_channels: 5
+  image_channels: 3
   image_size: 256                # Spatial size of input patches (H = W)
   latent_dim: 256                # VAE latent vector dimension
   hidden_dim: 256                # VAE conv base channel width (D → 2D → 4D)
@@ -24,21 +24,29 @@ model:
 
 
 data:
-  context_length: 12             # Number of past satellite frames (12 x 10min = 2hr)
-  forecast_length: 6             # Number of future frames to predict (6 x 10min = 1hr)
+  context_length: 2             # Number of past satellite frames 
+  forecast_length: 1             # Number of future frames to predict
   satellite_timestep_min: 10     # Temporal resolution of heliosat data (minutes)
 
 
   heliosat_vars:
     - surface_global_irradiance
-    - cloud_optical_depth
     - solar_elevation 
 
   barra_vars:
     - KI
-    - hus500
 
-  # File paths
+  # Zarr stores (used by the DataLoader — fast random access)
+  heliosat_zarr:
+    train: /scratch/er8/cd3022/CPDiT/DiT_data/zarr/heliosat_train.zarr
+    val:   /scratch/er8/cd3022/CPDiT/DiT_data/zarr/heliosat_val.zarr
+    test:  /scratch/er8/cd3022/CPDiT/DiT_data/zarr/heliosat_test.zarr
+  barra_zarr:
+    train: /scratch/er8/cd3022/CPDiT/DiT_data/zarr/barra_train.zarr
+    val:   /scratch/er8/cd3022/CPDiT/DiT_data/zarr/barra_val.zarr
+    test:  /scratch/er8/cd3022/CPDiT/DiT_data/zarr/barra_test.zarr
+
+  # File paths (REMOVE LATER, AND CONVERT TO ZARR ONLY)
   heliosat:
     train: /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/train/
     val:   /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/val/
@@ -74,19 +82,22 @@ data:
 #   Stage 2 — freeze VAE, train diffusion model in latent space
 # -----------------------------------------------------------------------------
 training:
-  stage: 2                       # 1 = VAE only, 2 = diffusion (VAE frozen)
-  freeze_vae: true               # Must be true when stage: 2
+  stage: 1                       # 1 = VAE only, 2 = diffusion (VAE frozen)
+  freeze_vae: false               # Must be true when stage: 2
   seed: 42
 
   # Batch sizes — may need reducing if GPU memory is tight at 256x256
   batch_size:
-    stage1: 32
+    stage1: 16
     stage2: 16
 
   # Epochs
+  # REDUCED FOR TESTING, ORGINAL VALS ARE
+  # STAGE1: 100
+  # STAGE2: 200
   max_epochs:
-    stage1: 100
-    stage2: 200
+    stage1: 1
+    stage2: 1
 
   early_stopping:
     enabled: true
@@ -104,6 +115,8 @@ training:
   save_every_n_epochs: 5
   keep_last_n_checkpoints: 3
   resume_from: null              # Set to a checkpoint path to resume training
+
+  log_dir: /scratch/er8/cd3022/CPDiT/logs/
 
 # -----------------------------------------------------------------------------
 # Optimiser

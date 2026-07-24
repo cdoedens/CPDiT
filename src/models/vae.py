@@ -258,7 +258,7 @@ class VariationalAutoencoder(nn.Module):
         x_recon: torch.Tensor,
         mu:      torch.Tensor,
         logvar:  torch.Tensor,
-        beta:    float = 0.001,
+        beta:    float = 1.0,       # with mean reduction, 1.0 is a sensible default
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Beta-VAE loss: reconstruction MSE + beta-weighted KL divergence.
@@ -285,17 +285,16 @@ class VariationalAutoencoder(nn.Module):
             kl_loss:    KL divergence                 (scalar, for logging).
         """
         logvar = torch.clamp(logvar, min=-30.0, max=20.0)
-
-        # Sum over (C, H, W), mean over batch
-        recon_loss = F.mse_loss(x_recon, x, reduction="sum") / x.size(0)
-
-        # Sum over latent_dim, mean over batch
-        kl_loss = -0.5 * torch.sum(
-            1 + logvar - mu.pow(2) - logvar.exp(), dim=-1
-        ).mean()
-
+    
+        # Mean over all elements — scale-invariant across image sizes
+        recon_loss = F.mse_loss(x_recon, x, reduction="mean")
+    
+        # Mean over batch, mean over latent dim
+        kl_loss = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
+    
         total_loss = recon_loss + beta * kl_loss
         return total_loss, recon_loss, kl_loss
+
 
     # ------------------------------------------------------------------ #
     # Repr                                                                 #
