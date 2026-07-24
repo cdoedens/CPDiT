@@ -1,6 +1,5 @@
 import xarray as xr
 import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
 from pathlib import Path
 from dask.distributed import Client
 import numpy as np
@@ -276,13 +275,9 @@ if __name__ == "__main__":
     # START DATA PROCESSING
     #
     ################################################################################
-    helio_stats = {}
-    bar_stats = {}
     all_valid_times = []
 
     # to find valid times
-    context_length  = 12   # frames
-    forecast_length = 6    # frames
     timestep        = pd.Timedelta("10min")
 
     base_data_dir = Path("/scratch/er8/cd3022/CPDiT/DiT_data/")
@@ -340,39 +335,12 @@ if __name__ == "__main__":
 
 
         # save monthly netcdf files for each dataset
-        helio_file_name = helio_data_dir / f"heliosat_{date}.nc"
-        helio.to_netcdf(helio_file_name)
-        bar_file_name = bar_data_dir / f"barra_{date}.nc"
-        bar.to_netcdf(bar_file_name)
+        # UPDATED TO ZARR
+        helio_file_name = helio_data_dir / f"heliosat_{date}.zarr"
+        helio.to_zarr(helio_file_name)
+        bar_file_name = bar_data_dir / f"barra_{date}.zarr"
+        bar.to_zarr(bar_file_name)
 
-        
-
-        # calculate stats for the month
-        for var in helio.data_vars:
-            mean = helio[var].mean().compute().item()
-            std = helio[var].std().compute().item()
-
-            if month == 1:
-                helio_stats[var] = {
-                    "mean": [mean],
-                    "std": [std],
-                }
-            else:
-                helio_stats[var]["mean"].append(mean)
-                helio_stats[var]["std"].append(std)
-        
-        for var in bar.data_vars:
-            mean = bar[var].mean().compute().item()
-            std = bar[var].std().compute().item()
-
-            if month == 1:
-                bar_stats[var] = {
-                    "mean": [mean],
-                    "std": [std],
-                }
-            else:
-                bar_stats[var]["mean"].append(mean)
-                bar_stats[var]["std"].append(std)
 
 
     #######################################################################
@@ -393,35 +361,6 @@ if __name__ == "__main__":
     os.makedirs(index_dir, exist_ok=True)
     index_df.to_parquet(index_dir / f"{dit_dataset}_index.parquet", index=False)
 
-    #######################################################################
-    # Save mean and standard for each variable to a json file for later use
-    #######################################################################
-
-    # Take the mean across months (ignoring the different numbers of days) to get final stats for the whole year
-    helio_stats_final = helio_stats.copy()
-    for var in helio_stats:
-        helio_stats_final[var]["mean"] = np.mean(helio_stats[var]["mean"]).item()
-        helio_stats_final[var]["std"] = np.mean(helio_stats[var]["std"]).item()
-
-    bar_stats_final = bar_stats.copy()
-    for var in bar_stats:
-        bar_stats_final[var]["mean"] = np.mean(bar_stats[var]["mean"]).item()
-        bar_stats_final[var]["std"] = np.mean(bar_stats[var]["std"]).item()
-
-    # write out stats to a json file for each dataset
-    stats_dir = Path("/scratch/er8/cd3022/CPDiT/stats/")
-    os.makedirs(stats_dir, exist_ok=True)
-
-    # TO DO
-    # MAKE SEPARATE SCRIPT FOR STATS ACROSS ALL YEARS, SO THAT TRAIN/VAL/TEST HAVE SAME STATS
-    helio_stats_file = stats_dir / "heliosat_stats.json"
-    bar_stats_file = stats_dir / "barra_stats.json"
-
-    with open(helio_stats_file, "w") as file:
-        json.dump(helio_stats_final, file, indent=4)
-
-    with open(bar_stats_file, "w") as file:
-        json.dump(bar_stats_final, file, indent=4)
 
     #######################################################################
     # Save regridding weights for BARRA → Heliosat, to be reused across runs
