@@ -88,12 +88,12 @@ training:
   seed: 42
   # Mixed precision — recommended for A100/V100 GPUs on Gadi
   # set to false when stage: 1
-  mixed_precision: false          # Uses torch.cuda.amp automatically
+  mixed_precision: true          # Uses torch.cuda.amp automatically
 
   # Batch sizes — may need reducing if GPU memory is tight at 256x256
   batch_size:
-    stage1: 16
-    stage2: 16
+    stage1: 64
+    stage2: 64
 
   # Epochs
   # REDUCED FOR TESTING, ORGINAL VALS ARE
