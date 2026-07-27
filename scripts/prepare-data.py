@@ -315,7 +315,7 @@ if __name__ == "__main__":
     # START DATA PROCESSING
     #
     ################################################################################
-    all_valid_times = []
+    valid_times = []
     
     # to find valid times
     timestep        = pd.Timedelta("10min")
@@ -328,7 +328,7 @@ if __name__ == "__main__":
     helio_list = []
     barra_list = []
     print("Starting month loop")
-    for month in range(1, 4):
+    for month in range(1, 3):
         
         date = f"{year}-{month:02d}"
     
@@ -347,13 +347,6 @@ if __name__ == "__main__":
         
         # fill missing timestep
         helio = interp_himawari_gaps(helio) 
-        
-        # record the valid times
-        print("Finding valid start times")
-        all_valid_times.append(
-            get_valid_start_times(helio, total_length, daytime_times)
-        )
-        
         helio_list.append(helio)
     
     
@@ -365,19 +358,26 @@ if __name__ == "__main__":
         # load BARRA-R2 data
         bar = get_barra(date, std_vars, conv_vars, lat_min, lat_max, lon_min, lon_max)
     
-        # make regridder once, then reuse for subsequent months
-        # TO DO:
-        # CURRENTLY JUST REGRIDS SPATIAL DIMS, BARRA TIME STILL HOURLY,
-        # UNSURE HOW THE MODEL HANDLES THIS
-        if month ==1:
-            regridder = xe.Regridder(bar, helio, method='bilinear')
-    
         bar = bar[barra_vars] # just the vars for this model config
-        bar = regridder(bar) # regrid to heliosat
+        # get onto helio grid and times
+        bar = bar.interp(
+            lat=helio.latitude,
+            lon=helio.longitude,
+            time=helio.time,
+            method='nearest'
+        ).shift(time=2)           # prevent data leakage
         barra_list.append(bar)
-    
+
+        # record the valid times
+        print("Finding valid start times")
+        monthly_valid_times = get_valid_start_times(helio, total_length, daytime_times)
+        valid_times.append(monthly_valid_times)
+        
+        # keep just good times in the datasets
+        helio = helio.sel(time=monthly_valid_times)
+        bar = bar.sel(time=monthly_valid_times)
+
         print(f"finished month: {month:02d}")
-    
     
     
     full_helio = xr.concat(helio_list, dim='time')
@@ -403,15 +403,15 @@ if __name__ == "__main__":
     #######################################################################
     # Save the valid times to a parquet file for later use
     #######################################################################
-    all_valid_times = pd.DatetimeIndex(np.concatenate(all_valid_times))
+    valid_times = pd.DatetimeIndex(np.concatenate(valid_times))
     
     
     
     # save parquet file with valid times
     index_df = pd.DataFrame({
-        "start_time":    all_valid_times,
-        "context_end":   all_valid_times + (context_length - 1) * timestep,
-        "forecast_end":  all_valid_times + (total_length   - 1) * timestep,
+        "start_time":    valid_times,
+        "context_end":   valid_times + (context_length - 1) * timestep,
+        "forecast_end":  valid_times + (total_length   - 1) * timestep,
     })
     
     index_dir = Path("/scratch/er8/cd3022/CPDiT/index/")
