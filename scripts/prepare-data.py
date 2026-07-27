@@ -73,6 +73,7 @@ barra_vars = config["data"]["barra_vars"]
 # TIMESTEPS NEEDED
 context_length  = config["data"]["context_length"]
 forecast_length = config["data"]["forecast_length"]
+total_length = context_length + forecast_length
 
 # USE TO FILTER TIMESTEPS WITH LOW SOLAR ELEVATION
 syd_lat = -31.75
@@ -175,7 +176,7 @@ def get_barra(date, std_vars, conv_vars, lat_min, lat_max, lon_min, lon_max):
         preprocess = preprocess,
         compat='override',
         parallel=True,
-        chunks={'time':10_000, 'lat':-1, 'lon':-1}
+        chunks={'time':total_length, 'lat':-1, 'lon':-1} # align time dim size with batch
     )
 
 
@@ -235,8 +236,7 @@ def interp_himawari_gaps(ds):
     return ds_filled
 
 
-def get_valid_start_times(ds, context_length, forecast_length, daytime_times, min_solar_elevation=10.0):
-    total_length = context_length + forecast_length
+def get_valid_start_times(ds, total_length, daytime_times, min_solar_elevation=10.0):
     times        = pd.DatetimeIndex(ds.time.values)
 
     # ------------------------------------------------------------------ #
@@ -324,15 +324,11 @@ if __name__ == "__main__":
     zarr_dir = base_data_dir / "zarr"
     os.makedirs(zarr_dir, exist_ok=True)
     
-    # helio_data_dir = base_data_dir / "heliosat" / dit_dataset
-    # bar_data_dir = base_data_dir / "barra" / dit_dataset
-    # os.makedirs(helio_data_dir, exist_ok=True)
-    # os.makedirs(bar_data_dir, exist_ok=True)
     
     helio_list = []
     barra_list = []
     print("Starting month loop")
-    for month in range(1, 7):
+    for month in range(1, 4):
         
         date = f"{year}-{month:02d}"
     
@@ -355,21 +351,29 @@ if __name__ == "__main__":
         # record the valid times
         print("Finding valid start times")
         all_valid_times.append(
-            get_valid_start_times(helio, context_length, forecast_length, daytime_times)
+            get_valid_start_times(helio, total_length, daytime_times)
         )
         
         helio_list.append(helio)
     
     
         
-        # now that heliosat data is 256x256, use that as target grid
-        if month == 1: 
-            lat_min, lat_max = helio.latitude.min().item(), helio.latitude.max().item()
-            lon_min, lon_max = helio.longitude.min().item(), helio.longitude.max().item()
+        # # now that heliosat data is 256x256, use that as target grid
+        # if month == 1: 
+        #     lat_min, lat_max = helio.latitude.min().item(), helio.latitude.max().item()
+        #     lon_min, lon_max = helio.longitude.min().item(), helio.longitude.max().item()
         # load BARRA-R2 data
         bar = get_barra(date, std_vars, conv_vars, lat_min, lat_max, lon_min, lon_max)
     
-        bar = bar[barra_vars] # start with small subset of vars
+        # make regridder once, then reuse for subsequent months
+        # TO DO:
+        # CURRENTLY JUST REGRIDS SPATIAL DIMS, BARRA TIME STILL HOURLY,
+        # UNSURE HOW THE MODEL HANDLES THIS
+        if month ==1:
+            regridder = xe.Regridder(bar, helio, method='bilinear')
+    
+        bar = bar[barra_vars] # just the vars for this model config
+        bar = regridder(bar) # regrid to heliosat
         barra_list.append(bar)
     
         print(f"finished month: {month:02d}")
@@ -380,10 +384,13 @@ if __name__ == "__main__":
     full_barra = xr.concat(barra_list, dim='time')
 
     # Force Dask to reconcile the chunk graph from the concat seams
+    # Align time chunk size with the time batch size (context_length + forecast_length)
+    # TO DO:
+    # REPLACE HARDCODED 256 WITH REFERENCE TO PATCH SIZE IN YAML CONFIG FILE
     for var in full_helio.data_vars:
-        full_helio[var].data = da.rechunk(full_helio[var].data, chunks=(300, 256, 256))
+        full_helio[var].data = da.rechunk(full_helio[var].data, chunks=(total_length, 256, 256))
     for var in full_barra.data_vars:
-        full_barra[var].data = da.rechunk(full_barra[var].data, chunks=(10_000, full_barra.sizes['lat'], full_barra.sizes['lon']))
+        full_barra[var].data = da.rechunk(full_barra[var].data, chunks=(total_length, 256, 256))
 
     
     # UPDATED TO ZARR
@@ -398,7 +405,7 @@ if __name__ == "__main__":
     #######################################################################
     all_valid_times = pd.DatetimeIndex(np.concatenate(all_valid_times))
     
-    total_length = context_length + forecast_length
+    
     
     # save parquet file with valid times
     index_df = pd.DataFrame({
@@ -410,13 +417,8 @@ if __name__ == "__main__":
     index_dir = Path("/scratch/er8/cd3022/CPDiT/index/")
     os.makedirs(index_dir, exist_ok=True)
     index_df.to_parquet(index_dir / f"{dit_dataset}_index.parquet", index=False)
-    
-    
-    #######################################################################
-    # Save regridding weights for BARRA → Heliosat, to be reused across runs
-    #######################################################################
-    regridder = xe.Regridder(bar, helio, method='bilinear')
-    regridder.to_netcdf('/scratch/er8/cd3022/CPDiT/regridders/barra_to_heliosat.nc')   # reuse across runs
+
+
     
     print("Data preparation complete.")
 

@@ -3,7 +3,7 @@ model:
   image_channels: 3
   image_size: 256                # Spatial size of input patches (H = W)
   latent_dim: 256                # VAE latent vector dimension
-  hidden_dim: 64                # VAE conv base channel width (D → 2D → 4D)
+  hidden_dim: 64                 # VAE conv base channel width (D → 2D → 4D)
 
   transformer:
     num_layers: 4                # Depth of the temporal transformer
@@ -24,8 +24,8 @@ model:
 
 
 data:
-  context_length: 2             # Number of past satellite frames 
-  forecast_length: 1             # Number of future frames to predict
+  context_length: 12             # Number of past satellite frames 
+  forecast_length: 6             # Number of future frames to predict
   satellite_timestep_min: 10     # Temporal resolution of heliosat data (minutes)
 
 
@@ -72,9 +72,9 @@ data:
     test:  /scratch/er8/cd3022/CPDiT/index/test_index.parquet
 
   # DataLoader settings
-  num_workers: 4
+  num_workers: 16
   pin_memory: true
-  prefetch_factor: 2             # Batches to prefetch per worker
+  prefetch_factor: 16             # Batches to prefetch per worker
 
 # -----------------------------------------------------------------------------
 # Training stages
@@ -92,16 +92,13 @@ training:
 
   # Batch sizes — may need reducing if GPU memory is tight at 256x256
   batch_size:
-    stage1: 64
-    stage2: 64
+    stage1: 32
+    stage2: 32
 
   # Epochs
-  # REDUCED FOR TESTING, ORGINAL VALS ARE
-  # STAGE1: 100
-  # STAGE2: 200
   max_epochs:
-    stage1: 1
-    stage2: 1
+    stage1: 100
+    stage2: 200
 
   early_stopping:
     enabled: true
