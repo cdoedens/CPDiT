@@ -18,6 +18,9 @@ import dask.array as da
 
 import pvlib
 
+import warnings
+warnings.filterwarnings("ignore", message="The specified chunks separate the stored chunks")
+
 dit_dataset = sys.argv[1]
 
 ds_to_year = {
@@ -34,6 +37,8 @@ lat_min=-35
 lat_max=-28.5
 lon_min=145
 lon_max=151.5
+
+patch_size = 256
 
 with open(f"/home/548/cd3022/repos/CPDiT/configs/train_config.yaml") as f:
     config = yaml.safe_load(f)
@@ -95,7 +100,7 @@ daytime_times = set(solar_elevation[solar_elevation >= 10.0].index)
 # Functions to load and process data
 #################################################################################
 
-def get_heliosat(date, variables, lat_min, lat_max, lon_min, lon_max, patch_size=256):
+def get_heliosat(date, variables, lat_min, lat_max, lon_min, lon_max):
     '''
     Use xarray's open_mfdataset() to open Himawari heliosat netcdf files, using arguments optimised for
     opening climate datasets quickly and efficiently.
@@ -103,11 +108,10 @@ def get_heliosat(date, variables, lat_min, lat_max, lon_min, lon_max, patch_size
     INPUTS
     date (str): in format YYYY-MM, year and month to get data for
     variables (list): variables in file to keep
-    lat_min, lat_max, lon_min, lon_max (int): region boundaries (must be larger enough to fit patch_size ** 2)
-    patch_size (int): multiple of 8, slices into square for torch.nn to handle cleanly
+    lat_min, lat_max, lon_min, lon_max (int): region boundaries
 
     OUTPUT
-    xarray dataset with data_vars=variables and lat/lon dimensions of size=patch_size taken from within region boundaries
+    xarray dataset with data_vars=variables and lat/lon dimensions taken from within region boundaries
     '''
 
     year, month = date.split("-")
@@ -119,10 +123,7 @@ def get_heliosat(date, variables, lat_min, lat_max, lon_min, lon_max, patch_size
         return ds.sel(
             latitude=slice(lat_min, lat_max),
             longitude=slice(lon_min, lon_max)
-        )[helio_vars].isel(
-            latitude=slice(0, patch_size),
-            longitude=slice(-patch_size, None)
-        )
+        )[helio_vars]
     
 
     return xr.open_mfdataset(
@@ -328,55 +329,71 @@ if __name__ == "__main__":
     helio_list = []
     barra_list = []
     print("Starting month loop")
-    for month in range(1, 3):
+    for month in range(1, 13):
         
         date = f"{year}-{month:02d}"
     
+        # --------------------------------------------------------------------------- #
         # load himawari heliosat data
+        # --------------------------------------------------------------------------- #
+        # To properly interpolate BARRA grid and times, a larger himawari area is first taken.
+        # Then, once data has been interpolated, the edges are trimmed off both to get 256x256
         helio = get_heliosat(
             date,
             variables=helio_vars,
-            lat_min=lat_min,
-            lat_max=lat_max,
-            lon_min=lon_min,
-            lon_max=lon_max
+            lat_min=lat_min-0.5,
+            lat_max=lat_max+0.5,
+            lon_min=lon_min-0.5,
+            lon_max=lon_max+0.5
         )
-        # himawari has some data from the previous UTC day, because of the AEST day. This aligns it with BARRA
-        helio = helio.sel(time=slice(f"{date}-01", None))
-        # chunk over time
+    
         
         # fill missing timestep
         helio = interp_himawari_gaps(helio) 
-        helio_list.append(helio)
-    
-    
+        # himawari has some data from the previous UTC day, because of the AEST day. This aligns it with BARRA
+        helio = helio.sel(time=slice(f"{date}-01", None))
         
-        # # now that heliosat data is 256x256, use that as target grid
-        # if month == 1: 
-        #     lat_min, lat_max = helio.latitude.min().item(), helio.latitude.max().item()
-        #     lon_min, lon_max = helio.longitude.min().item(), helio.longitude.max().item()
+    
         # load BARRA-R2 data
-        bar = get_barra(date, std_vars, conv_vars, lat_min, lat_max, lon_min, lon_max)
+        bar = get_barra(
+            date,
+            std_vars, conv_vars,
+            lat_min=lat_min-0.5,
+            lat_max=lat_max+0.5,
+            lon_min=lon_min-0.5,
+            lon_max=lon_max+0.5
+        )
     
         bar = bar[barra_vars] # just the vars for this model config
-        # get onto helio grid and times
-        bar = bar.interp(
+        
+        # Regrid to himawari resolution
+        bar_regrid = bar.interp(
             lat=helio.latitude,
             lon=helio.longitude,
             time=helio.time,
             method='nearest'
-        ).shift(time=2)           # prevent data leakage
-        barra_list.append(bar)
-
-        # record the valid times
+        )
+    
+        # Now that BARRA is regridded, trim edges to get to 256x256 patch
+        helio = helio.sel(
+            latitude=slice(lat_min, lat_max),
+            longitude=slice(lon_min, lon_max)
+        ).isel(
+            latitude=slice(0, patch_size),
+            longitude=slice(-patch_size, None)
+        )
+        bar_regrid = bar_regrid.sel(
+            latitude=helio.latitude,
+            longitude=helio.longitude,
+        )
+        # Record the valid times
         print("Finding valid start times")
         monthly_valid_times = get_valid_start_times(helio, total_length, daytime_times)
         valid_times.append(monthly_valid_times)
-        
-        # keep just good times in the datasets
-        helio = helio.sel(time=monthly_valid_times)
-        bar = bar.sel(time=monthly_valid_times)
-
+    
+        helio_list.append(helio)
+        barra_list.append(bar_regrid)
+    
         print(f"finished month: {month:02d}")
     
     
