@@ -3,7 +3,7 @@ model:
   image_channels: 3
   image_size: 256                # Spatial size of input patches (H = W)
   latent_dim: 256                # VAE latent vector dimension
-  hidden_dim: 64                 # VAE conv base channel width (D → 2D → 4D)
+  hidden_dim: 128                # VAE conv base channel width (D → 2D → 4D)
 
   transformer:
     num_layers: 4                # Depth of the temporal transformer
@@ -46,17 +46,6 @@ data:
     val:   /scratch/er8/cd3022/CPDiT/DiT_data/zarr/barra_val.zarr
     test:  /scratch/er8/cd3022/CPDiT/DiT_data/zarr/barra_test.zarr
 
-  # File paths (REMOVE LATER, AND CONVERT TO ZARR ONLY)
-  # heliosat:
-  #   train: /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/train/
-  #   val:   /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/val/
-  #   test:  /scratch/er8/cd3022/CPDiT/DiT_data/heliosat/test/
-
-  # barra:
-  #   train: /scratch/er8/cd3022/CPDiT/DiT_data/barra/train/
-  #   val:   /scratch/er8/cd3022/CPDiT/DiT_data/barra/val/
-  #   test:  /scratch/er8/cd3022/CPDiT/DiT_data/barra/test/
-
   # Precomputed assets
   regrid_weights:
     barra_to_heliosat: /scratch/er8/cd3022/CPDiT/regridders/barra_to_heliosat.nc
@@ -72,9 +61,9 @@ data:
     test:  /scratch/er8/cd3022/CPDiT/index/test_index.parquet
 
   # DataLoader settings
-  num_workers: 16
+  num_workers: 12
   pin_memory: true
-  prefetch_factor: 16             # Batches to prefetch per worker
+  prefetch_factor: 1             # Batches to prefetch per worker
 
 # -----------------------------------------------------------------------------
 # Training stages
@@ -92,8 +81,8 @@ training:
 
   # Batch sizes — may need reducing if GPU memory is tight at 256x256
   batch_size:
-    stage1: 32
-    stage2: 32
+    stage1: 64
+    stage2: 64
 
   # Epochs
   max_epochs:
@@ -102,11 +91,13 @@ training:
 
   early_stopping:
     enabled: true
-    patience: 20                 # Epochs without improvement before stopping
+    patience: 10                 # Epochs without improvement before stopping
     monitor: val_loss            # Metric to monitor
 
   # Gradient clipping — important for transformer stability
   gradient_clip_norm: 1.0
+  vae_beta: 0.01                     # KL loss weight for VAE training
+  vae_ssim_weight: 0.1               # SSIM loss weight for VAE training
 
 
 
