@@ -43,6 +43,8 @@ class Trainer:
         self.gradient_clip_norm = training_cfg.get("gradient_clip_norm", 1.0)
         self.checkpoint_dir     = Path(training_cfg["checkpoint_dir"])
         self.save_every         = training_cfg.get("save_every_n_epochs", 5)
+        self.vae_beta           = training_cfg.get("vae_beta", 0.01)
+        self.vae_ssim_weight    = training_cfg.get("vae_ssim_weight", 0.1)
 
         # max_epochs is a per-stage dict in the YAML
         epoch_cfg        = training_cfg.get("max_epochs", {})
@@ -132,7 +134,12 @@ class Trainer:
         with torch.cuda.amp.autocast(enabled=self.use_amp):
             x_recon, mu, logvar = self.model.vae(flat_images)
             loss, _, _ = self.model.vae.vae_loss(
-                flat_images, x_recon, mu, logvar, beta=0.01
+                flat_images,
+                x_recon,
+                mu,
+                logvar,
+                self.vae_beta,
+                self.vae_ssim_weight
             )
         return loss
 
@@ -152,8 +159,8 @@ class Trainer:
         pbar = tqdm(train_loader, desc="Training")
     
         for context, forecast in pbar:
-            context  = context.to(self.device)
-            forecast = forecast.to(self.device)
+            context  = context.to(self.device, non_blocking=True)
+            forecast = forecast.to(self.device, non_blocking=True)
             
             self.optimizer.zero_grad()
 
