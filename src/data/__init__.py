@@ -15,9 +15,9 @@ CPDiTDataset        — main dataset class. Reads the precomputed valid-timestam
 build_dataloader    — convenience factory that constructs a CPDiTDataset and
                       wraps it in a DataLoader with the correct settings.
 
-Zarr stores are opened once in the main process inside _ensure_open. All
-variables are loaded into torch shared memory so that forked DataLoader workers
-can read directly without copy-on-write page faults or RAM duplication.
+Zarr stores are opened once per worker inside _ensure_open and cached for the
+lifetime of that worker process, giving O(1) per-sample time-slice access with
+no file-open overhead.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ import numpy as np
 import pandas as pd
 import torch
 import zarr
-import gc
 from torch.utils.data import DataLoader, Dataset
 
 
@@ -46,23 +45,6 @@ def _worker_init_fn(worker_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shared memory helper
-# ---------------------------------------------------------------------------
-
-def _to_shared_memory(arr: np.ndarray) -> np.ndarray:
-    """
-    Copy a numpy array into torch shared memory.
-
-    On Linux, forked worker processes will read directly from this memory
-    without triggering copy-on-write page faults, keeping RAM usage flat
-    regardless of the number of workers.
-    """
-    t = torch.from_numpy(arr.copy())  # ensure contiguous
-    t.share_memory_()
-    return t.numpy()
-
-
-# ---------------------------------------------------------------------------
 # Main dataset
 # ---------------------------------------------------------------------------
 
@@ -73,17 +55,18 @@ class CPDiTDataset(Dataset):
     Each sample is identified by a start timestamp drawn from the
     precomputed valid-timestamp index. On __getitem__ the dataset:
 
-      1. Selects the time window from the in-RAM shared-memory cache
-         (pure numpy slice, no decompression overhead).
+      1. Selects the time window from the cached Zarr stores (no file open).
       2. Normalises every variable to zero mean / unit variance.
          Variables with "transform": "quantile" in barra_stats.json are
          passed through the fitted QuantileTransformer before z-scoring.
       3. Stacks all variables along the channel axis and returns
          (context, forecast) tensors of shape (T, C, H, W) each.
 
-    Call _ensure_open() once in the main process before creating the
-    DataLoader. Workers inherit the shared-memory cache via fork at zero
-    additional RAM cost.
+    Zarr stores are opened once per worker on the first __getitem__ call,
+    then cached for the lifetime of the worker.
+
+    BARRA data must be pre-regridded to the heliosat grid before training.
+    See scripts/prepare_data.py.
     """
 
     def __init__(
@@ -149,23 +132,14 @@ class CPDiTDataset(Dataset):
                     stacklevel=2,
                 )
 
-        # Populated by _ensure_open()
-        self._helio_ds:          Optional[zarr.Group] = None
-        self._barra_ds:          Optional[zarr.Group] = None
-        self._helio_time_to_idx: Dict[pd.Timestamp, int] = {}
-        self._barra_time_to_idx: Dict[pd.Timestamp, int] = {}
-        self._helio_cache:       Dict[str, np.ndarray] = {}
-        self._barra_cache:       Dict[str, np.ndarray] = {}
+        self._helio_ds = None
+        self._barra_ds = None
 
     # ------------------------------------------------------------------ #
-    # Asset initialisation — call once in the main process                #
+    # Lazy asset initialisation (once per worker)                         #
     # ------------------------------------------------------------------ #
 
     def _ensure_open(self) -> None:
-        """
-        Open Zarr stores, build time-index dicts, and load all arrays into
-        torch shared memory. Safe to call multiple times (no-op after first).
-        """
         if self._helio_ds is not None:
             return
 
@@ -183,20 +157,6 @@ class CPDiTDataset(Dataset):
 
         self._helio_time_to_idx = {t: i for i, t in enumerate(helio_times)}
         self._barra_time_to_idx = {t: i for i, t in enumerate(barra_times)}
-
-        self._helio_cache = {}
-        for var in self.heliosat_vars:
-            raw = self._helio_ds[var][:]          # decompress from zarr
-            self._helio_cache[var] = np.ascontiguousarray(raw, dtype=np.float16)
-            del raw
-            gc.collect()
-        
-        self._barra_cache = {}
-        for var in self.barra_vars:
-            raw = self._barra_ds[var][:]
-            self._barra_cache[var] = np.ascontiguousarray(raw, dtype=np.float16)
-            del raw
-            gc.collect()
 
     # ------------------------------------------------------------------ #
     # Normalisation                                                        #
@@ -239,46 +199,47 @@ class CPDiTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         self._ensure_open()
-
-        start = self.start_times[idx]
-
-        # --- Heliosat: slice from shared-memory cache ---
+    
+        start      = self.start_times[idx]
+        end_offset = self.total_length - 1
+        end        = start + end_offset * self.satellite_timestep
+    
+        # --- Heliosat: direct integer slice, no dask ---
         i0_h = self._helio_time_to_idx[start]
         i1_h = i0_h + self.total_length
         helio_arrays = [
-            self._helio_cache[var][i0_h:i1_h].astype(np.float32)
+            self._helio_ds[var][i0_h:i1_h].astype(np.float32)
             for var in self.heliosat_vars
         ]
-
-        # --- BARRA: nearest-hour lookup then slice from cache ---
+    
+        # --- BARRA: nearest-hour lookup then direct slice ---
         barra_start = start.round("h")
         i0_b = self._barra_time_to_idx.get(barra_start)
         if i0_b is None:
-            i0_b = min(
-                self._barra_time_to_idx,
-                key=lambda t: abs(t - start)
-            )
+            # fall back to closest available
+            i0_b = min(self._barra_time_to_idx,
+                       key=lambda t: abs(t - start))
             i0_b = self._barra_time_to_idx[i0_b]
         i1_b = i0_b + self.total_length
         barra_arrays = [
-            self._barra_cache[var][i0_b:i1_b].astype(np.float32)
+            self._barra_ds[var][i0_b:i1_b].astype(np.float32)
             for var in self.barra_vars
         ]
-
+    
         # --- Normalise and stack ---
         channel_arrays = []
         for var, arr in zip(self.heliosat_vars, helio_arrays):
             channel_arrays.append(self._normalise_helio(arr, var))
         for var, arr in zip(self.barra_vars, barra_arrays):
             channel_arrays.append(self._normalise_barra(arr, var))
-
+    
         data = np.stack(channel_arrays, axis=1)  # (T, C, H, W)
-
+    
         assert data.shape[0] == self.total_length, (
             f"Expected {self.total_length} timesteps, got {data.shape[0]} "
             f"for start_time={start}."
         )
-
+    
         data_tensor = torch.from_numpy(data)
         context     = data_tensor[: self.context_length]
         forecast    = data_tensor[self.context_length :]
@@ -340,9 +301,6 @@ def build_dataloader(
                                             "barra_quantile_transforms"
                                         ),
     )
-
-    # Load all data into shared memory before forking workers
-    dataset._ensure_open()
 
     return DataLoader(
         dataset,
