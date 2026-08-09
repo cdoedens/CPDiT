@@ -1,5 +1,4 @@
 import xarray as xr
-import matplotlib.pyplot as plt
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -7,7 +6,6 @@ from datetime import datetime, timedelta
 import sys, os
 import json
 import yaml
-import xesmf as xe
 import shutil
 
 from metpy.calc import dewpoint_from_specific_humidity
@@ -15,20 +13,26 @@ from metpy.units import units
 
 from dask.distributed import Client
 import dask.array as da
+import zarr
+from numcodecs import LZ4
 
 import pvlib
 
 import warnings
-warnings.filterwarnings("ignore", message="The specified chunks separate the stored chunks")
+warnings.filterwarnings("ignore", category=UserWarning)
 
-dit_dataset = sys.argv[1]
+import sys
+sys.path.append("/home/548/cd3022/repos/CPDiT/")
+import src.prep as prep
+
+split = sys.argv[1]
 
 ds_to_year = {
     "train": 2020,
     "val": 2021,
     "test": 2022,
 }
-year = ds_to_year[dit_dataset]
+year = ds_to_year[split]
 
 ##################################################################################
 # Fixed parameters
@@ -96,249 +100,39 @@ solar_elevation = pvlib.solarposition.get_solarposition(
 
 daytime_times = set(solar_elevation[solar_elevation >= 10.0].index)
 
-#################################################################################
-# Functions to load and process data
-#################################################################################
-
-def get_heliosat(date, variables, lat_min, lat_max, lon_min, lon_max):
-    '''
-    Use xarray's open_mfdataset() to open Himawari heliosat netcdf files, using arguments optimised for
-    opening climate datasets quickly and efficiently.
-
-    INPUTS
-    date (str): in format YYYY-MM, year and month to get data for
-    variables (list): variables in file to keep
-    lat_min, lat_max, lon_min, lon_max (int): region boundaries
-
-    OUTPUT
-    xarray dataset with data_vars=variables and lat/lon dimensions taken from within region boundaries
-    '''
-
-    year, month = date.split("-")
-    file_path = Path(f'/g/data/rv74/satellite-products/arc/der/himawari-ahi/solar/p1s/v1.1/{year}/{month}/')
-    files = sorted([f for f in file_path.rglob("*.nc")])
-
-    
-    def preprocess(ds):
-        return ds.sel(
-            latitude=slice(lat_min, lat_max),
-            longitude=slice(lon_min, lon_max)
-        )[helio_vars]
-    
-
-    return xr.open_mfdataset(
-            files,
-            preprocess = preprocess,
-            concat_dim='time',
-            combine='nested',
-            data_vars='minimal',
-            coords='minimal',
-            compat='override',
-            parallel=True,
-            chunks='auto'
-        )
-
-def get_barra(date, std_vars, conv_vars, lat_min, lat_max, lon_min, lon_max):
-
-    '''
-    Use xarray's open_mfdataset() to open BARRA-R2 netcdf files, and calculate additional convective parameters
-
-    INPUTS
-    date (str): in format YYYY-MM, year and month to get data for
-    std_vars, conv_vars (list): variables to retrieve
-    lat_min, lat_max, lon_min, lon_max (int): region boundaries (must be larger enough to fit patch_size ** 2)
-
-    OUTPUT
-    xarray dataset with data_vars=[std_vars + conv_vars + dew_points + KI + TCD]  taken from within region boundaries
-    '''
-    
-    year, month = date.split("-")
-
-    files = []
-    for var in std_vars:
-        file_path = Path(f'/g/data/ob53/BARRA2/output/reanalysis/AUS-11/BOM/ERA5/historical/hres/BARRA-R2/v1/1hr/{var}/latest/')
-        var_file = [f for f in file_path.glob(f'*{year}{month}.nc')][0]
-        files.append(var_file)
-
-    for var in conv_vars:
-        file_path = Path(f'/g/data/ob53/BARRA2/output/reanalysis/AUST-11/BOM/ERA5/historical/hres/BARRA-R2/v1/1hr/{var}/latest/')
-        var_file = [f for f in file_path.glob(f'*{year}{month}.nc')][0]
-        files.append(var_file)
-
-    def preprocess(ds):
-        return ds.sel(
-            lat=slice(lat_min, lat_max),
-            lon=slice(lon_min, lon_max),
-        )
-    files=sorted(files)
-
-    bar =  xr.open_mfdataset(
-        files,
-        preprocess = preprocess,
-        compat='override',
-        parallel=True,
-        chunks={'time':total_length, 'lat':-1, 'lon':-1} # align time dim size with batch
-    )
-
-
-    #################################################################################
-    # Calculate additional convective indices
-    #################################################################################
-    # When there is 0 CAPE, MUEL is nan.
-    # To fix this and make sure the model is trained off all environments,
-    # set MUEL to 0 where there are nan values.
-    # Other variables (e.g. CIN) are not so easily set to 0
-    bar['MUEL'] = xr.where(bar['MUEL'].isnull(), 0, bar['MUEL'])
-    
-    
-    # Calculate dew points for thunderstorm parameters
-    for pressure in ['850', '700', '500']:
-        bar[f'dp{pressure}'] = (
-            dewpoint_from_specific_humidity(
-                pressure=int(pressure) * units.hPa,
-                specific_humidity=bar[f'hus{pressure}'] * units('g/g'),
-            )
-            .metpy.convert_units('K')   # or 'K' depending on your preference
-            .metpy.dequantify()            # removes units → returns plain DataArray
-        )
-    
-    # Convective Parameters from RAW TS Climatology Paper
-    bar['KI'] = bar['ta850'] - bar['ta500'] + bar['dp850'] - (bar['ta700'] - bar['dp700'])
-    # bar['TCD'] = bar['MUEL'] - bar['MULCL']
-
-    return bar
-
-
-def interp_himawari_gaps(ds):
-    '''
-    Himawari misses one timestep each day at T02:40.
-    This function fills that value with a linear interpolation between adjacent times
-
-    INPUTS
-    ds: himawari dataset
-
-    OUTPUTS
-    The same dataset but with the missing timestep filled
-    '''
-    ds_filled = ds.copy()
-    gap_mask = (
-        (ds.time.dt.hour == 2) &
-        (ds.time.dt.minute == 40)
-    )
-    
-    for var in ds.data_vars:
-        mask = gap_mask & ds[var].isnull()
-        estimate = (
-            ds[var].shift(time=1)
-            + ds[var].shift(time=-1)
-        ) / 2
-    
-        ds_filled[var] = ds[var].where(~mask, estimate)
-    return ds_filled
-
-
-def get_valid_start_times(ds, total_length, daytime_times, min_solar_elevation=10.0):
-    times        = pd.DatetimeIndex(ds.time.values)
-
-    # ------------------------------------------------------------------ #
-    # Step 1: Find bad days using only daytime timesteps                  #
-    # Spatial mean reduces (T, H, W) → (T,) before resampling,           #
-    # so the .compute() only pulls a tiny array.                          #
-    # ------------------------------------------------------------------ #
-    daytime_ds = ds.sel(time=[t for t in times if t in daytime_times])
-
-    ghi_has_nan = (
-        ds["surface_global_irradiance"]
-        .sel(time=daytime_ds.time)
-        .isnull()
-        .any(dim=["latitude", "longitude"])   # (T,) bool — True if any pixel NaN
-        .resample(time="1D")
-        .any()                                # (days,) bool — True if any timestep NaN
-        .compute()
-    )
-
-    bad_days = set(
-        pd.DatetimeIndex(ghi_has_nan.time.values[ghi_has_nan.values])
-        .normalize()
-    )
-
-    print(f"  {len(bad_days)} bad days identified.")
-
-    # ------------------------------------------------------------------ #
-    # Step 2: Continuity filter                                           #
-    # ------------------------------------------------------------------ #
-    gaps              = times.to_series().diff().fillna(pd.Timedelta("999h"))
-    is_continuous     = (gaps == timestep)
-    continuous_series = is_continuous.astype(int)
-
-    rolling_min = (
-        continuous_series
-        .iloc[::-1]
-        .rolling(window=total_length - 1, min_periods=total_length - 1)
-        .min()
-        .iloc[::-1]
-        .shift(-(total_length - 2))
-    )
-
-    valid_mask = rolling_min == 1.0
-    valid_mask.iloc[-(total_length - 1):] = False
-    candidate_times = times[valid_mask.values]
-
-    # ------------------------------------------------------------------ #
-    # Step 3: Apply both filters — elevation first, then bad days         #
-    # Both checks are pure set lookups, no I/O                           #
-    # ------------------------------------------------------------------ #
-    valid_start_times = [
-        t0 for t0 in candidate_times
-        if all(
-            t0 + i * timestep in daytime_times
-            for i in range(total_length)
-        )
-        and not any(
-            (t0 + i * timestep).normalize() in bad_days
-            for i in range(total_length)
-        )
-    ]
-
-    print(f"  {len(candidate_times)} candidates → "
-          f"{len(valid_start_times)} after daytime + NaN filter.")
-
-    return pd.DatetimeIndex(valid_start_times)
-
 if __name__ == "__main__":
     client = Client(
         n_workers=24,
         threads_per_worker=1
     )
-    
+
     ################################################################################
     # 
     # START DATA PROCESSING
     #
     ################################################################################
-    valid_times = []
     
     # to find valid times
-    timestep        = pd.Timedelta("10min")
+    timestep = pd.Timedelta("10min")
     
     base_data_dir = Path("/scratch/er8/cd3022/CPDiT/DiT_data/")
     zarr_dir = base_data_dir / "zarr"
     os.makedirs(zarr_dir, exist_ok=True)
-    
-    
+
+    valid_times = []
     helio_list = []
     barra_list = []
     print("Starting month loop")
-    for month in range(1, 13):
-        
+    for month in range(1, 3):
         date = f"{year}-{month:02d}"
+        print(f"Processing {date}")
     
         # --------------------------------------------------------------------------- #
         # load himawari heliosat data
         # --------------------------------------------------------------------------- #
         # To properly interpolate BARRA grid and times, a larger himawari area is first taken.
         # Then, once data has been interpolated, the edges are trimmed off both to get 256x256
-        helio = get_heliosat(
+        helio = prep.get_heliosat(
             date,
             variables=helio_vars,
             lat_min=lat_min-0.5,
@@ -346,16 +140,16 @@ if __name__ == "__main__":
             lon_min=lon_min-0.5,
             lon_max=lon_max+0.5
         )
-    
+        
         
         # fill missing timestep
-        helio = interp_himawari_gaps(helio) 
+        helio = prep.interp_himawari_gaps(helio) 
         # himawari has some data from the previous UTC day, because of the AEST day. This aligns it with BARRA
         helio = helio.sel(time=slice(f"{date}-01", None))
         
-    
+        
         # load BARRA-R2 data
-        bar = get_barra(
+        bar = prep.get_barra(
             date,
             std_vars, conv_vars,
             lat_min=lat_min-0.5,
@@ -363,7 +157,7 @@ if __name__ == "__main__":
             lon_min=lon_min-0.5,
             lon_max=lon_max+0.5
         )
-    
+        
         bar = bar[barra_vars] # just the vars for this model config
         
         # Regrid to himawari resolution
@@ -373,7 +167,7 @@ if __name__ == "__main__":
             time=helio.time,
             method='nearest'
         )
-    
+        
         # Now that BARRA is regridded, trim edges to get to 256x256 patch
         helio = helio.sel(
             latitude=slice(lat_min, lat_max),
@@ -387,43 +181,47 @@ if __name__ == "__main__":
             longitude=helio.longitude,
         )
         # Record the valid times
+        # Record the valid times
         print("Finding valid start times")
-        monthly_valid_times = get_valid_start_times(helio, total_length, daytime_times)
+        monthly_valid_times = prep.get_valid_start_times(helio, total_length, daytime_times, timestep)
         valid_times.append(monthly_valid_times)
-    
+
+        # add month to list for concatenation later
         helio_list.append(helio)
         barra_list.append(bar_regrid)
-    
         print(f"finished month: {month:02d}")
-    
-    
+
     full_helio = xr.concat(helio_list, dim='time')
     full_barra = xr.concat(barra_list, dim='time')
 
+    # Combine into one dataset
+    final_ds = xr.merge([full_helio, full_barra])
+    
     # Force Dask to reconcile the chunk graph from the concat seams
-    # Align time chunk size with the time batch size (context_length + forecast_length)
     # TO DO:
     # REPLACE HARDCODED 256 WITH REFERENCE TO PATCH SIZE IN YAML CONFIG FILE
-    for var in full_helio.data_vars:
-        full_helio[var].data = da.rechunk(full_helio[var].data, chunks=(total_length, 256, 256))
-    for var in full_barra.data_vars:
-        full_barra[var].data = da.rechunk(full_barra[var].data, chunks=(total_length, 256, 256))
-
+    for var in final_ds.data_vars:
+        final_ds[var].data = da.rechunk(final_ds[var].data, chunks=(1, 256, 256))
     
-    # UPDATED TO ZARR
-    helio_file_name = zarr_dir / f"heliosat_{dit_dataset}.zarr"
-    full_helio.to_zarr(helio_file_name, mode='w')
+    # Ensure correct encoding to speed up read time
+    encoding = {
+        var: {
+            "chunks": (1, 256, 256),
+            "compressor": zarr.Blosc(cname="lz4", clevel=1, shuffle=zarr.Blosc.SHUFFLE),
+        }
+        for var in final_ds.data_vars
+    }
+    encoding["time"] = {"chunks": (1,)}
     
-    bar_file_name = zarr_dir / f"barra_{dit_dataset}.zarr"
-    full_barra.to_zarr(bar_file_name, mode='w')
+    # Save monthly combined dataset
+    file_name = zarr_dir / f"combined_{split}.zarr"
+    final_ds.to_zarr(file_name, mode="w", encoding=encoding)
     
     #######################################################################
     # Save the valid times to a parquet file for later use
     #######################################################################
     valid_times = pd.DatetimeIndex(np.concatenate(valid_times))
-    
-    
-    
+
     # save parquet file with valid times
     index_df = pd.DataFrame({
         "start_time":    valid_times,
@@ -433,9 +231,7 @@ if __name__ == "__main__":
     
     index_dir = Path("/scratch/er8/cd3022/CPDiT/index/")
     os.makedirs(index_dir, exist_ok=True)
-    index_df.to_parquet(index_dir / f"{dit_dataset}_index.parquet", index=False)
-
-
+    index_df.to_parquet(index_dir / f"{split}_index.parquet", index=False)
     
     print("Data preparation complete.")
 
