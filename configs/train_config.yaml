@@ -42,21 +42,21 @@ data:
   test_year:  2022
 
   # build_dataloader now points at the single combined stores
-  zarr_paths:
+  zarr:
     train: /scratch/er8/cd3022/CPDiT/DiT_data/zarr/combined_train.zarr
     val:   /scratch/er8/cd3022/CPDiT/DiT_data/zarr/combined_val.zarr
     test:  /scratch/er8/cd3022/CPDiT/DiT_data/zarr/combined_test.zarr
 
 
-  normalisation_stats:
-    heliosat: /scratch/er8/cd3022/CPDiT/stats/heliosat_stats.json
-    barra:    /scratch/er8/cd3022/CPDiT/stats/barra_stats.json
-    barra_quantile_transforms: /scratch/er8/cd3022/CPDiT/stats/barra_quantile_transforms.pkl
+  stats:
+    combined:            /scratch/er8/cd3022/CPDiT/DiT_data/stats/combined_stats.json
+    quantile_transforms: /scratch/er8/cd3022/CPDiT/DiT_data/stats/quantile_transforms.pkl
 
-  valid_timestamps:
-    train: /scratch/er8/cd3022/CPDiT/index/train_index.parquet
-    val:   /scratch/er8/cd3022/CPDiT/index/val_index.parquet
-    test:  /scratch/er8/cd3022/CPDiT/index/test_index.parquet
+
+  index:
+    train: /scratch/er8/cd3022/CPDiT/DiT_data/index/train_index.parquet
+    val:   /scratch/er8/cd3022/CPDiT/DiT_data/index/val_index.parquet
+    test:  /scratch/er8/cd3022/CPDiT/DiT_data/index/test_index.parquet
 
   # DataLoader settings
   num_workers: 12
