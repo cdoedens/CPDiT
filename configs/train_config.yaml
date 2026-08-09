@@ -2,7 +2,7 @@
 model:
   image_channels: 3
   image_size: 256                # Spatial size of input patches (H = W)
-  latent_dim: 256                # VAE latent vector dimension
+  latent_channels: 4              
   hidden_dim: 128                # VAE conv base channel width (D → 2D → 4D)
 
   transformer:
@@ -36,19 +36,17 @@ data:
   barra_vars:
     - KI
 
-  # Zarr stores (used by the DataLoader — fast random access)
-  heliosat_zarr:
-    train: /scratch/er8/cd3022/CPDiT/DiT_data/zarr/heliosat_train.zarr
-    val:   /scratch/er8/cd3022/CPDiT/DiT_data/zarr/heliosat_val.zarr
-    test:  /scratch/er8/cd3022/CPDiT/DiT_data/zarr/heliosat_test.zarr
-  barra_zarr:
-    train: /scratch/er8/cd3022/CPDiT/DiT_data/zarr/barra_train.zarr
-    val:   /scratch/er8/cd3022/CPDiT/DiT_data/zarr/barra_val.zarr
-    test:  /scratch/er8/cd3022/CPDiT/DiT_data/zarr/barra_test.zarr
+  data_dir: /scratch/er8/cd3022/CPDiT/DiT_data/zarr/
+  train_year: 2020
+  val_year:   2021
+  test_year:  2022
 
-  # Precomputed assets
-  regrid_weights:
-    barra_to_heliosat: /scratch/er8/cd3022/CPDiT/regridders/barra_to_heliosat.nc
+  # build_dataloader now points at the single combined stores
+  zarr_paths:
+    train: /scratch/er8/cd3022/CPDiT/DiT_data/zarr/combined_train.zarr
+    val:   /scratch/er8/cd3022/CPDiT/DiT_data/zarr/combined_val.zarr
+    test:  /scratch/er8/cd3022/CPDiT/DiT_data/zarr/combined_test.zarr
+
 
   normalisation_stats:
     heliosat: /scratch/er8/cd3022/CPDiT/stats/heliosat_stats.json
