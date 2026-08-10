@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics.functional import structural_similarity_index_measure as ssim
+from pytorch_msssim import ms_ssim
 
 
 class ResBlock(nn.Module):
@@ -200,35 +201,31 @@ class VariationalAutoencoder(nn.Module):
         return x_recon, mu, logvar
 
     # ------------------------------------------------------------------ #
-    # Loss                                                                 #
+    # Loss                                                               #
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def spectral_loss(x_recon: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        fft_recon = torch.fft.rfft2(x_recon)
+        fft_real  = torch.fft.rfft2(x)
+        return F.l1_loss(torch.abs(fft_recon), torch.abs(fft_real))
 
-    def vae_loss(
-        self,
-        x:       torch.Tensor,
-        x_recon: torch.Tensor,
-        mu:      torch.Tensor,
-        logvar:  torch.Tensor,
-        beta:    float = 0.001,
-        ssim_weight: float = 0.1,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Reconstruction (MSE + SSIM) + beta-weighted KL divergence.
+    # New loss function for cloud data
+    def vae_loss(self, x, x_recon, mu, logvar,
+                beta=0.001,
+                msssim_weight=0.7,
+                spectral_weight=0.1):
 
-        KL is computed over the full spatial latent map and normalised
-        by the number of latent elements so it stays on the same scale
-        as the reconstruction loss regardless of latent_channels or
-        image_size.
-        """
-        recon_loss = F.mse_loss(x_recon, x, reduction="mean")
-        ssim_loss  = 1.0 - ssim(x_recon, x, data_range=1.0)
+        recon_loss  = F.mse_loss(x_recon, x, reduction="mean")
+        msssim_loss = 1.0 - ms_ssim(x_recon, x, data_range=1.0, size_average=True)
+        spec_loss   = self.spectral_loss(x_recon, x)  # <-- self. required
+        kl_loss     = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
 
-        # KL over spatial map, mean-reduced to match recon scale
-        kl_loss = -0.5 * (
-            1 + logvar - mu.pow(2) - logvar.exp()
-        ).mean()
-
-        total = recon_loss + ssim_weight * ssim_loss + beta * kl_loss
+        total = (
+            recon_loss
+            + msssim_weight   * msssim_loss
+            + spectral_weight * spec_loss
+            + beta            * kl_loss
+        )
         return total, recon_loss, kl_loss
 
     def extra_repr(self) -> str:
