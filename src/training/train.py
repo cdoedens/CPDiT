@@ -45,6 +45,7 @@ class Trainer:
         self.save_every         = training_cfg.get("save_every_n_epochs", 5)
         self.vae_beta           = training_cfg.get("vae_beta", 0.01)
         self.vae_ssim_weight    = training_cfg.get("vae_ssim_weight", 0.1)
+        self.vae_subbatch       = training_cfg.get("vae_subbatch", 32)
 
         # max_epochs is a per-stage dict in the YAML
         epoch_cfg        = training_cfg.get("max_epochs", {})
@@ -62,8 +63,8 @@ class Trainer:
         self.model = LatentDiffusionTransformer(
             image_channels         = model_cfg["image_channels"],
             image_size             = model_cfg["image_size"],
-            latent_dim             = model_cfg["latent_dim"],
-            hidden_dim             = model_cfg["hidden_dim"],
+            latent_channels        = model_cfg["latent_channels"],
+            vae_hidden_dim         = model_cfg["hidden_dim"],
             num_transformer_layers = transformer_cfg["num_layers"],
             num_heads              = transformer_cfg["num_heads"],
             feedforward_dim        = transformer_cfg["feedforward_dim"],
@@ -102,7 +103,7 @@ class Trainer:
 
         # Mixed precision scaler
         self.use_amp = training_cfg.get("mixed_precision", False) and device == "cuda"
-        self.scaler  = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler  = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         logging_cfg   = config.get("logging", {})
         self.run_name = logging_cfg.get("project_name", "baseline")
@@ -124,82 +125,105 @@ class Trainer:
         return train_loader, val_loader
 
     # ------------------------------------------------------------------ #
-    # Forward steps                                                        #
+    # Forward steps                                                      #
     # ------------------------------------------------------------------ #
 
     def _stage1_step(self, context: torch.Tensor, forecast: torch.Tensor) -> torch.Tensor:
-        """Train the VAE alone on flattened image frames."""
+        vae         = self.model.module.vae if isinstance(self.model, DDP) else self.model.vae
         images      = torch.cat([context, forecast], dim=1)
         flat_images = images.reshape(-1, *images.shape[2:])
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
-            x_recon, mu, logvar = self.model.vae(flat_images)
-            loss, _, _ = self.model.vae.vae_loss(
-                flat_images,
-                x_recon,
-                mu,
-                logvar,
-                self.vae_beta,
-                self.vae_ssim_weight
-            )
-        return loss
+        n_frames    = flat_images.shape[0]
+        total_loss  = 0.0
+        n_subbatches = math.ceil(n_frames / self.vae_subbatch)
+    
+        for i in range(0, n_frames, self.vae_subbatch):
+            chunk = flat_images[i : i + self.vae_subbatch]
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                x_recon, mu, logvar = vae(chunk)
+                loss, _, _ = vae.vae_loss(
+                    chunk, x_recon, mu, logvar,
+                    self.vae_beta, self.vae_ssim_weight,
+                )
+            # Divide by n_subbatches so each chunk contributes equally
+            # regardless of batch size or vae_subbatch size
+            self.scaler.scale(loss / n_subbatches).backward()
+            total_loss += loss.item()
+    
+        return torch.tensor(total_loss / n_subbatches)
+
 
     def _stage2_step(self, context: torch.Tensor, forecast: torch.Tensor) -> torch.Tensor:
         """Train the diffusion model with frozen VAE."""
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.amp.autocast("cuda", enabled=self.use_amp):
             loss, _ = self.model(context, forecast)
         return loss
 
     # ------------------------------------------------------------------ #
     # Epoch loops                                                          #
     # ------------------------------------------------------------------ #
-
     def train_epoch(self, train_loader: DataLoader) -> float:
+        if hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(epoch)
         self.model.train()
         total_loss = 0.0
         pbar = tqdm(train_loader, desc="Training")
+
+
     
         for context, forecast in pbar:
             context  = context.to(self.device, non_blocking=True)
             forecast = forecast.to(self.device, non_blocking=True)
-            
+    
             self.optimizer.zero_grad()
-
+    
             if self.stage == 1:
+                # _stage1_step calls .backward() internally per sub-batch
                 loss = self._stage1_step(context, forecast)
             else:
                 loss = self._stage2_step(context, forecast)
-
-            self.scaler.scale(loss).backward()
-
+                self.scaler.scale(loss).backward()
+    
             if self.gradient_clip_norm > 0:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), max_norm=self.gradient_clip_norm
                 )
-
+    
             self.scaler.step(self.optimizer)
             self.scaler.update()
-
+    
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-
+    
         return total_loss / max(1, len(train_loader))
-
+        
     def _stage1_step_eval(self, context: torch.Tensor, forecast: torch.Tensor) -> torch.Tensor:
-        """Deterministic VAE forward for validation — uses mu directly, no sampling."""
+        """Deterministic VAE forward for validation in sub-batches.
+        Uses mu directly (no sampling) and mirrors the sub-batch loop
+        from _stage1_step so peak memory is identical to training.
+        """
+        vae = self.model.module.vae if isinstance(self.model, DDP) else self.model.vae
         images      = torch.cat([context, forecast], dim=1)
-        flat_images = images.reshape(-1, *images.shape[2:])
-        beta        = self.config["training"].get("vae_beta", 0.01)
+        flat_images = images.reshape(-1, *images.shape[2:])   # (B*T, C, H, W)
+        n_frames    = flat_images.shape[0]
     
-        with torch.cuda.amp.autocast(enabled=False):
-            mu, logvar  = self.model.vae.encode(flat_images)
-            x_recon     = self.model.vae.decode(mu)           # use mu, not sampled z
-            loss, recon_loss, kl_loss = self.model.vae.vae_loss(
-                flat_images, x_recon, mu, logvar, beta=beta
-            )
+        total_loss   = 0.0
+        n_subbatches = 0
     
-        return loss
+        for i in range(0, n_frames, self.vae_subbatch):
+            chunk = flat_images[i : i + self.vae_subbatch]
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                mu, logvar  = vae.encode(chunk)
+                x_recon     = vae.decode(mu)
+                loss, _, _  = vae.vae_loss(
+                    chunk, x_recon, mu, logvar,
+                    beta=self.vae_beta,
+                )
+            total_loss   += loss.item()
+            n_subbatches += 1
     
+        return torch.tensor(total_loss / n_subbatches)
+
     def validate(self, val_loader: Optional[DataLoader]) -> Optional[float]:
         self.model.eval()
         total_loss = 0.0
@@ -269,38 +293,39 @@ class Trainer:
         es_counter  = 0
 
         for epoch in range(num_epochs):
-            logger.info(f"\nEpoch {epoch + 1}/{num_epochs}  "
-                        f"(lr={self.optimizer.param_groups[0]['lr']:.2e})")
-
-            train_loss = self.train_epoch(train_loader)
-            logger.info(f"Train Loss: {train_loss:.6f}")
-
-            val_loss = self.validate(val_loader)
-            if val_loss is not None:
-                logger.info(f"Val Loss: {val_loss:.6f}")
-
-            self.scheduler.step()
-
-            if self.mlflow_enabled:
-                mlflow.log_metric("train_loss", train_loss, step=epoch)
-                mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
+            if self.is_primary:
+                logger.info(f"\nEpoch {epoch + 1}/{num_epochs}  "
+                            f"(lr={self.optimizer.param_groups[0]['lr']:.2e})")
+    
+                train_loss = self.train_epoch(train_loader)
+                logger.info(f"Train Loss: {train_loss:.6f}")
+    
+                val_loss = self.validate(val_loader)
                 if val_loss is not None:
-                    mlflow.log_metric("val_loss", val_loss, step=epoch)
-
-            if (epoch + 1) % self.save_every == 0:
-                self.save_checkpoint(epoch + 1, val_loss)
-
-            if val_loss is not None and val_loss < best_val_loss:
-                best_val_loss = val_loss
-                es_counter    = 0
-                self.save_checkpoint(epoch + 1, val_loss)
-                logger.info(f"New best model — Val Loss: {val_loss:.6f}")
-            elif es_enabled:
-                es_counter += 1
-                logger.info(f"No improvement ({es_counter}/{es_patience})")
-                if es_counter >= es_patience:
-                    logger.info("Early stopping triggered.")
-                    break
+                    logger.info(f"Val Loss: {val_loss:.6f}")
+    
+                self.scheduler.step()
+    
+                if self.mlflow_enabled:
+                    mlflow.log_metric("train_loss", train_loss, step=epoch)
+                    mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
+                    if val_loss is not None:
+                        mlflow.log_metric("val_loss", val_loss, step=epoch)
+    
+                if (epoch + 1) % self.save_every == 0:
+                    self.save_checkpoint(epoch + 1, val_loss)
+    
+                if val_loss is not None and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    es_counter    = 0
+                    self.save_checkpoint(epoch + 1, val_loss)
+                    logger.info(f"New best model — Val Loss: {val_loss:.6f}")
+                elif es_enabled:
+                    es_counter += 1
+                    logger.info(f"No improvement ({es_counter}/{es_patience})")
+                    if es_counter >= es_patience:
+                        logger.info("Early stopping triggered.")
+                        break
 
 
 # ---------------------------------------------------------------------------

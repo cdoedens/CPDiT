@@ -4,17 +4,17 @@ Data loading utilities for satellite solar nowcasting.
 Design
 ------
 CPDiTDataset        — main dataset class. Reads the precomputed valid-timestamp
-                      index (parquet), opens one or more Zarr stores per split
-                      (e.g. one per month), and routes each timestamp lookup to
-                      the correct store. This removes the need for a slow
-                      combine_zarr step — monthly stores are read directly.
-
-                      Each store is opened once per worker on the first
-                      __getitem__ call and cached for the lifetime of that
-                      worker, giving O(1) per-sample time-slice access.
+                      index (parquet), opens a single combined Zarr store once
+                      per worker, normalises all variables using precomputed
+                      per-variable statistics, and returns (context, forecast)
+                      tensor pairs ready for the model.
 
 build_dataloader    — convenience factory that constructs a CPDiTDataset and
                       wraps it in a DataLoader with the correct settings.
+
+Zarr stores are opened once per worker inside _ensure_open and cached for the
+lifetime of that worker process, giving O(1) per-sample time-slice access with
+no file-open overhead.
 """
 
 from __future__ import annotations
@@ -50,88 +50,85 @@ class CPDiTDataset(Dataset):
     """
     Dataset for the CPDiT latent diffusion model.
 
-    Accepts one or more Zarr stores per split so that monthly files can be
-    read directly without a slow combine step. Each timestamp in the
-    valid-index is mapped to the store that contains it, and sequences that
-    span a store boundary are excluded automatically during index build.
+    Each sample is identified by a start timestamp drawn from the
+    precomputed valid-timestamp index. On __getitem__ the dataset:
 
-    On __getitem__ the dataset:
-      1. Looks up the start timestamp to find which store and integer offset
-         to use — O(1), no searching at runtime.
+      1. Looks up the start timestamp in the unified time index to get
+         a contiguous integer slice — O(1), no searching at runtime.
       2. Reads exactly (context_length + forecast_length) timesteps for
-         each variable from that store.
+         each variable from the combined Zarr store.
       3. Normalises every variable to zero mean / unit variance.
+         Variables with "transform": "quantile" in combined_stats.json
+         are passed through the fitted QuantileTransformer before z-scoring.
       4. Stacks all variables along the channel axis and returns
          (context, forecast) tensors of shape (T, C, H, W) each.
+
+    The Zarr store is opened once per worker on the first __getitem__ call
+    and cached for the lifetime of that worker.
     """
 
     def __init__(
         self,
         index_path:                    str | Path,
-        zarr_paths:                    List[str | Path],
-        stats_path_heliosat:           str | Path,
-        stats_path_barra:              str | Path,
+        zarr_path:                     str | Path,
+        stats_path:                    str | Path,
         heliosat_vars:                 List[str],
         barra_vars:                    List[str],
         context_length:                int = 12,
         forecast_length:               int = 6,
         satellite_timestep:            str = "10min",
-        barra_quantile_transform_path: str | Path | None = None,
+        quantile_transform_path:       str | Path | None = None,
     ):
         """
         Args:
-            index_path:       Parquet file of valid start timestamps.
-            zarr_paths:       List of Zarr store paths (e.g. one per month).
-                              Order does not matter — timestamps are matched
-                              to stores automatically.
-            stats_path:       JSON file of per-variable normalisation stats.
-            heliosat_vars:    Heliosat variable names to load.
-            barra_vars:       BARRA variable names to load.
-            context_length:   Number of context timesteps.
-            forecast_length:  Number of forecast timesteps.
-            satellite_timestep: Temporal resolution of the data (e.g. "10min").
-            barra_quantile_transform_path:
-                              Optional path to pickled QuantileTransformer dict.
+            index_path:              Parquet file of valid start timestamps.
+            zarr_path:               Combined Zarr store (heliosat + BARRA,
+                                     single shared time axis).
+            stats_path:              combined_stats.json — flat dict keyed by
+                                     variable name with keys: mean, std, and
+                                     optionally transform: "quantile".
+            heliosat_vars:           Heliosat variable names to load.
+            barra_vars:              BARRA variable names to load.
+            context_length:          Number of context timesteps.
+            forecast_length:         Number of forecast timesteps.
+            satellite_timestep:      Temporal resolution (e.g. "10min").
+            quantile_transform_path: Path to quantile_transforms.pkl — a
+                                     pickled dict of fitted QuantileTransformers
+                                     keyed by variable name.
         """
-        self.zarr_paths                    = [Path(p) for p in zarr_paths]
-        self.stats_path_heliosat           = Path(stats_path_heliosat)
-        self.stats_path_barra              = Path(stats_path_barra)
-        self.heliosat_vars                 = heliosat_vars
-        self.barra_vars                    = barra_vars
-        self.all_vars                      = heliosat_vars + barra_vars
-        self.context_length                = context_length
-        self.forecast_length               = forecast_length
-        self.total_length                  = context_length + forecast_length
-        self.satellite_timestep            = pd.Timedelta(satellite_timestep)
-        self.barra_quantile_transform_path = Path(barra_quantile_transform_path)
+        self.zarr_path          = Path(zarr_path)
+        self.stats_path         = Path(stats_path)
+        self.heliosat_vars      = heliosat_vars
+        self.barra_vars         = barra_vars
+        self.all_vars           = heliosat_vars + barra_vars
+        self.context_length     = context_length
+        self.forecast_length    = forecast_length
+        self.total_length       = context_length + forecast_length
+        self.satellite_timestep = pd.Timedelta(satellite_timestep)
 
-        for p in self.zarr_paths:
-            if not p.exists():
-                raise FileNotFoundError(
-                    f"Zarr store not found: {p}\n"
-                    f"Run scripts/prepare_data.py first."
-                )
+        if not self.zarr_path.exists():
+            raise FileNotFoundError(f"Zarr store not found: {self.zarr_path}")
+        if not self.stats_path.exists():
+            raise FileNotFoundError(f"Stats file not found: {self.stats_path}")
 
-        if not self.stats_path_heliosat.exists():
-            raise FileNotFoundError(
-                f"Stats file not found: {self.stats_path_heliosat}"
-            )
+        # Load valid start timestamps
+        index            = pd.read_parquet(index_path)
+        self.start_times = pd.DatetimeIndex(index["start_time"].values)
 
         # Load normalisation stats
-        with open(Path(stats_path_heliosat)) as f:
-            helio_stats: Dict[str, Dict] = json.load(f)
-        with open(Path(stats_path_barra)) as f:
-            barra_stats: Dict[str, Dict] = json.load(f)
+        with open(self.stats_path) as f:
+            self._stats: Dict[str, Dict] = json.load(f)
 
-        # Merge into a single lookup used by _normalise / denormalise.
-        # BARRA entries overwrite heliosat entries on key collision (there
-        # should be none in practice).
-        self._stats: Dict[str, Dict] = {**helio_stats, **barra_stats}
+        missing = [v for v in self.all_vars if v not in self._stats]
+        if missing:
+            raise ValueError(
+                f"Variables missing from {self.stats_path.name}: {missing}"
+            )
 
         # Load quantile transforms
         self._quantile_transforms: Dict = {}
-        if barra_quantile_transform_path is not None:
-            qt_path = Path(barra_quantile_transform_path)
+        if quantile_transform_path is not None:
+            qt_path = Path(quantile_transform_path)
             if not qt_path.exists():
                 raise FileNotFoundError(
                     f"Quantile transform file not found: {qt_path}"
@@ -140,109 +137,78 @@ class CPDiTDataset(Dataset):
                 self._quantile_transforms = pickle.load(f)
 
         for var in self.barra_vars:
-            s = self._stats.get(var, {})
-            if s.get("transform") == "quantile" and var not in self._quantile_transforms:
+            if (
+                self._stats.get(var, {}).get("transform") == "quantile"
+                and var not in self._quantile_transforms
+            ):
                 warnings.warn(
-                    f"Variable '{var}' has transform='quantile' but no quantile "
-                    f"transform was loaded. Falling back to z-score only. "
-                    f"Pass barra_quantile_transform_path to fix this.",
+                    f"Variable '{var}' has transform='quantile' in "
+                    f"{self.stats_path.name} but no fitted transformer was "
+                    f"found in quantile_transforms.pkl. Falling back to "
+                    f"z-score only.",
                     UserWarning,
                     stacklevel=2,
                 )
 
-        # Build the timestamp → (store_index, integer_offset) map.
-        # Done at construction time (main process) so workers inherit it
-        # without repeating the work.
-        #
-        # We also filter the valid-index to only keep timestamps where the
-        # full sequence [start, start + total_length) fits inside a single
-        # store, so __getitem__ never has to stitch across a boundary.
-        self._ts_to_store_and_idx: Dict[pd.Timestamp, Tuple[int, int]] = {}
-        self._build_time_index()
-
-        index = pd.read_parquet(index_path)
-        all_starts = pd.DatetimeIndex(index["start_time"].values)
-
-        valid_mask  = [t in self._ts_to_store_and_idx for t in all_starts]
-        n_dropped   = (~np.array(valid_mask)).sum()
-        if n_dropped > 0:
-            warnings.warn(
-                f"{n_dropped} timestamps dropped because their full sequence "
-                f"({self.total_length} steps) crosses a Zarr store boundary "
-                f"or is not present in any store.",
-                UserWarning,
-                stacklevel=2,
-            )
-
-        self.start_times = all_starts[valid_mask]
-
-        # Zarr stores are opened lazily inside workers
-        self._stores: List[zarr.Group | None] = [None] * len(self.zarr_paths)
+        # Zarr store and time index opened lazily per worker
+        self._ds:           zarr.Group | None           = None
+        self._time_to_idx:  Dict[pd.Timestamp, int] | None = None
 
     # ------------------------------------------------------------------ #
-    # Time index construction (main process, called once at __init__)     #
+    # Lazy store initialisation (once per worker)                        #
     # ------------------------------------------------------------------ #
-    def _build_time_index(self) -> None:
+    @staticmethod
+    def _decode_time(raw: np.ndarray, attrs: dict) -> pd.DatetimeIndex:
         """
-        Build a global timestamp → (store_idx, integer_offset) map across
-        all stores. A timestamp is registered if its full window of
-        total_length steps is available, even if it spans two adjacent stores.
+        Decode a raw integer time array using the CF 'units' attribute,
+        e.g. 'minutes since 2020-01-01 00:00:00'.
         """
-        DATA_EPOCH = pd.Timestamp("2000-01-01")
+        units: str = attrs.get("units", "")
     
-        # Read every store's time array once and keep them in order
-        store_times: List[pd.DatetimeIndex] = []
-        for path in self.zarr_paths:
-            z     = zarr.open(str(path), mode="r")
-            times = DATA_EPOCH + pd.to_timedelta(
-                z["time"][:].astype(np.int64), unit="s"
+        # Parse "X since YYYY-MM-DD HH:MM:SS"
+        try:
+            freq_str, _, origin_str = units.partition(" since ")
+            origin   = pd.Timestamp(origin_str.strip())
+            freq_map = {
+                "minutes": "min",
+                "seconds": "s",
+                "hours":   "h",
+                "days":    "D",
+            }
+            pd_unit = freq_map.get(freq_str.strip().lower())
+            if pd_unit is None:
+                raise ValueError(f"Unrecognised time unit: '{freq_str}'")
+            times = origin + pd.to_timedelta(raw.astype(np.int64), unit=pd_unit)
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not decode time axis with units='{units}': {e}"
+            ) from e
+    
+        # Strip timezone so lookups against tz-naive index parquet always match
+        if times.tz is not None:
+            times = times.tz_localize(None)
+    
+        return times
+    
+    def _ensure_open(self) -> None:
+        if self._ds is not None:
+            return
+    
+        self._ds = zarr.open(str(self.zarr_path), mode="r")
+    
+        times             = self._decode_time(self._ds["time"][:], dict(self._ds["time"].attrs))
+        self._time_to_idx = {t: i for i, t in enumerate(times)}
+    
+        missing_vars = [v for v in self.all_vars if v not in self._ds]
+        if missing_vars:
+            raise KeyError(
+                f"Variables not found in {self.zarr_path.name}: {missing_vars}\n"
+                f"Available: {list(self._ds.keys())}"
             )
-            store_times.append(times)
-    
-        # Build a flat global index: timestamp → (store_idx, offset_in_store)
-        # This is used for the first timestep of each window only.
-        global_ts_to_loc: Dict[pd.Timestamp, Tuple[int, int]] = {}
-        for store_idx, times in enumerate(store_times):
-            for i, t in enumerate(times):
-                if t not in global_ts_to_loc:   # first store wins on overlap
-                    global_ts_to_loc[t] = (store_idx, i)
-    
-        # Build a flat global timeline for contiguity checks
-        # Maps timestamp → global integer position
-        all_times_sorted = sorted(global_ts_to_loc.keys())
-        global_pos       = {t: i for i, t in enumerate(all_times_sorted)}
-    
-        # Register a start timestamp only if all total_length steps exist
-        # and are contiguous (no gaps) in the global timeline
-        for t_start, (store_idx, offset) in global_ts_to_loc.items():
-            g0 = global_pos[t_start]
-            g1 = g0 + self.total_length
-    
-            # Check all required timestamps exist
-            required = all_times_sorted[g0:g1]
-            if len(required) < self.total_length:
-                continue
-    
-            # Check they are evenly spaced (no gaps)
-            diffs = pd.DatetimeIndex(required).to_series().diff().dropna()
-            if not (diffs == self.satellite_timestep).all():
-                continue
-    
-            self._ts_to_store_and_idx[t_start] = (store_idx, offset)
+
 
     # ------------------------------------------------------------------ #
-    # Lazy store opening (once per worker)                                #
-    # ------------------------------------------------------------------ #
-
-    def _ensure_open(self, store_idx: int) -> zarr.Group:
-        if self._stores[store_idx] is None:
-            self._stores[store_idx] = zarr.open(
-                str(self.zarr_paths[store_idx]), mode="r"
-            )
-        return self._stores[store_idx]
-
-    # ------------------------------------------------------------------ #
-    # Normalisation                                                        #
+    # Normalisation                                                      #
     # ------------------------------------------------------------------ #
 
     def _normalise(self, arr: np.ndarray, var: str) -> np.ndarray:
@@ -253,6 +219,7 @@ class CPDiTDataset(Dataset):
             shape = out.shape
             out   = qt.transform(out.ravel().reshape(-1, 1)).ravel().reshape(shape)
         return ((out - s["mean"]) / (s["std"] + 1e-8)).astype(np.float32)
+
 
     def denormalise(self, arr: np.ndarray, var: str) -> np.ndarray:
         s   = self._stats[var]
@@ -265,6 +232,7 @@ class CPDiTDataset(Dataset):
             ).ravel().reshape(shape).astype(np.float32)
         return out
 
+    # Backward-compatible aliases
     def denormalise_helio(self, arr: np.ndarray, var: str) -> np.ndarray:
         return self.denormalise(arr, var)
 
@@ -277,52 +245,33 @@ class CPDiTDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.start_times)
-    
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_open()
+
         start = self.start_times[idx]
-        store_idx, i0 = self._ts_to_store_and_idx[start]
+
+        if start not in self._time_to_idx:
+            raise KeyError(
+                f"Timestamp {start} not found in {self.zarr_path.name}. "
+                f"Check that the index parquet matches the Zarr store."
+            )
+
+        i0 = self._time_to_idx[start]
         i1 = i0 + self.total_length
-    
-        ds        = self._ensure_open(store_idx)
-        store_len = ds["time"].shape[0]
-    
-        if i1 <= store_len:
-            # Common case: entire window fits in one store
-            channel_arrays = [
-                self._normalise(ds[var][i0:i1].astype(np.float32), var)
-                for var in self.all_vars
-            ]
-        else:
-            # Window spans two stores — read tail of current, head of next
-            n_this = store_len - i0
-            n_next = self.total_length - n_this
-    
-            if store_idx + 1 >= len(self.zarr_paths):
-                raise RuntimeError(
-                    f"Window for {start} runs past the last store — "
-                    f"this timestamp should have been filtered during index build."
-                )
-    
-            ds_next = self._ensure_open(store_idx + 1)
-    
-            channel_arrays = [
-                self._normalise(
-                    np.concatenate([
-                        ds[var][i0:].astype(np.float32),
-                        ds_next[var][:n_next].astype(np.float32),
-                    ], axis=0),
-                    var,
-                )
-                for var in self.all_vars
-            ]
-    
+
+        channel_arrays = [
+            self._normalise(self._ds[var][i0:i1].astype(np.float32), var)
+            for var in self.all_vars
+        ]
+
         data = np.stack(channel_arrays, axis=1)   # (T, C, H, W)
-    
+
         assert data.shape[0] == self.total_length, (
             f"Expected {self.total_length} timesteps, got {data.shape[0]} "
             f"for start_time={start}."
         )
-    
+
         data_tensor = torch.from_numpy(data)
         context     = data_tensor[: self.context_length]
         forecast    = data_tensor[self.context_length :]
@@ -332,7 +281,6 @@ class CPDiTDataset(Dataset):
         return (
             f"CPDiTDataset("
             f"n_samples={len(self)}, "
-            f"n_stores={len(self.zarr_paths)}, "
             f"context_length={self.context_length}, "
             f"forecast_length={self.forecast_length}, "
             f"heliosat_vars={self.heliosat_vars}, "
@@ -371,18 +319,15 @@ def build_dataloader(
         shuffle = (split == "train")
 
     dataset = CPDiTDataset(
-        index_path                    = data_cfg["valid_timestamps"][split],
-        zarr_paths                    = data_cfg["zarr_paths"][split],
-        stats_path_heliosat           = data_cfg["normalisation_stats"]["heliosat"],
-        stats_path_barra              = data_cfg["normalisation_stats"]["barra"],
-        heliosat_vars                 = data_cfg["heliosat_vars"],
-        barra_vars                    = data_cfg["barra_vars"],
-        context_length                = data_cfg["context_length"],
-        forecast_length               = data_cfg["forecast_length"],
-        satellite_timestep            = f"{data_cfg['satellite_timestep_min']}min",
-        barra_quantile_transform_path = data_cfg["normalisation_stats"].get(
-                                            "barra_quantile_transforms"
-                                        ),
+        index_path               = data_cfg["index"][split],
+        zarr_path                = data_cfg["zarr"][split],
+        stats_path               = data_cfg["stats"]["combined"],
+        heliosat_vars            = data_cfg["heliosat_vars"],
+        barra_vars               = data_cfg["barra_vars"],
+        context_length           = data_cfg["context_length"],
+        forecast_length          = data_cfg["forecast_length"],
+        satellite_timestep       = f"{data_cfg['satellite_timestep_min']}min",
+        quantile_transform_path  = data_cfg["stats"].get("quantile_transforms"),
     )
 
     return DataLoader(
