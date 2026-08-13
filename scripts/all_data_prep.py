@@ -13,9 +13,9 @@ for split in ["train", "val", "test"]:
     with open(job_script_filename, "w") as f3:
         f3.write('#!/bin/bash \n')
         f3.write('#PBS -l walltime=4:00:00 \n')
-        f3.write('#PBS -l mem=96GB \n')
+        f3.write('#PBS -l mem=192GB \n')
         f3.write('#PBS -l ncpus=48 \n')
-        f3.write('#PBS -l jobfs=10GB \n')
+        f3.write('#PBS -l jobfs=100GB \n')
         f3.write('#PBS -l storage=gdata/dk92+gdata/rt52+scratch/nf33+gdata/rv74+gdata/rq0+gdata/ra22+gdata/xp65+gdata/er8+scratch/er8+gdata/ob53 \n')
         f3.write('#PBS -l other=hyperthread \n')
         f3.write('#PBS -q normal \n')
