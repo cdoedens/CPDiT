@@ -32,7 +32,7 @@ data:
 
 
   heliosat_vars:
-    - surface_global_irradiance
+    - surface_global_irradiance # First listed channel (i.e. channel[0]) is what the loss function will optimise for
     - solar_elevation 
 
   barra_vars:
@@ -45,10 +45,6 @@ data:
 
   # build_dataloader now points at the single combined stores
   zarr:
-    train: /scratch/er8/cd3022/CPDiT/DiT_data/zarr/combined_train.zarr
-    val:   /scratch/er8/cd3022/CPDiT/DiT_data/zarr/combined_val.zarr
-    test:  /scratch/er8/cd3022/CPDiT/DiT_data/zarr/combined_test.zarr
-  testing:
     train: /scratch/er8/cd3022/CPDiT/DiT_data/testing/combined_train.zarr
     val:   /scratch/er8/cd3022/CPDiT/DiT_data/testing/combined_val.zarr
     test:  /scratch/er8/cd3022/CPDiT/DiT_data/testing/combined_test.zarr
@@ -65,9 +61,9 @@ data:
     test:  /scratch/er8/cd3022/CPDiT/index/test_index.parquet
 
   # DataLoader settings
-  num_workers: 12
+  num_workers: 8
   pin_memory: true
-  prefetch_factor: 1             # Batches to prefetch per worker
+  prefetch_factor: 2             # Batches to prefetch per worker
 
 # -----------------------------------------------------------------------------
 # Training stages
@@ -77,8 +73,9 @@ data:
 # -----------------------------------------------------------------------------
 training:
   compile_model: True            # Set to false when debugging/diagnosing issues for better tracebacks
-  stage: 1                       # 1 = VAE only, 2 = diffusion (VAE frozen)
-  freeze_vae: false               # Must be true when stage: 2
+  stage: 2                       # 1 = VAE only, 2 = diffusion (VAE frozen)
+  freeze_vae: true               # Must be true when stage: 2
+  stage1_checkpoint: /scratch/er8/cd3022/CPDiT/checkpoints/checkpoint_epoch_050.pt
   seed: 42
   # Mixed precision — recommended for A100/V100 GPUs on Gadi
   # set to false when stage: 1
@@ -86,11 +83,9 @@ training:
 
   vae_subbatch: 64   # frames per VAE forward pass in stage 1
 
-
-  # Batch sizes — may need reducing if GPU memory is tight at 256x256
   batch_size:
-    stage1: 64
-    stage2: 64
+    stage1: 4
+    stage2: 4
 
   # Epochs
   max_epochs:
@@ -110,7 +105,7 @@ training:
 
 
   # Checkpoint settings
-  checkpoint_dir: /scratch/er8/cd3022/CPDiT/checkpoints/
+  checkpoint_dir: /scratch/er8/cd3022/CPDiT/testing_checkpoints/
   save_every_n_epochs: 5
   keep_last_n_checkpoints: 3
   resume_from: null              # Set to a checkpoint path to resume training
