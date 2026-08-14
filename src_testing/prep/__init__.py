@@ -41,8 +41,15 @@ def get_heliosat(date, variables, lat_min, lat_max, lon_min, lon_max):
     xarray dataset with data_vars=variables and lat/lon dimensions taken from within region boundaries
     '''
 
+        
+    date_dt = datetime.strptime(date, '%Y-%m')
+    if date_dt <= datetime.strptime('2019-03-31', '%Y-%m-%d'):
+        version = 'v1.0'
+    else:
+        version = 'v1.1'
+
     year, month = date.split("-")
-    file_path = Path(f'/g/data/rv74/satellite-products/arc/der/himawari-ahi/solar/p1s/v1.1/{year}/{month}/')
+    file_path = Path(f'/g/data/rv74/satellite-products/arc/der/himawari-ahi/solar/p1s/{version}/{year}/{month}/')
     files = sorted([f for f in file_path.rglob("*.nc")])
 
     
@@ -164,7 +171,7 @@ def interp_himawari_gaps(ds):
     return ds_filled
 
 
-def get_valid_start_times(ds, total_length, daytime_times, timestep, min_solar_elevation=10.0,):
+def get_valid_start_times(ds, total_length, daytime_times, timestep):
     times        = pd.DatetimeIndex(ds.time.values)
 
     # ------------------------------------------------------------------ #
@@ -172,27 +179,25 @@ def get_valid_start_times(ds, total_length, daytime_times, timestep, min_solar_e
     # Spatial mean reduces (T, H, W) → (T,) before resampling,           #
     # so the .compute() only pulls a tiny array.                          #
     # ------------------------------------------------------------------ #
-    daytime_ds = ds.sel(time=[t for t in times if t in daytime_times])
 
-    ghi_has_nan = (
+    timestep_has_nan = (
         ds["surface_global_irradiance"]
-        .sel(time=daytime_ds.time)
         .isnull()
         .any(dim=["latitude", "longitude"])   # (T,) bool — True if any pixel NaN
-        .resample(time="1D")
-        .any()                                # (days,) bool — True if any timestep NaN
         .compute()
     )
-
-    bad_days = set(
-        pd.DatetimeIndex(ghi_has_nan.time.values[ghi_has_nan.values])
-        .normalize()
+    
+    bad_timesteps = set(
+        pd.DatetimeIndex(timestep_has_nan.time.values[timestep_has_nan.values])
     )
 
-    print(f"  {len(bad_days)} bad days identified.")
+    print(f"  {len(bad_timesteps)} bad timesteps identified.")
 
     # ------------------------------------------------------------------ #
-    # Step 2: Continuity filter                                           #
+    # Step 2: Continuity filter                                          #
+    # Finds candidate start times where there are total_length
+    # time steps all of 10 mins ahead of the start time, stops window 
+    # from going overnight
     # ------------------------------------------------------------------ #
     gaps              = times.to_series().diff().fillna(pd.Timedelta("999h"))
     is_continuous     = (gaps == timestep)
@@ -200,11 +205,9 @@ def get_valid_start_times(ds, total_length, daytime_times, timestep, min_solar_e
 
     rolling_min = (
         continuous_series
-        .iloc[::-1]
         .rolling(window=total_length - 1, min_periods=total_length - 1)
         .min()
-        .iloc[::-1]
-        .shift(-(total_length - 2))
+        .shift(-(total_length - 1))
     )
 
     valid_mask = rolling_min == 1.0
@@ -218,16 +221,29 @@ def get_valid_start_times(ds, total_length, daytime_times, timestep, min_solar_e
     valid_start_times = [
         t0 for t0 in candidate_times
         if all(
-            t0 + i * timestep in daytime_times
+            t0 + i * timestep in daytime_times # check that all  times in the wind have sun in the sky
             for i in range(total_length)
         )
         and not any(
-            (t0 + i * timestep).normalize() in bad_days
+            (t0 + i * timestep) in bad_timesteps # check that there are now nan timesteps in the window
             for i in range(total_length)
         )
     ]
 
     print(f"  {len(candidate_times)} candidates → "
-          f"{len(valid_start_times)} after daytime + NaN filter.")
+          f"{len(valid_start_times)} after filter.")
 
     return pd.DatetimeIndex(valid_start_times)
+
+def get_valid_timesteps(valid_start_times, total_length, timestep):
+    """
+    Given valid start times, return the union of all timesteps
+    that fall within any valid window of length total_length.
+    """
+    print("finding all valid times, based off valid start times and total_length")
+    all_timesteps = set()
+    for t0 in valid_start_times:
+        for i in range(total_length):
+            all_timesteps.add(t0 + i * timestep)
+    print("All valid times retrieved")
+    return pd.DatetimeIndex(sorted(all_timesteps))
