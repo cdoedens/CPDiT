@@ -1,14 +1,14 @@
 #!/bin/bash 
 #PBS -l walltime=48:00:00 
-#PBS -l mem=256GB 
-#PBS -l ncpus=12
-#PBS -l ngpus=1
-#PBS -l jobfs=10GB 
+#PBS -l mem=1024GB 
+#PBS -l ncpus=48
+#PBS -l ngpus=4
+#PBS -l jobfs=100GB 
 #PBS -l storage=gdata/dk92+scratch/er8
 #PBS -l other=hyperthread 
 #PBS -q gpuhopper
 #PBS -P v46
-#PBS -o /home/548/cd3022/repos/CPDiT/outputs/logs/training.log
+#PBS -o /home/548/cd3022/repos/CPDiT/outputs/logs/training_stage2.log
 #PBS -j oe 
 
 
@@ -22,8 +22,7 @@ source hpc_setup.sh
 
 # Run training
 echo "Starting CPDiT training on GPU..."
-python -m src.training.train \
-    --config configs/train_config.yaml \
-    --device cuda
+torchrun --nproc_per_node=4 -m src_testing.training.train \
+    --config configs/experimental_config.yaml
 
 echo "Training job completed!"
