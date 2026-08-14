@@ -38,11 +38,6 @@ data:
   barra_vars:
     - KI
 
-  data_dir: /scratch/er8/cd3022/CPDiT/DiT_data/zarr/
-  train_year: 2020
-  val_year:   2021
-  test_year:  2022
-
   # build_dataloader now points at the single combined stores
   zarr:
     train: /scratch/er8/cd3022/CPDiT/DiT_data/testing/combined_train.zarr
@@ -85,7 +80,7 @@ training:
 
   batch_size:
     stage1: 4
-    stage2: 4
+    stage2: 32
 
   # Epochs
   max_epochs:
@@ -123,7 +118,7 @@ optimiser:
     betas: [0.9, 0.999]
   stage2:
     lr: 1.0e-4
-    weight_decay: 1.0e-4
+    weight_decay: 0
     betas: [0.9, 0.999]         # beta2=0.999 is standard for diffusion models
 
   scheduler:
