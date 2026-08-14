@@ -304,26 +304,42 @@ class Trainer:
             )
         return loss
 
-    def validate(self, val_loader: Optional[DataLoader]) -> Optional[float]:
+    def validate(self, val_loader: Optional[DataLoader]) -> Optional[dict[str, float]]:
+        if val_loader is None:
+            return None
+    
         self.model.eval()
-        total_loss = 0.0
+    
+        totals = {"latent_loss": 0.0, "irradiance_mse": 0.0, "irradiance_mae": 0.0}
+        n_batches = 0
+    
         with torch.no_grad():
             for context, forecast in tqdm(
                 val_loader,
                 desc="Validation",
-                disable=not self.is_primary,       # FIX 10: same as train_epoch
+                disable=not self.is_primary,
             ):
                 context  = context.to(self.device)
                 forecast = forecast.to(self.device)
-
+    
                 if self.stage == 1:
+                    # Stage 1 has no irradiance-specific metric — just VAE loss
                     loss = self._stage1_step_eval(context, forecast)
+                    totals["latent_loss"] += loss.item()
                 else:
-                    loss = self._stage2_step(context, forecast)
+                    with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
+                        # Access inner model regardless of compile wrapping
+                        inner = self._get_inner_model()
+                        metrics = inner.forward_eval(context, forecast)
+    
+                    for k, v in metrics.items():
+                        totals[k] += v.item()
+    
+                n_batches += 1
+    
+        n = max(1, n_batches)
+        return {k: v / n for k, v in totals.items()}
 
-                total_loss += loss.item()
-
-        return total_loss / max(1, len(val_loader))
 
     # ------------------------------------------------------------------ #
     # Checkpointing                                                        #
@@ -350,15 +366,24 @@ class Trainer:
             logger.info(f"Loaded Stage 1 VAE weights from {path}")
 
     
-    def save_checkpoint(self, epoch: int, val_loss: Optional[float] = None) -> Path:
-        # For stage 2, self.model is LDT (not DDP), but denoiser inside it
-        # may be DDP-wrapped — unwrap that too before saving.
+    def save_checkpoint(
+        self,
+        epoch:       int,
+        val_metrics: Optional[dict[str, float]] = None,
+    ) -> Path:
         inner = self._get_inner_model()
     
-        # Temporarily unwrap denoiser if needed so state_dict is portable
-        denoiser_was_ddp = isinstance(inner.denoiser, DDP)
-        if denoiser_was_ddp:
-            inner.denoiser = inner.denoiser.module
+        # Unwrap denoiser from both torch.compile (_orig_mod) and DDP (module)
+        # in whatever order they were applied, so saved keys are always clean.
+        denoiser_orig = inner.denoiser
+        d = denoiser_orig
+        if hasattr(d, "_orig_mod"):   # torch.compile wrapper
+            d = d._orig_mod
+        if isinstance(d, DDP):        # DDP wrapper
+            d = d.module
+        if isinstance(d, DDP) and hasattr(d, "_orig_mod"):  # edge case: compile(DDP(...))
+            d = d._orig_mod
+        inner.denoiser = d
     
         checkpoint = {
             "epoch":                epoch,
@@ -367,18 +392,19 @@ class Trainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "scaler_state_dict":    self.scaler.state_dict(),
             "config":               self.config,
-            "val_loss":             val_loss,
+            "val_metrics":          val_metrics,
         }
         path = self.checkpoint_dir / f"checkpoint_epoch_{epoch:03d}.pt"
         torch.save(checkpoint, path)
     
-        # Re-wrap so training can continue after saving
-        if denoiser_was_ddp:
-            inner.denoiser = DDP(inner.denoiser, device_ids=[self.local_rank])
+        # Restore original wrapped denoiser so training continues unaffected
+        inner.denoiser = denoiser_orig
     
         if self.is_primary:
             logger.info(f"Checkpoint saved to {path}")
         return path
+
+
 
     # ------------------------------------------------------------------ #
     # Top-level train entry point                                          #
@@ -395,6 +421,7 @@ class Trainer:
         else:
             self._training_loop(train_loader, val_loader, num_epochs)
 
+    
     def _training_loop(
         self,
         train_loader: DataLoader,
@@ -402,46 +429,60 @@ class Trainer:
         num_epochs:   int,
     ) -> None:
         best_val_loss = float("inf")
-
+    
         es_cfg      = self.config["training"].get("early_stopping", {})
         es_enabled  = es_cfg.get("enabled", False)
         es_patience = es_cfg.get("patience", 20)
         es_counter  = 0
-
+    
         for epoch in range(num_epochs):
             if self.is_primary:
                 logger.info(
                     f"\nEpoch {epoch + 1}/{num_epochs}  "
                     f"(lr={self.optimizer.param_groups[0]['lr']:.2e})"
                 )
-
-            # FIX 12: all ranks must call train_epoch/validate —
-            # previously only rank 0 did, so non-primary ranks hung
-            # waiting for DDP gradient syncs that never came
+    
             train_loss = self.train_epoch(train_loader, epoch)
-            val_loss   = self.validate(val_loader)
-
+            val_metrics = self.validate(val_loader)
+    
             self.scheduler.step()
-
+    
             if self.is_primary:
-                logger.info(f"Train Loss: {train_loss:.6f}")
-                if val_loss is not None:
-                    logger.info(f"Val Loss: {val_loss:.6f}")
-
+                logger.info(f"Train Loss (latent): {train_loss:.6f}")
+    
+                if val_metrics is not None:
+                    logger.info(
+                        f"Val — latent: {val_metrics['latent_loss']:.6f} | "
+                        f"irradiance MSE: {val_metrics['irradiance_mse']:.6f} | "
+                        f"irradiance MAE: {val_metrics['irradiance_mae']:.6f}"
+                    )
+    
                 if self.mlflow_enabled:
-                    mlflow.log_metric("train_loss", train_loss, step=epoch)
+                    mlflow.log_metric("train_latent_loss", train_loss, step=epoch)
                     mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
-                    if val_loss is not None:
-                        mlflow.log_metric("val_loss", val_loss, step=epoch)
-
+                    if val_metrics is not None:
+                        for k, v in val_metrics.items():
+                            mlflow.log_metric(f"val_{k}", v, step=epoch)
+    
                 if (epoch + 1) % self.save_every == 0:
-                    self.save_checkpoint(epoch + 1, val_loss)
-
-                if val_loss is not None and val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                    self.save_checkpoint(epoch + 1, val_metrics)
+    
+                # Use irradiance MSE as the primary criterion for best-model
+                # selection and early stopping. Fall back to latent loss for
+                # stage 1 where irradiance_mse is not available.
+                primary_metric = (
+                    val_metrics.get("irradiance_mse", val_metrics.get("latent_loss"))
+                    if val_metrics is not None
+                    else None
+                )
+    
+                if primary_metric is not None and primary_metric < best_val_loss:
+                    best_val_loss = primary_metric
                     es_counter    = 0
-                    self.save_checkpoint(epoch + 1, val_loss)
-                    logger.info(f"New best model — Val Loss: {val_loss:.6f}")
+                    self.save_checkpoint(epoch + 1, val_metrics)
+                    logger.info(
+                        f"New best model — irradiance MSE: {primary_metric:.6f}"
+                    )
                 elif es_enabled:
                     es_counter += 1
                     logger.info(f"No improvement ({es_counter}/{es_patience})")

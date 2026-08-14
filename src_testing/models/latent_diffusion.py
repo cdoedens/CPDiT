@@ -503,6 +503,62 @@ class LatentDiffusionTransformer(nn.Module):
         loss = F.mse_loss(predicted_noise, noise)
         return loss, encoded_context
 
+    @torch.no_grad()
+    def forward_eval(
+        self,
+        context_images: torch.Tensor,   # (B, T_ctx,   C, H, W)
+        target_images:  torch.Tensor,   # (B, T_fcast, C, H, W)
+    ) -> dict[str, torch.Tensor]:
+        """
+        Evaluation forward pass. Returns irradiance-specific pixel-space metrics
+        alongside the standard latent noise loss.
+    
+        The predicted clean image is estimated from the single-step x0 prediction
+        (DDPM eq. 15) rather than running the full reverse chain — this is fast
+        and gives a meaningful signal about denoiser quality at each noise level.
+    
+        Returns a dict with keys:
+            latent_loss       : standard noise-prediction MSE (all channels)
+            irradiance_mse    : pixel-space MSE on irradiance channel only
+            irradiance_mae    : pixel-space MAE on irradiance channel only
+        """
+        B      = context_images.shape[0]
+        device = context_images.device
+    
+        context_latents = self.encode_images(context_images, deterministic=True)
+        target_latents  = self.encode_images(target_images,  deterministic=True)
+        encoded_context = self._encode_context(context_latents)
+    
+        t = torch.randint(0, self.num_diffusion_steps, (B,), device=device)
+    
+        noisy_targets, noise = self.add_noise(target_latents, t)
+        predicted_noise      = self.denoiser(noisy_targets, t, encoded_context)
+    
+        # Standard latent loss — same as training
+        latent_loss = F.mse_loss(predicted_noise, noise)
+    
+        # Recover predicted x0 from noise prediction (DDPM eq. 15)
+        sqrt_ab     = self.sqrt_alphas_cumprod[t].view(B, 1, 1, 1, 1)
+        sqrt_one_ab = self.sqrt_one_minus_alphas_cumprod[t].view(B, 1, 1, 1, 1)
+        pred_x0_latent = (
+            (noisy_targets - sqrt_one_ab * predicted_noise)
+            / sqrt_ab.clamp(min=1e-8)
+        )
+    
+        # Decode to pixel space — VAE decoder is frozen so this is cheap
+        pred_images = self.decode_latents(pred_x0_latent)   # (B, T, C, H, W)
+    
+        # Score irradiance channel only
+        pred_irr   = pred_images[:, :, 0:1, :, :]
+        target_irr = target_images[:, :, 0:1, :, :]
+    
+        return {
+            "latent_loss":    latent_loss,
+            "irradiance_mse": F.mse_loss(pred_irr, target_irr),
+            "irradiance_mae": F.l1_loss(pred_irr, target_irr),
+        }
+
+
     # ------------------------------------------------------------------ #
     # Inference: DDIM reverse diffusion                                    #
     # ------------------------------------------------------------------ #
