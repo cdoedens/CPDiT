@@ -16,4 +16,7 @@ python -m src.training.train \
     --config "$CONFIG_PATH" \
     --device "$DEVICE"
 
+# torchrun --nproc_per_node=4 -m src_testing.training.train \
+#     --config "$CONFIG_PATH" \
+
 echo "Training completed!"
