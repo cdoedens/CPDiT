@@ -13,9 +13,9 @@ echo "Setting up HPC environment for CPDiT..."
 
 # Load the module
 module use /g/data/dk92/apps/Modules/modulefiles/
-module load pet/0.4.0
+module load pet/0.6.2
 
-echo "✓ Loaded pet/0.4.0 module"
+echo "✓ Loaded pet/0.6.2 module"
 
 # Verify conda is available
 if ! command -v conda &> /dev/null; then
