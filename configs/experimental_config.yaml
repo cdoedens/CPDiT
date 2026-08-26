@@ -1,6 +1,6 @@
 
 model:
-  image_channels: 3
+  image_channels: 2
   image_size: 256                # Spatial size of input patches (H = W)
   latent_channels: 4              
   hidden_dim: 128                # VAE conv base channel width (D → 2D → 4D)
@@ -8,16 +8,27 @@ model:
   
 
   transformer:
-    num_layers: 4                # Depth of the temporal transformer
-    num_heads: 8                 # Number of attention heads
-    feedforward_dim: 1024        # FFN width inside each transformer layer
+    num_layers: 4
+    num_heads: 8
+    feedforward_dim: 1024
+    transformer_dim: 512        # Irradiance token dimension (AdaLN transformer stream)
+    barra_token_dim: 128          # NWP auxiliary context token dimension (cross-attention)
     dropout: 0.1
-    max_seq_len: 64              # Must be >= context_length + forecast_length
+    max_seq_len: 64
 
   diffusion:
-    num_steps: 1000              # Total diffusion timesteps T
-    denoiser_hidden_dim: 512     # Hidden width of the DenoiserNetwork MLP
-    beta_schedule: cosine        # cosine (Nichol & Dhariwal 2021) or linear
+    num_steps: 1000
+    embed_dim:   768
+    num_blocks:  16
+    num_heads:   12
+    window_size: 31
+    ffn_mult:    4
+    cond_dim:    256
+    
+    denoiser_hidden_dim: 128    # Recommended: 128 or 256 — 512 is very memory-heavy
+    denoiser_heads: 4           # Attention heads in denoiser ContextCrossAttention blocks
+    beta_schedule: cosine
+
 
   inference:
     ddim_steps: 50               # Denoising steps at inference (~20x faster than DDPM)
@@ -26,66 +37,56 @@ model:
 
 
 data:
-  context_length: 12             # Number of past satellite frames 
-  forecast_length: 6             # Number of future frames to predict
-  satellite_timestep_min: 10     # Temporal resolution of heliosat data (minutes)
-
-
-  heliosat_vars:
-    - surface_global_irradiance # First listed channel (i.e. channel[0]) is what the loss function will optimise for
-    - solar_elevation 
-
+  sat_timestep: "10 minutes"
+  bar_timestep: "1 hour" # for iterator
+  sat_norm: 1200
+  barra_norm: 100
+  n_prior_sat: 12
+  n_post: 1
+  bounds:       [-35, -28.5, 145, 151.5]
+  inner_bounds: [-34.4, -29.3, 146.1, 151.2]
+  barra_domain: "AUST-11"
+  barra_freq:   "1hr" # for file path
+  himawari_vars:
+    - surface_global_irradiance
+    # - solar_elevation
   barra_vars:
-    - KI
+    - RH24mean
+  splits:
+    train:
+      start:    "20200101T0000"
+      end:      "20210101T0000"
+      ref_date: "20200101T0000"
+    val:
+      start:    "20210101T0000"
+      end:      "20220101T0000"
+      ref_date: "20210101T0000"
 
-  # build_dataloader now points at the single combined stores
-  zarr:
-    train: /scratch/er8/cd3022/CPDiT/DiT_data/testing/combined_train.zarr
-    val:   /scratch/er8/cd3022/CPDiT/DiT_data/testing/combined_val.zarr
-    test:  /scratch/er8/cd3022/CPDiT/DiT_data/testing/combined_test.zarr
-
+dataloader:
+  batch_size: 1
+  pin_memory: true
 
   stats:
     combined:            /scratch/er8/cd3022/CPDiT/stats/combined_stats.json
     quantile_transforms: /scratch/er8/cd3022/CPDiT/stats/quantile_transforms.pkl
 
 
-  index:
-    train: /scratch/er8/cd3022/CPDiT/index/train_index.parquet
-    val:   /scratch/er8/cd3022/CPDiT/index/val_index.parquet
-    test:  /scratch/er8/cd3022/CPDiT/index/test_index.parquet
-
   # DataLoader settings
-  num_workers: 8
+  num_workers: 0
   pin_memory: true
   prefetch_factor: 2             # Batches to prefetch per worker
 
-# -----------------------------------------------------------------------------
-# Training stages
-# Two-stage LDM recipe (Rombach et al. 2022):
-#   Stage 1 — train VAE alone until reconstruction loss converges
-#   Stage 2 — freeze VAE, train diffusion model in latent space
-# -----------------------------------------------------------------------------
+
 training:
-  compile_model: True            # Set to false when debugging/diagnosing issues for better tracebacks
-  stage: 2                       # 1 = VAE only, 2 = diffusion (VAE frozen)
-  freeze_vae: true               # Must be true when stage: 2
-  stage1_checkpoint: /scratch/er8/cd3022/CPDiT/checkpoints/checkpoint_epoch_050.pt
+  compile_model: False            # Set to false when debugging/diagnosing issues for better tracebacks
+  checkpoint: /scratch/er8/cd3022/CPDiT/checkpoints/checkpoint_epoch_050.pt
   seed: 42
-  # Mixed precision — recommended for A100/V100 GPUs on Gadi
-  # set to false when stage: 1
   mixed_precision: true          # Uses torch.cuda.amp automatically
 
-  vae_subbatch: 64   # frames per VAE forward pass in stage 1
-
-  batch_size:
-    stage1: 4
-    stage2: 32
+  batch_size: 1
 
   # Epochs
-  max_epochs:
-    stage1: 100
-    stage2: 200
+  max_epochs: 100
 
   early_stopping:
     enabled: true
@@ -112,14 +113,10 @@ training:
 # -----------------------------------------------------------------------------
 optimiser:
   name: adamw
-  stage1:
-    lr: 1.0e-4
-    weight_decay: 1.0e-4
-    betas: [0.9, 0.999]
-  stage2:
-    lr: 1.0e-4
-    weight_decay: 0
-    betas: [0.9, 0.999]         # beta2=0.999 is standard for diffusion models
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
 
   scheduler:
     name: cosine_annealing      # Smooth LR decay over training
@@ -131,7 +128,7 @@ optimiser:
 # -----------------------------------------------------------------------------
 logging:
   project_name: CPDiT
-  experiment_name: stage2_256px_12ctx_6fcast
+  experiment_name: 256px_12ctx_6fcast
   log_dir: /scratch/er8/cd3022/CPDiT/logs/
   log_every_n_steps: 50
 
