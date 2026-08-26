@@ -56,15 +56,12 @@ class CPDiTDataset(Dataset):
 
     def __init__(
         self,
-        index_path:                    str | Path,
-        zarr_path:                     str | Path,
         stats_path:                    str | Path,
         heliosat_vars:                 List[str],
         barra_vars:                    List[str],
         context_length:                int = 12,
         forecast_length:               int = 6,
         satellite_timestep:            str = "10min",
-        quantile_transform_path:       str | Path | None = None,
     ):
         """
         Args:
@@ -83,7 +80,6 @@ class CPDiTDataset(Dataset):
                                      pickled dict of fitted QuantileTransformers
                                      keyed by variable name.
         """
-        self.zarr_path          = Path(zarr_path)
         self.stats_path         = Path(stats_path)
         self.heliosat_vars      = heliosat_vars
         self.barra_vars         = barra_vars
@@ -93,14 +89,8 @@ class CPDiTDataset(Dataset):
         self.total_length       = context_length + forecast_length
         self.satellite_timestep = pd.Timedelta(satellite_timestep)
 
-        if not self.zarr_path.exists():
-            raise FileNotFoundError(f"Zarr store not found: {self.zarr_path}")
         if not self.stats_path.exists():
             raise FileNotFoundError(f"Stats file not found: {self.stats_path}")
-
-        # Load valid start timestamps
-        index            = pd.read_parquet(index_path)
-        self.start_times = pd.DatetimeIndex(index["start_time"].values)
 
         # Load normalisation stats
         with open(self.stats_path) as f:
@@ -112,69 +102,6 @@ class CPDiTDataset(Dataset):
                 f"Variables missing from {self.stats_path.name}: {missing}"
             )
 
-        # Load quantile transforms
-        self._quantile_transforms: Dict = {}
-        if quantile_transform_path is not None:
-            qt_path = Path(quantile_transform_path)
-            if not qt_path.exists():
-                raise FileNotFoundError(
-                    f"Quantile transform file not found: {qt_path}"
-                )
-            with open(qt_path, "rb") as f:
-                self._quantile_transforms = pickle.load(f)
-
-        for var in self.barra_vars:
-            if (
-                self._stats.get(var, {}).get("transform") == "quantile"
-                and var not in self._quantile_transforms
-            ):
-                warnings.warn(
-                    f"Variable '{var}' has transform='quantile' in "
-                    f"{self.stats_path.name} but no fitted transformer was "
-                    f"found in quantile_transforms.pkl. Falling back to "
-                    f"z-score only.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-
-        # Zarr store and time index opened lazily per worker
-        self._ds:           zarr.Group | None           = None
-
-    # ------------------------------------------------------------------ #
-    # Lazy store initialisation (once per worker)                        #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _decode_time(raw: np.ndarray, attrs: dict) -> pd.DatetimeIndex:
-        """
-        Decode a raw integer time array using the CF 'units' attribute,
-        e.g. 'minutes since 2020-01-01 00:00:00'.
-        """
-        units: str = attrs.get("units", "")
-    
-        # Parse "X since YYYY-MM-DD HH:MM:SS"
-        try:
-            freq_str, _, origin_str = units.partition(" since ")
-            origin   = pd.Timestamp(origin_str.strip())
-            freq_map = {
-                "minutes": "min",
-                "seconds": "s",
-                "hours":   "h",
-                "days":    "D",
-            }
-            pd_unit = freq_map.get(freq_str.strip().lower())
-            if pd_unit is None:
-                raise ValueError(f"Unrecognised time unit: '{freq_str}'")
-            times = origin + pd.to_timedelta(raw.astype(np.int64), unit=pd_unit)
-        except Exception as e:
-            raise RuntimeError(
-                f"Could not decode time axis with units='{units}': {e}"
-            ) from e
-    
-        # Strip timezone so lookups against tz-naive index parquet always match
-        if times.tz is not None:
-            times = times.tz_localize(None)
-    
-        return times
     
     def _ensure_open(self) -> None:
         if self._ds is not None:

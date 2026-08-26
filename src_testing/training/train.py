@@ -21,7 +21,7 @@ try:
 except ImportError:
     HAS_MLFLOW = False
 
-from src_testing.data import build_dataloader
+from src_testing.petdata import build_dataloader
 from src_testing.models import LatentDiffusionTransformer
 from .config import load_config
 
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class Trainer:
-    """Training loop manager for the staged LDM pipeline."""
+    """Training loop manager for end-to-end (single-stage) LDM training."""
 
     def __init__(self, config: dict, device: str = "cuda"):
         self.config     = config
@@ -44,21 +44,14 @@ class Trainer:
         transformer_cfg = model_cfg.get("transformer", {})
         diffusion_cfg   = model_cfg.get("diffusion", {})
 
-        self.stage              = training_cfg["stage"]
         self.gradient_clip_norm = training_cfg.get("gradient_clip_norm", 1.0)
         self.checkpoint_dir     = Path(training_cfg["checkpoint_dir"])
         self.save_every         = training_cfg.get("save_every_n_epochs", 5)
         self.vae_beta           = training_cfg.get("vae_beta", 0.01)
         self.vae_ssim_weight    = training_cfg.get("vae_ssim_weight", 0.1)
+        self.vae_loss_weight    = training_cfg.get("vae_loss_weight", 0.1)
 
-        epoch_cfg       = training_cfg.get("max_epochs", {})
-        self.max_epochs = (
-            epoch_cfg.get(f"stage{self.stage}", 100)
-            if isinstance(epoch_cfg, dict)
-            else int(epoch_cfg)
-        )
-
-        stage_opt = optimiser_cfg.get(f"stage{self.stage}", {})
+        self.max_epochs = int(training_cfg.get("max_epochs", 100))
 
         if self.is_primary:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -73,71 +66,40 @@ class Trainer:
             num_transformer_layers = transformer_cfg["num_layers"],
             num_heads              = transformer_cfg["num_heads"],
             feedforward_dim        = transformer_cfg["feedforward_dim"],
-            transformer_dim        = transformer_cfg.get("transformer_dim", 512),
-            barra_token_dim          = transformer_cfg.get("barra_token_dim", 128),
             num_diffusion_steps    = diffusion_cfg["num_steps"],
             denoiser_hidden_dim    = diffusion_cfg["denoiser_hidden_dim"],
-            denoiser_heads         = diffusion_cfg.get("denoiser_heads", 4),
             dropout                = transformer_cfg.get("dropout", 0.1),
         ).to(device)
 
-        # ── Stage 1 weights (must happen before freeze/DDP/compile) ───────
-        if self.stage == 2:
-            stage1_ckpt = training_cfg.get("stage1_checkpoint")
-            if stage1_ckpt is None:
-                raise ValueError(
-                    "training.stage1_checkpoint must be set in config for Stage 2 training."
-                )
-            self._load_stage1_weights(stage1_ckpt)
+        # ── DDP: wrap the entire model ─────────────────────────────────────
+        if dist.is_initialized():
+            self.model = DDP(self.model, device_ids=[self.local_rank])
 
-        # ── Stage 2: freeze VAE → DDP → compile ───────────────────────────
-        if self.stage == 2:
-            self.model.freeze_vae()
+        # ── Optional torch.compile ─────────────────────────────────────────
+        if training_cfg.get("compile_model", False):
+            if self.is_primary:
+                logger.info("Compiling model with torch.compile...")
+            torch._dynamo.config.optimize_ddp = False
+            self.model = torch.compile(
+                self.model,
+                dynamic=True,
+                mode="reduce-overhead",
+            )
 
-            if dist.is_initialized():
-                self.model.denoiser = DDP(
-                    self.model.denoiser,
-                    device_ids=[self.local_rank],
-                )
-
-            if training_cfg.get("compile_model", True):
-                if self.is_primary:
-                    logger.info("Compiling denoiser with torch.compile...")
-                torch._dynamo.config.optimize_ddp = False
-                self.model.denoiser = torch.compile(
-                    self.model.denoiser,
-                    dynamic=True,
-                    mode="reduce-overhead",
-                )
-
-        # ── Stage 1: DDP → compile (order fixed from original) ────────────
-        else:
-            if dist.is_initialized():
-                self.model = DDP(self.model, device_ids=[self.local_rank])
-
-            if training_cfg.get("compile_model", True):
-                if self.is_primary:
-                    logger.info("Compiling model with torch.compile...")
-                torch._dynamo.config.optimize_ddp = False
-                self.model = torch.compile(
-                    self.model,
-                    dynamic=True,
-                    mode="reduce-overhead",
-                )
-
-        # ── Optimiser: only non-frozen parameters ─────────────────────────
-        betas = tuple(stage_opt.get("betas", [0.9, 0.999]))
+        # ── Optimiser ─────────────────────────────────────────────────────
+        opt_cfg = optimiser_cfg.get("unified", optimiser_cfg)
+        betas   = tuple(opt_cfg.get("betas", [0.9, 0.999]))
         self.optimizer = AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr           = stage_opt["lr"],
-            weight_decay = stage_opt.get("weight_decay", 1e-4),
+            lr           = opt_cfg["lr"],
+            weight_decay = opt_cfg.get("weight_decay", 1e-4),
             betas        = betas,
         )
 
         sched_cfg     = optimiser_cfg.get("scheduler", {})
         warmup_epochs = sched_cfg.get("warmup_epochs", 0)
         min_lr        = sched_cfg.get("min_lr", 1e-6)
-        base_lr       = stage_opt["lr"]
+        base_lr       = opt_cfg["lr"]
 
         def lr_lambda(epoch: int) -> float:
             if epoch < warmup_epochs:
@@ -160,35 +122,22 @@ class Trainer:
             mlflow.set_experiment(logging_cfg.get("experiment_name", "CPDiT"))
 
     # ------------------------------------------------------------------ #
-    # VAE checkpoint (single definition)                                   #
+    # Helpers                                                              #
     # ------------------------------------------------------------------ #
 
-    def _load_stage1_weights(self, checkpoint_path: str | Path) -> None:
-        """
-        Load VAE weights from a Stage 1 checkpoint.
-        Called before DDP/compile wrapping, so self.model is always a
-        plain LatentDiffusionTransformer at this point.
-        """
-        path = Path(checkpoint_path)
-        if not path.exists():
-            raise FileNotFoundError(f"Stage 1 checkpoint not found: {path}")
+    def _get_inner_model(self) -> LatentDiffusionTransformer:
+        """Unwrap DDP and/or torch.compile to get the raw LDT."""
+        m = self.model
+        if hasattr(m, "_orig_mod"):   # torch.compile
+            m = m._orig_mod
+        if isinstance(m, DDP):        # DDP
+            m = m.module
+        if hasattr(m, "_orig_mod"):   # compile(DDP(...))
+            m = m._orig_mod
+        return m
 
-        checkpoint = torch.load(path, map_location=self.device)
-        state_dict = checkpoint["model_state_dict"]
-
-        vae_state = {
-            k.removeprefix("vae."): v
-            for k, v in state_dict.items()
-            if k.startswith("vae.")
-        }
-
-        missing, unexpected = self.model.vae.load_state_dict(vae_state, strict=True)
-        if missing:
-            raise RuntimeError(f"Missing keys loading VAE weights: {missing}")
-        if unexpected:
-            logger.warning(f"Unexpected keys loading VAE weights: {unexpected}")
-        if self.is_primary:
-            logger.info(f"Loaded Stage 1 VAE weights from {path}")
+    def _get_vae(self):
+        return self._get_inner_model().vae
 
     # ------------------------------------------------------------------ #
     # Data                                                                 #
@@ -205,51 +154,57 @@ class Trainer:
     # Forward steps                                                        #
     # ------------------------------------------------------------------ #
 
-    def _get_inner_model(self) -> LatentDiffusionTransformer:
-        """Return the unwrapped LatentDiffusionTransformer regardless of stage."""
-        m = self.model
-        if hasattr(m, "_orig_mod"):   # torch.compile wrapper
-            m = m._orig_mod
-        if isinstance(m, DDP):
-            m = m.module
-        return m
+    def _unified_step(
+        self,
+        context:  torch.Tensor,
+        forecast: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Single forward pass for end-to-end training.
 
-    def _get_vae(self):
-        return self._get_inner_model().vae
+        Returns:
+            loss:      combined loss (diffusion + vae_loss_weight * vae)
+            diff_loss: diffusion component (detached)
+            vae_loss:  VAE reconstruction + KL component (detached)
+        """
+        images      = torch.cat([context, forecast], dim=1)   # (B, T, C, H, W)
+        flat_images = images.reshape(-1, *images.shape[2:])   # (B*T, C, H, W)
 
-    def _stage1_step(self, context: torch.Tensor, forecast: torch.Tensor) -> torch.Tensor:
-        vae         = self._get_vae()
-        images      = torch.cat([context, forecast], dim=1)
-        flat_images = images.reshape(-1, *images.shape[2:])
         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-            x_recon, mu, logvar = vae(flat_images)
-            loss, _, _ = vae.vae_loss(
+            # VAE loss — keeps encoder/decoder well-conditioned during joint training
+            vae                     = self._get_vae()
+            x_recon, mu, logvar     = vae(flat_images)
+            vae_loss, _, _          = vae.vae_loss(
                 flat_images, x_recon, mu, logvar,
-                beta         = self.vae_beta,
-                ssim_weight  = self.vae_ssim_weight,
+                beta=self.vae_beta, ssim_weight=self.vae_ssim_weight,
             )
-        return loss
 
-    def _stage2_step(self, context: torch.Tensor, forecast: torch.Tensor) -> torch.Tensor:
-        with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-            loss, _ = self.model(context, forecast)
-        return loss
+            # Diffusion loss
+            diff_loss, _ = self.model(context, forecast)
+
+            loss = diff_loss + self.vae_loss_weight * vae_loss
+
+        return loss, diff_loss.detach(), vae_loss.detach()
 
     # ------------------------------------------------------------------ #
     # Epoch loops                                                          #
     # ------------------------------------------------------------------ #
 
-    def train_epoch(self, train_loader: DataLoader, epoch: int) -> float:
+    def train_epoch(
+        self,
+        train_loader: DataLoader,
+        epoch:        int,
+    ) -> dict[str, float]:
         if hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
 
         self.model.train()
         total_loss = 0.0
-        pbar = tqdm(
-            train_loader,
-            desc    = f"Epoch {epoch + 1} train",
-            disable = not self.is_primary,
-        )
+        total_diff = 0.0
+        total_vae  = 0.0
+        n_steps    = 0
+
+        pbar = tqdm(train_loader, desc="Training", disable=not self.is_primary)
 
         for context, forecast in pbar:
             context  = context.to(self.device, non_blocking=True)
@@ -257,74 +212,72 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
-            if self.stage == 1:
-                loss = self._stage1_step(context, forecast)
-            else:
-                loss = self._stage2_step(context, forecast)
+            loss, diff_loss, vae_loss = self._unified_step(context, forecast)
 
             self.scaler.scale(loss).backward()
 
             if self.gradient_clip_norm > 0:
                 self.scaler.unscale_(self.optimizer)
-                # Clip only trainable parameters — avoids iterating over
-                # frozen VAE params (no gradients) in Stage 2.
                 torch.nn.utils.clip_grad_norm_(
-                    [p for p in self.model.parameters() if p.requires_grad],
-                    max_norm = self.gradient_clip_norm,
+                    self.model.parameters(), max_norm=self.gradient_clip_norm
                 )
 
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
             total_loss += loss.item()
+            total_diff += diff_loss.item()
+            total_vae  += vae_loss.item()
+            n_steps    += 1
+
             if self.is_primary:
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+                pbar.set_postfix({
+                    "loss": f"{loss.item():.4f}",
+                    "diff": f"{diff_loss.item():.4f}",
+                    "vae":  f"{vae_loss.item():.4f}",
+                })
 
-        return total_loss / max(1, len(train_loader))
+        n = max(1, n_steps)
+        return {
+            "total":     total_loss / n,
+            "diffusion": total_diff / n,
+            "vae":       total_vae  / n,
+        }
 
-    def _stage1_step_eval(self, context: torch.Tensor, forecast: torch.Tensor) -> torch.Tensor:
-        """
-        Stage 1 eval step — mirrors _stage1_step exactly, including ssim_weight,
-        so train and val losses are computed on the same objective.
-        """
-        vae         = self._get_vae()
-        images      = torch.cat([context, forecast], dim=1)
-        flat_images = images.reshape(-1, *images.shape[2:])
-        with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-            mu, logvar = vae.encode(flat_images)
-            x_recon    = vae.decode(mu)
-            loss, _, _ = vae.vae_loss(
-                flat_images, x_recon, mu, logvar,
-                beta        = self.vae_beta,
-                ssim_weight = self.vae_ssim_weight,
-            )
-        return loss
-
-    def validate(self, val_loader: Optional[DataLoader]) -> Optional[dict[str, float]]:
+    def validate(
+        self,
+        val_loader: Optional[DataLoader],
+    ) -> Optional[dict[str, float]]:
         if val_loader is None:
             return None
 
         self.model.eval()
-        totals    = {"latent_loss": 0.0, "irradiance_mse": 0.0, "irradiance_mae": 0.0}
+        totals = {
+            "total_loss":    0.0,
+            "diff_loss":     0.0,
+            "vae_loss":      0.0,
+            "irradiance_mse": 0.0,
+            "irradiance_mae": 0.0,
+        }
         n_batches = 0
 
         with torch.no_grad():
             for context, forecast in tqdm(
-                val_loader,
-                desc    = "Validation",
-                disable = not self.is_primary,
+                val_loader, desc="Validation", disable=not self.is_primary
             ):
                 context  = context.to(self.device)
                 forecast = forecast.to(self.device)
 
-                if self.stage == 1:
-                    loss = self._stage1_step_eval(context, forecast)
-                    totals["latent_loss"] += loss.item()
-                else:
-                    with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-                        inner   = self._get_inner_model()
-                        metrics = inner.forward_eval(context, forecast)
-                    for k, v in metrics.items():
+                loss, diff_loss, vae_loss = self._unified_step(context, forecast)
+                totals["total_loss"] += loss.item()
+                totals["diff_loss"]  += diff_loss.item()
+                totals["vae_loss"]   += vae_loss.item()
+
+                # Irradiance-space metrics
+                inner   = self._get_inner_model()
+                metrics = inner.forward_eval(context, forecast)
+                for k, v in metrics.items():
+                    if k in totals:
                         totals[k] += v.item()
 
                 n_batches += 1
@@ -340,24 +293,8 @@ class Trainer:
         self,
         epoch:       int,
         val_metrics: Optional[dict[str, float]] = None,
-        tag:         str = "",
     ) -> Path:
         inner = self._get_inner_model()
-
-        # Unwrap denoiser from compile (_orig_mod) and/or DDP (module)
-        # so saved state_dict keys are always clean (no "_orig_mod." prefix).
-        denoiser_orig = inner.denoiser
-        d = denoiser_orig
-        if hasattr(d, "_orig_mod"):
-            d = d._orig_mod
-        if isinstance(d, DDP):
-            d = d.module
-        inner.denoiser = d
-
-        filename  = f"checkpoint_epoch_{epoch:03d}"
-        if tag:
-            filename += f"_{tag}"
-        filename += ".pt"
 
         checkpoint = {
             "epoch":                epoch,
@@ -368,36 +305,55 @@ class Trainer:
             "config":               self.config,
             "val_metrics":          val_metrics,
         }
-        path = self.checkpoint_dir / filename
+        path = self.checkpoint_dir / f"checkpoint_epoch_{epoch:03d}.pt"
         torch.save(checkpoint, path)
-
-        # Restore original wrapped denoiser so training continues unaffected
-        inner.denoiser = denoiser_orig
 
         if self.is_primary:
             logger.info(f"Checkpoint saved to {path}")
         return path
 
+    def load_checkpoint(self, checkpoint_path: str | Path) -> int:
+        """Load a checkpoint and return the epoch it was saved at."""
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+        checkpoint = torch.load(path, map_location=self.device)
+        self._get_inner_model().load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+
+        epoch = checkpoint.get("epoch", 0)
+        if self.is_primary:
+            logger.info(f"Resumed from checkpoint {path} (epoch {epoch})")
+        return epoch
+
     # ------------------------------------------------------------------ #
     # Top-level train entry point                                          #
     # ------------------------------------------------------------------ #
 
-    def train(self, num_epochs: Optional[int] = None):
+    def train(self, num_epochs: Optional[int] = None, resume_from: Optional[str] = None):
         num_epochs               = num_epochs or self.max_epochs
         train_loader, val_loader = self.setup_data()
+
+        start_epoch = 0
+        if resume_from is not None:
+            start_epoch = self.load_checkpoint(resume_from)
 
         if self.mlflow_enabled:
             with mlflow.start_run(run_name=self.run_name):
                 mlflow.log_params(_flatten(self.config))
-                self._training_loop(train_loader, val_loader, num_epochs)
+                self._training_loop(train_loader, val_loader, num_epochs, start_epoch)
         else:
-            self._training_loop(train_loader, val_loader, num_epochs)
+            self._training_loop(train_loader, val_loader, num_epochs, start_epoch)
 
     def _training_loop(
         self,
         train_loader: DataLoader,
         val_loader:   Optional[DataLoader],
         num_epochs:   int,
+        start_epoch:  int = 0,
     ) -> None:
         best_val_loss = float("inf")
 
@@ -405,72 +361,63 @@ class Trainer:
         es_enabled  = es_cfg.get("enabled", False)
         es_patience = es_cfg.get("patience", 20)
         es_counter  = 0
-        should_stop = False
 
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             if self.is_primary:
                 logger.info(
                     f"\nEpoch {epoch + 1}/{num_epochs}  "
                     f"(lr={self.optimizer.param_groups[0]['lr']:.2e})"
                 )
 
-            train_loss  = self.train_epoch(train_loader, epoch)
-            val_metrics = self.validate(val_loader)
+            train_metrics = self.train_epoch(train_loader, epoch)
+            val_metrics   = self.validate(val_loader)
 
             self.scheduler.step()
 
-            # ── All logging, checkpointing, and early stopping on primary ──
             if self.is_primary:
-                logger.info(f"Train loss: {train_loss:.6f}")
+                logger.info(
+                    f"Train — total: {train_metrics['total']:.6f} | "
+                    f"diffusion: {train_metrics['diffusion']:.6f} | "
+                    f"vae: {train_metrics['vae']:.6f}"
+                )
 
                 if val_metrics is not None:
                     logger.info(
-                        f"Val — latent: {val_metrics['latent_loss']:.6f} | "
+                        f"Val   — total: {val_metrics['total_loss']:.6f} | "
+                        f"diffusion: {val_metrics['diff_loss']:.6f} | "
+                        f"vae: {val_metrics['vae_loss']:.6f} | "
                         f"irradiance MSE: {val_metrics['irradiance_mse']:.6f} | "
                         f"irradiance MAE: {val_metrics['irradiance_mae']:.6f}"
                     )
 
                 if self.mlflow_enabled:
-                    mlflow.log_metric("train_latent_loss", train_loss, step=epoch)
+                    for k, v in train_metrics.items():
+                        mlflow.log_metric(f"train_{k}", v, step=epoch)
                     mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
                     if val_metrics is not None:
                         for k, v in val_metrics.items():
                             mlflow.log_metric(f"val_{k}", v, step=epoch)
 
+                if (epoch + 1) % self.save_every == 0:
+                    self.save_checkpoint(epoch + 1, val_metrics)
+
+                # Primary metric: irradiance MSE if available, else total val loss
                 primary_metric = (
-                    val_metrics.get("irradiance_mse", val_metrics.get("latent_loss"))
-                    if val_metrics is not None
-                    else None
+                    val_metrics.get("irradiance_mse") or val_metrics.get("total_loss")
+                    if val_metrics is not None else None
                 )
 
-                saved_as_best = False
                 if primary_metric is not None and primary_metric < best_val_loss:
                     best_val_loss = primary_metric
                     es_counter    = 0
-                    saved_as_best = True
-                    self.save_checkpoint(epoch + 1, val_metrics, tag="best")
+                    self.save_checkpoint(epoch + 1, val_metrics)
                     logger.info(f"New best model — primary metric: {primary_metric:.6f}")
                 elif es_enabled:
                     es_counter += 1
                     logger.info(f"No improvement ({es_counter}/{es_patience})")
                     if es_counter >= es_patience:
                         logger.info("Early stopping triggered.")
-                        should_stop = True
-
-                # Periodic save — skip if we already saved a best checkpoint
-                # this epoch to avoid writing the same weights twice.
-                if (epoch + 1) % self.save_every == 0 and not saved_as_best:
-                    self.save_checkpoint(epoch + 1, val_metrics)
-
-            # Broadcast stop signal to all ranks so they exit together
-            # rather than hanging at the next collective operation.
-            if dist.is_initialized():
-                stop_tensor = torch.tensor(int(should_stop), device=self.device)
-                dist.broadcast(stop_tensor, src=0)
-                should_stop = bool(stop_tensor.item())
-
-            if should_stop:
-                break
+                        break
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +441,9 @@ def _flatten(d: dict, parent_key: str = "", sep: str = ".") -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Train the CPDiT latent diffusion transformer")
-    parser.add_argument("--config", type=str, default="configs/train_config.yaml")
+    parser.add_argument("--config",     type=str, default="configs/train_config.yaml")
+    parser.add_argument("--resume",     type=str, default=None,
+                        help="Path to a checkpoint to resume training from")
     args = parser.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -505,7 +454,7 @@ def main():
 
     config  = load_config(args.config)
     trainer = Trainer(config, device=device)
-    trainer.train()
+    trainer.train(resume_from=args.resume)
 
     dist.destroy_process_group()
 

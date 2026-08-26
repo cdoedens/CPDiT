@@ -1,5 +1,5 @@
 """Data loading via pyearthtools pipeline for the CPDiT training script."""
-
+import traceback
 import functools
 from typing import Optional
 
@@ -107,6 +107,7 @@ def _build_pipeline(split: str, config: dict) -> petpipe.Pipeline:
     full_pipe = petpipe.Pipeline(
         (sat_pipe, bar_pipe),
         iterator=petpipe.iterators.DateRange(start_date, end_date, interval=sat_timestep),
+        exceptions_to_ignore=petdata.exceptions.DataNotFoundError,
     )
 
     return full_pipe
@@ -138,11 +139,24 @@ class PipelineDataset(IterableDataset):
         self.pipeline = pipeline
         self.config   = config
         
-
     def __iter__(self):
-        for sat_sample, bar_sample in self.pipeline:
-            print(f"timestamp: {sat_sample.time.values[-1]}")  # what time is the forecast frame?
-            # Interpolate BARRA to Himawari spatial/temporal resolution
+        image_size = self.config["model"].get("image_size", 256)
+        pipeline_iter = iter(self.pipeline)
+        while True:
+            try:
+                sat_sample, bar_sample = next(pipeline_iter)
+            except StopIteration:
+                return
+            except petdata.exceptions.DataNotFoundError as e:
+                print(f"Skipping missing data: {e}")
+                continue
+            except Exception as e:
+                print(f"Skipping sample (fetch error): {type(e).__name__}: {e}")
+                traceback.print_exc()  # ← full traceback, not just the message
+                continue
+
+            print(f"timestamp: {sat_sample.time.values[-1]}")
+             # Interpolate BARRA to Himawari spatial/temporal resolution
             bar_interp = bar_sample.interp(
                 latitude=sat_sample.latitude,
                 longitude=sat_sample.longitude,
@@ -151,22 +165,20 @@ class PipelineDataset(IterableDataset):
             )
             # Combine into one dataset
             combined_sample = xr.merge([sat_sample, bar_interp])
-            # Trim the edges to remove NANs from interpolation (256 square region)
+            # Trim the edges to remove NANs from interpolation
             combined_inner = combined_sample.isel(
                 time=slice(1, -1),
-                latitude=slice(10, 266),
-                longitude=slice(10, 236),
+                latitude=slice(10, 10+image_size),
+                longitude=slice(10, 10+image_size),
             )
-            # convert to numpy
-            arr = np.stack([combined_inner[v].values for v in combined_inner.data_vars], axis=0)  # (c, t, h, w)
-            # Rearrange c t h w -> t c h w
-            arr = np.transpose(arr, (1, 0, 2, 3))  # (t, c, h, w)
+            arr = np.stack([combined_inner[v].values for v in combined_inner.data_vars], axis=0)
+            arr = np.transpose(arr, (1, 0, 2, 3))
             tensor = torch.tensor(arr, dtype=torch.float32)
-    
+
             if torch.any(torch.isnan(tensor)):
                 print("NANs found in tensor sample, skipping...")
                 continue
-    
+
             context  = tensor[:-1]
             forecast = tensor[[-1]]
             yield context, forecast
