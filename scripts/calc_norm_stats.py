@@ -1,70 +1,94 @@
+# Core Python imports
+import os, sys
+from pathlib import Path
 import json
-import pickle
+
+# Scientific standard imports
 import numpy as np
 import xarray as xr
-from pathlib import Path
-from sklearn.preprocessing import QuantileTransformer
-import os
+import matplotlib.pyplot as plt
+import functools
+sys.path.append("/home/548/cd3022/repos/CPDiT/")
+import src.prep as prep
 
-DATA_DIR  = Path("/scratch/er8/cd3022/CPDiT/DiT_data/zarr/")
-STATS_DIR = Path("/scratch/er8/cd3022/CPDiT/stats/")
+# PyEarthTools imports including NCI cached data
+import pyearthtools.data as petdata
+import pyearthtools.pipeline as petpipe
+from pyearthtools.data.time import Petdt
 
-# Variables to apply quantile normalisation to instead of z-score.
-# Add any future skewed variables here.
-QUANTILE_VARS = {"KI"}
-N_QUANTILES   = 10_000
+my_site = 'site_archive_nci'  # set this to 'site_archive_nci', 'site_archive_jasmin' or 'site_archive_met_office'
+import importlib
+_ = importlib.import_module(my_site)
 
-FILES = [f for f in DATA_DIR.glob("*.zarr*")]
+from dask.distributed import Client
 
-ds = xr.open_mfdataset(FILES, engine="zarr", concat_dim="time", combine="nested")
+# We specify the date, hour, and minute for querying data
+date = '20200105T0000'
+start_date = '20200101T0000'
+end_date = '20210101T0000'
+bar_timestep = "1 hour" 
+sat_timestep = "10 min" 
+save_dir = Path("/scratch/er8/cd3022/CPDiT/stats/")
 
-os.makedirs(STATS_DIR, exist_ok=True)
+sat_mean_path = save_dir / "mean_sat.npy"
+sat_std_path = save_dir / "std_sat.npy"
+bar_mean_path = save_dir / "mean_bar.npy"
+bar_std_path = save_dir / "std_bar.npy"
 
-# ---------------------------------------------------------------------------
-# Heliosat — standard z-score for all variables
-# ---------------------------------------------------------------------------
-stats = {}
-transforms = {}
+iterator = petpipe.iterators.DateRange(start_date, end_date, interval=bar_timestep)
+iterator_full = petpipe.iterators.DateRange(start_date, end_date, interval=sat_timestep)
 
-for var in ds.data_vars:
+
+if __name__ == "__main__":
+    client = Client(
+        n_workers=24,
+        threads_per_worker=1
+    )
+
+    # TO DO: update to full year
+    date = "2020-01"
+
+    # TO DO: update to use config file, instead of hard coding
+    lat_min, lat_max, lon_min, lon_max = -35, -28.5, 145, 151.5
+    him_vars = [
+        "surface_global_irradiance",
+        "solar_elevation"
+    ]
+    bar_std = ["tas"]
+    bar_conv = [
+        "RH24mean"
+    ]
+    him = prep.get_heliosat(
+        date,
+        variables=him_vars,
+        lat_min=lat_min,
+        lat_max=lat_max,
+        lon_min=lon_min,
+        lon_max=lon_max
+    )
     
-    if var in QUANTILE_VARS:
-        print(f"  Applying quantile transform (n_quantiles={N_QUANTILES})...")
-        arr = ds[var].values.astype("float32").ravel()
-        arr = arr[np.isfinite(arr)]
-        qt = QuantileTransformer(
-            n_quantiles         = N_QUANTILES,
-            output_distribution = "normal",
-            subsample           = min(len(arr), 2_000_000),
-            random_state        = 42,
-        )
-        transformed = qt.fit_transform(arr.reshape(-1, 1)).ravel()
-        transforms[var] = qt
-
-        # The quantile transform already produces ~N(0,1), but we store
-        # mean/std of the transformed values so the normalisation step
-        # in the dataloader is consistent with the heliosat variables.
-        mean = float(transformed.mean())
-        std  = float(transformed.std())
-
-        norm = (transformed - mean) / (std + 1e-8)
-        print(f"  transformed mean={mean:.4f}  std={std:.4f}")
-        print(f"  → norm range [{norm.min():.2f}, {norm.max():.2f}]")
-
-        stats[var] = {"mean": mean, "std": std, "transform": "quantile"}
-
-    else:
-        print(f"  Computing stats for {var}...")
-        mean = float(ds[var].mean().compute().item())
-        std  = float(ds[var].std().compute().item())
-        stats[var] = {"mean": mean, "std": std, "transform": "none"}
-
-        print(f"  mean={mean:.4f}  std={std:.4f}")
-
-with open(STATS_DIR / "combined_stats.json", "w") as f:
-    json.dump(stats, f, indent=4)
-print(f"\nSaved stats.json\n")
-
-with open(STATS_DIR / "quantile_transforms.pkl", "wb") as f:
-    pickle.dump(transforms, f)
-print(f"Saved quantile_transforms.pkl")
+    # load BARRA-R2 data
+    bar = prep.get_barra(
+        date,
+        bar_std, bar_conv,
+        lat_min=lat_min,
+        lat_max=lat_max,
+        lon_min=lon_min,
+        lon_max=lon_max
+    )
+    
+    bar = bar[bar_conv]
+    
+    stats = {}
+    
+    for var in him.data_vars:
+        mean = him[var].mean().values.item()
+        std = him[var].std().values.item()
+        stats[var] = {"mean": mean, "std": std}
+    for var in bar.data_vars:
+        mean = bar[var].mean().values.item()
+        std = bar[var].std().values.item()
+        stats[var] = {"mean": mean, "std": std}
+    
+    with open(save_dir / "combined_stats.json", "w") as f:
+        json.dump(stats, f, indent=4)
