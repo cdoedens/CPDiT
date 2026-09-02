@@ -1,112 +1,239 @@
+# -----------------------------------------------------------------------------
+# CPDiT — latent Diffusion Transformer for solar irradiance nowcasting
+#
+# Every key below is read by the code. Nothing speculative belongs here: a
+# config key that nothing consumes is worse than no key at all.
+# -----------------------------------------------------------------------------
 
 model:
-  image_channels: 2
+  image_channels: 2              # surface_global_irradiance + RH24mean
   image_size: 256                # Spatial size of input patches (H = W)
-  latent_channels: 4              
-  hidden_dim: 128                # VAE conv base channel width (D → 2D → 4D)
+  latent_channels: 4
+  hidden_dim: 128                # VAE conv base channel width (D -> 2D -> 4D)
+  max_forecast_steps: 32         # Upper bound for the lead-time embedding table
 
-  
+  # Latent scaling for the diffusion process. Leave null to track the latent
+  # standard deviation by EMA during training (appropriate while the VAE is
+  # still learning). Set a float to freeze it — do this once the VAE has
+  # converged, using the "Latent scale (EMA std)" value logged each epoch.
+  latent_scale: null
+  latent_scale_momentum: 0.99
 
+  # Temporal transformer over the context latent sequence
   transformer:
     num_layers: 4
     num_heads: 8
     feedforward_dim: 1024
-    transformer_dim: 512        # Irradiance token dimension (AdaLN transformer stream)
-    barra_token_dim: 128          # NWP auxiliary context token dimension (cross-attention)
+    transformer_dim: 128         # Token dim for the temporal (context) stream
     dropout: 0.1
     max_seq_len: 64
 
+  # DiT denoiser under a score-based (SDE) diffusion process.
+  # The model learns grad_x log p_t(x) over continuous
+  # time under the SDE named here; there is no discrete timestep ladder.
   diffusion:
-    num_steps: 1000
-    embed_dim:   768
-    num_blocks:  16
-    num_heads:   12
-    window_size: 31
-    ffn_mult:    4
-    cond_dim:    256
-    
-    denoiser_hidden_dim: 128    # Recommended: 128 or 256 — 512 is very memory-heavy
-    denoiser_heads: 4           # Attention heads in denoiser ContextCrossAttention blocks
-    beta_schedule: cosine
+    # vp_cosine | vp | ve
+    #   vp_cosine  variance preserving with the cosine alpha_bar (default)
+    #   vp         variance preserving, linear beta (continuous limit of DDPM)
+    #   ve         variance exploding (classic NCSN / score matching)
+    sde: vp_cosine
+    cosine_s:  0.008             # vp_cosine only
+    beta_min:  0.1               # vp only
+    beta_max:  20.0              # vp only
+    sigma_min: 0.01              # ve only
+    sigma_max: 50.0              # ve only
+    # Time floor. sigma(0) = 0 makes the score singular, so training and
+    # sampling both live on [t_eps, 1]. null uses the SDE's own default
+    # (1e-3 for VP, 1e-5 for VE).
+    t_eps: null
 
+    # sigma2     lambda(t) = sigma(t)^2 — variance-reduced, the usual choice
+    # likelihood lambda(t) = g(t)^2 — makes the loss an NLL bound
+    loss_weighting: sigma2
+    # Continuous t in [0,1] is multiplied by this before the sinusoidal time
+    # embedding, whose frequencies expect the O(1000) range.
+    time_scale: 1000.0
+
+    patch_size:  4               # 4x4 strided-conv patch embedding
+    embed_dim:   768             # DiT token width
+    num_blocks:  4              # DiT depth
+    num_heads:   12
+    ffn_mult:    4
+    cond_dim:    256             # Width of the adaLN-Zero conditioning vector
+    window_size: 31              # 2-D neighbourhood attention window (must be odd)
+
+    # null = use the fused NATTEN kernels when importable, else the exact
+    # PyTorch fallback. Force with true/false.
+    use_natten: null
 
   inference:
-    ddim_steps: 50               # Denoising steps at inference (~20x faster than DDPM)
-    eta: 0.0                     # 0.0 = deterministic, 1.0 = stochastic DDPM
-    num_ensemble_members: 1      # Set >1 to generate probabilistic ensembles
+    # pc  reverse-time SDE + Langevin corrector (stochastic; use for ensembles)
+    # ode probability-flow ODE (deterministic given the initial noise)
+    sampler: pc
+    num_steps: 100               # reverse integration steps
+    num_ensemble_members: 1
 
-
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
 data:
-  sat_timestep: "10 minutes"
-  bar_timestep: "1 hour" # for iterator
-  sat_norm: 1200
-  barra_norm: 100
-  n_prior_sat: 12
-  n_post: 1
+  sat_timestep: "10 minutes"     # Iterator stride between sample windows
+  n_prior_sat: 12                # Context frames (t-120min .. t-10min)
+  n_post: 1                      # Forecast frames, starting at t
+
+  # Windows overlap heavily at a 10-minute cadence; take every Nth window to
+  # decorrelate consecutive samples. Works together with shuffle_buffer below.
+  sample_stride: 3
+
+  # Skip anchor dates in this inclusive UTC hour range (wraps past midnight);
+  # null keeps every hour. A sample needs its whole context window in daylight,
+  # and outside that the irradiance field is absent or NaN, so these dates cost
+  # a full archive fetch and yield nothing. MEASURED over this domain
+  # (145-151.5E, UTC+10): UTC 09-21 gave 0 usable samples out of 26 attempts;
+  # UTC 22-08 (local 08:00-18:00) gave all of them.
+  # This is a fixed clock window, not a solar calculation — it sits inside
+  # daylight year-round, so in summer it discards some genuinely usable
+  # early-morning and late-evening samples. Widen it if you want those.
+  skip_utc_hours: [9, 21]
+
   bounds:       [-35, -28.5, 145, 151.5]
-  inner_bounds: [-34.4, -29.3, 146.1, 151.2]
+  crop_offset:  10               # Pixels trimmed from the bounded region edge
+  irradiance_channel: 0          # Channel scored by the pixel-space metrics
+
   barra_domain: "AUST-11"
-  barra_freq:   "1hr" # for file path
+  barra_freq:   "1hr"
   himawari_vars:
     - surface_global_irradiance
-    # - solar_elevation
   barra_vars:
     - RH24mean
+
   splits:
     train:
-      start:    "20200101T0000"
-      end:      "20210101T0000"
-      ref_date: "20200101T0000"
+      start: "20200101T0000"
+      end:   "20210101T0000"
     val:
-      start:    "20210101T0000"
-      end:      "20220101T0000"
-      ref_date: "20210101T0000"
+      start: "20210101T0000"
+      end:   "20220101T0000"
 
+  # Statistics are in RAW PHYSICAL UNITS. The pipeline must not apply any other
+  # scaling to these fields before the z-score, or the two compose and collapse
+  # the signal to a near-constant field.
+  stats_path: "/scratch/er8/cd3022/CPDiT/stats/combined_stats.json"
+
+# -----------------------------------------------------------------------------
+# DataLoader
+# -----------------------------------------------------------------------------
 dataloader:
-  batch_size: 1
-  pin_memory: true
+  batch_size: 2
+  # MEASURED on 1x H200 (12 CPUs), September 2026:
+  #   archive read, 10 workers ......... 1.04 samples/s
+  #   warm cache read, 0 workers ....... 304   samples/s  (3.3 ms/sample)
+  #   GPU capability, batch 2 .......... 6.96 samples/s   (7.81 at batch 16)
+  #
+  # End-to-end training, same 3 epochs:
+  #   epoch 1 (cold) ... 0.36 samples/s | data wait 93% | compute  7%
+  #   epoch 2 (warm) ... 7.89 samples/s | data wait  4% | compute 96%
+  #
+  # With the cache warm the run is GPU-bound, so workers barely matter: a
+  # single worker already serves 40x what the GPU can eat, and num_workers: 0
+  # avoids the spawn startup entirely. Workers only help the COLD pass. They
+  # are I/O-bound, not CPU-bound (load avg 21 with 87% CPU idle), and
+  # oversubscribing does not work — 24 spawn workers never finished starting in
+  # 15 minutes, because each re-imports pyearthtools inside the container.
+  # Keep this at roughly (CPUs per GPU - 2) while priming; drop it to 0-2 once
+  # the cache is warm.
+  num_workers: 10                # Pipeline is built per worker, so >0 is safe
+  # Workers are spawned (not forked): the pipeline is not fork-safe and
+  # CUDA/NCCL are live by the time the loader is built. Precautionary.
+  multiprocessing_context: spawn
+  prefetch_factor: 2
+  persistent_workers: true
+  pin_memory: false
+  drop_last: true
+  shuffle_buffer: 256            # Reservoir size for the in-stream shuffle
+  # Samples held back before the first yield. The buffer is NOT pre-filled:
+  # at ~20s of archive I/O per sample, pre-filling 256 slots cost ~80 minutes
+  # of GPU idle before the first batch. Keep this near one batch.
+  shuffle_min_fill: 8
 
-  stats:
-    combined:            /scratch/er8/cd3022/CPDiT/stats/combined_stats.json
-    quantile_transforms: /scratch/er8/cd3022/CPDiT/stats/quantile_transforms.pkl
+  # ---- Transparent sample cache ------------------------------------------
+  # A sample costs ~16-20s to build from the archive and ~3 ms to read back,
+  # and the recipe is deterministic, so every epoch after the first can be
+  # served from local disk. The cache key hashes the variables, bounds, window,
+  # crop and the normalisation statistics, so editing any of them starts a new
+  # namespace automatically — there is no manual invalidation step, and stale
+  # tensors can never be served for a changed config.
+  #
+  # /scratch persists across jobs, so the archive cost is paid once ever.
+  # $PBS_JOBFS is faster local NVMe but is destroyed when the job ends, which
+  # means re-paying the first epoch every job — only worth it if /scratch is
+  # under pressure. Set to null to disable.
+  # The cache stores individual FRAMES, not assembled samples. Samples overlap
+  # (the window is 13 frames but advances sample_stride=3), so each frame belongs
+  # to ~5 samples; caching frames stores and decodes each exactly once.
+  # ~11 GB per year of frames at float16, against ~56 GB of assembled samples.
+  cache_dir: /scratch/er8/cd3022/CPDiT/sample_cache
+  # float16 halves cache size and read time. The model trains in bf16, which
+  # has *fewer* mantissa bits than float16, so this loses no usable precision.
+  cache_dtype: float16
 
-
-  # DataLoader settings
-  num_workers: 0
-  pin_memory: true
-  prefetch_factor: 2             # Batches to prefetch per worker
-
-
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
 training:
-  compile_model: False            # Set to false when debugging/diagnosing issues for better tracebacks
-  checkpoint: /scratch/er8/cd3022/CPDiT/checkpoints/checkpoint_epoch_050.pt
+  # Recommended workflow, in order:
+  #   1. Prime the cache with NO GPU (the cold pass is pure I/O):
+  #        python -m src.training.train --config <cfg> --prime-cache
+  #      on the `normal` queue with plenty of CPUs. ~17.5k samples at ~1
+  #      sample/s/worker; this is the one expensive pass and it is paid once,
+  #      because the cache lives on /scratch and survives the job.
+  #   2. Train on GPUs against the warm cache — measured 96% GPU busy, so 4x
+  #      H200 now scales roughly linearly instead of sharing one I/O bottleneck.
+  # A full epoch is then ~17568 / (7.9 x n_gpu) seconds: ~37 min on one H200,
+  # ~9 min on four. 100 epochs still needs --resume across jobs.
   seed: 42
-  mixed_precision: true          # Uses torch.cuda.amp automatically
+  compile_model: True       # Set false when debugging for better tracebacks
+  # default | max-autotune | reduce-overhead. Avoid reduce-overhead: it enables
+  # CUDA graphs, which segfault on this graph (inductor partitions it around
+  # device copies) and gain little at this step time.
+  compile_mode: default
+  # bf16 | fp16 | fp32. bf16 needs no GradScaler, but it also needs Ampere
+  # (sm_80+): on the V100s of the gpuvolta queue it has no tensor-core path and
+  # measured 10.4 TFLOP/s against fp16's 92.1 — slower even than fp32. The
+  # trainer detects that and falls back to fp16 with a warning, so this key can
+  # stay bf16 and remain correct on newer cards.
+  precision: bf16
 
-  batch_size: 1
-
-  # Epochs
   max_epochs: 100
+  gradient_accumulation_steps: 2
+  gradient_clip_norm: 1.0
+
+  # Joint VAE + diffusion training
+  vae_loss_weight: 0.1
+  vae_beta: 0.01                 # KL weight
+  vae_ssim_weight: 0.1
 
   early_stopping:
     enabled: true
-    patience: 10                 # Epochs without improvement before stopping
-    monitor: val_loss            # Metric to monitor
+    patience: 10
+    monitor: irradiance_mse      # Key from the validation metrics dict
 
-  # Gradient clipping — important for transformer stability
-  gradient_clip_norm: 1.0
-  vae_beta: 0.01                     # KL loss weight for VAE training
-  vae_ssim_weight: 0.1               # SSIM loss weight for VAE training
-
-
-
-  # Checkpoint settings
   checkpoint_dir: /scratch/er8/cd3022/CPDiT/testing_checkpoints/
   save_every_n_epochs: 5
-  keep_last_n_checkpoints: 3
-  resume_from: null              # Set to a checkpoint path to resume training
-
+  keep_last_n_checkpoints: 3     # best_model.pt is never rotated away
   log_dir: /scratch/er8/cd3022/CPDiT/logs/
+
+# -----------------------------------------------------------------------------
+# Evaluation
+# -----------------------------------------------------------------------------
+evaluation:
+  # Integrating the full reverse process is expensive, so forecast skill is
+  # only measured on the first N validation batches. 0 disables it.
+  forecast_eval_batches: 4
+  num_steps: 100
+  # ODE by default: deterministic, so the metric tracks the model rather than
+  # the sampler's noise draw.
+  sampler: ode
 
 # -----------------------------------------------------------------------------
 # Optimiser
@@ -117,40 +244,26 @@ optimiser:
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
 
-
   scheduler:
-    name: cosine_annealing      # Smooth LR decay over training
-    warmup_epochs: 5            # Linear warmup from 0 to lr over first 5 epochs
-    min_lr: 1.0e-6              # Floor for cosine decay
+    name: cosine_annealing
+    warmup_epochs: 5
+    min_lr: 1.0e-6
 
 # -----------------------------------------------------------------------------
-# Logging and evaluation
+# Logging
 # -----------------------------------------------------------------------------
 logging:
   project_name: CPDiT
-  experiment_name: 256px_12ctx_6fcast
+  experiment_name: 256px_12ctx_1fcast_dit
   log_dir: /scratch/er8/cd3022/CPDiT/logs/
-  log_every_n_steps: 50
-
-  # Metrics to track at validation time
-  metrics:
-    - mse
-    - mae
-    - ssim                      # Structural similarity — better for image quality
-    - crps                      # Continuous ranked probability score for ensembles
-
-  # Log sample forecast images to wandb/tensorboard every N epochs
-  visualise_every_n_epochs: 5
-  num_visualisation_samples: 4  # Number of sequences to visualise
 
 # -----------------------------------------------------------------------------
-# HPC / Gadi job settings
-# (used by scripts/train.pbs to set resource requests)
+# HPC / Gadi job settings (used by scripts/train.pbs)
 # -----------------------------------------------------------------------------
 hpc:
-  ncpus: 8
+  ncpus: 48                      # Matches scripts/train.pbs; 10 workers x 4 ranks
   ngpus: 4
-  mem_gb: 128
+  mem_gb: 382
   walltime: "48:00:00"
   queue: gpuvolta
   project: er8
