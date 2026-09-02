@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 import sys, os
 import json
 import yaml
-import xesmf as xe
 import shutil
 
 from metpy.calc import dewpoint_from_specific_humidity
@@ -122,22 +121,23 @@ def get_barra(date, std_vars, conv_vars, lat_min, lat_max, lon_min, lon_max):
     # To fix this and make sure the model is trained off all environments,
     # set MUEL to 0 where there are nan values.
     # Other variables (e.g. CIN) are not so easily set to 0
-    bar['MUEL'] = xr.where(bar['MUEL'].isnull(), 0, bar['MUEL'])
+    if "MUEL" in conv_vars:
+        bar['MUEL'] = xr.where(bar['MUEL'].isnull(), 0, bar['MUEL'])
     
-    
-    # Calculate dew points for thunderstorm parameters
-    for pressure in ['850', '700', '500']:
-        bar[f'dp{pressure}'] = (
-            dewpoint_from_specific_humidity(
-                pressure=int(pressure) * units.hPa,
-                specific_humidity=bar[f'hus{pressure}'] * units('g/g'),
+    if "KI"in conv_vars:
+        # Calculate dew points for thunderstorm parameters
+        for pressure in ['850', '700', '500']:
+            bar[f'dp{pressure}'] = (
+                dewpoint_from_specific_humidity(
+                    pressure=int(pressure) * units.hPa,
+                    specific_humidity=bar[f'hus{pressure}'] * units('g/g'),
+                )
+                .metpy.convert_units('K')   # or 'K' depending on your preference
+                .metpy.dequantify()            # removes units → returns plain DataArray
             )
-            .metpy.convert_units('K')   # or 'K' depending on your preference
-            .metpy.dequantify()            # removes units → returns plain DataArray
-        )
-    
-    # Convective Parameters from RAW TS Climatology Paper
-    bar['KI'] = bar['ta850'] - bar['ta500'] + bar['dp850'] - (bar['ta700'] - bar['dp700'])
+        
+        # Convective Parameters from RAW TS Climatology Paper
+        bar['KI'] = bar['ta850'] - bar['ta500'] + bar['dp850'] - (bar['ta700'] - bar['dp700'])
     # bar['TCD'] = bar['MUEL'] - bar['MULCL']
 
     return bar

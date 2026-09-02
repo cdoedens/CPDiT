@@ -1,31 +1,105 @@
 """
 Latent Diffusion Transformer for satellite image forecasting.
 
-Training follows the two-stage LDM recipe (Rombach et al. 2022):
-  Stage 1 — Train VAE alone (see vae.py / training scripts).
-  Stage 2 — Freeze VAE, train the diffusion model in latent space.
+This is the top-level assembly. It owns the sub-modules, defines the score
+function, implements the training objective, and exposes sampling. Nothing here
+implements a network or an SDE — those live in `networks.py` and `diffusion.py`.
 
-Latent space:
-  The VAE now produces spatial latent maps of shape
-  (latent_channels, H/8, W/8) rather than flat vectors.
-  For image_size=256 this gives (4, 32, 32) per frame.
+Module map
+----------
+    vae.py         VariationalAutoencoder   pixels <-> latent maps
+    networks.py    ContextEncoder           temporal encoder (learned)
+                   DiTDenoiser              score network   (learned)
+    diffusion.py   VPSDE / CosineVPSDE /    forward process (no parameters)
+                   VESDE, pc_sampler,       reverse-time samplers
+                   ode_sampler
+    THIS FILE      LatentDiffusionTransformer
 
-  The diffusion model operates entirely on these spatial maps.
-  The transformer encodes the context sequence by treating each
-  frame's flattened latent map as a token sequence.
+Forward pass, end to end
+------------------------
+    context frames + target frames
+        |
+        v  vae.encode (one pass over every frame)
+    latent maps ---> scaled by latent_std
+        |                    |
+        | context split      | target split
+        v                    v
+    latent_to_token      perturb(x0, t) via the SDE  -> x_t, z, sigma
+        v                    |
+    ContextEncoder ----------+
+        |                    |
+        +--------> DiTDenoiser(x_t, t, ctx_tokens, ctx_latents) -> out
+                             |
+                             v  score = -out / sigma
+                   denoising score matching loss against -z/sigma
 
-Diffusion formulation:
-  - Forward process : q(x_t | x_0) = N(sqrt(ā_t)*x_0, (1-ā_t)*I)
-  - Training target : predict noise epsilon added at timestep t
-  - Reverse process : DDPM posterior update (Ho et al. 2020)
-  - Fast inference  : DDIM sampler (Song et al. 2020)
+Sampling reverses this: start from the SDE's prior, integrate with the reverse
+SDE or the probability-flow ODE calling `score()` at each step, then decode.
+
+Conditioning
+------------
+The denoiser receives the context twice, deliberately:
+
+  - *Spatially*, by concatenating the context latent frames to the noisy latent
+    along the channel axis before patch embedding. This preserves the full
+    spatial structure of the recent past, which a pooled vector cannot.
+  - *Globally*, through adaLN-Zero, from the pooled temporal-transformer summary
+    together with the diffusion timestep and the forecast lead time.
+
+The lead-time embedding is what allows different forecast frames to be
+distinguished; without it every frame of the horizon would be an identical
+draw from the same conditional distribution.
+
+Latent scaling
+--------------
+Diffusion assumes the data it corrupts has roughly unit variance, but VAE
+latents have an arbitrary scale. We track an EMA of the latent standard
+deviation and divide by it, which is the running-statistics analogue of Stable
+Diffusion's fixed 0.18215 factor. Set ``latent_scale`` explicitly in the config
+to freeze it (appropriate once the VAE has stopped moving).
+
+Score-based formulation
+-----------------------
+This is a score-based generative model in the SDE framework of Song et al.
+(2021), not a discrete DDPM. The model learns the *score* of the perturbed data
+distribution, ``s_theta(x, t) ~= grad_x log p_t(x)``, over continuous time.
+
+  - Forward process : dx = f(x, t) dt + g(t) dw, with a Gaussian kernel
+                      p(x_t | x_0) = N(alpha(t) x_0, sigma(t)^2 I)
+  - Training        : denoising score matching. The kernel score is known in
+                      closed form, ``-z / sigma``, so the objective is
+                      ``E_t lambda(t) || s_theta(x_t, t) + z/sigma ||^2``.
+  - Sampling        : reverse-time SDE with a Langevin corrector
+                      (predictor-corrector), or the probability-flow ODE.
+
+Score parameterisation
+----------------------
+The network emits ``out``, and the score is defined as ``s_theta = -out/sigma(t)``.
+This is the standard VP parameterisation: it keeps the regression target unit
+variance at every noise level, so a single network output scale works across
+the whole of t, and it keeps the score finite as sigma -> 0 is approached rather
+than having the network learn an O(1/sigma) blow-up. `score()` is the primary
+interface; the raw output is an implementation detail.
+
+Note this makes the default ``sigma^2``-weighted objective numerically identical
+to epsilon-prediction MSE — that equivalence is a known property of the VP
+family, not an accident, and it is why the switch does not destabilise training.
+What is genuinely different is everything built on the score: continuous time,
+the choice of SDE, the reverse-SDE/Langevin sampler, the probability-flow ODE,
+and likelihood weighting (``lambda(t) = g(t)^2``), which is *not* equivalent to
+epsilon-MSE and targets the exact log-likelihood bound.
 
 References:
-  - Ho et al. 2020           — https://arxiv.org/abs/2006.11239
-  - Song et al. 2020         — https://arxiv.org/abs/2010.02502
-  - Nichol & Dhariwal 2021   — https://arxiv.org/abs/2102.09672
-  - Rombach et al. 2022      — https://arxiv.org/abs/2112.10752
+  - Song et al. 2021         - https://arxiv.org/abs/2011.13456 (score SDEs)
+  - Song & Ermon 2019        - https://arxiv.org/abs/1907.05600 (NCSN)
+  - Vincent 2011             - denoising score matching
+  - Ho et al. 2020           - https://arxiv.org/abs/2006.11239 (DDPM)
+  - Nichol & Dhariwal 2021   - https://arxiv.org/abs/2102.09672 (cosine)
+  - Rombach et al. 2022      - https://arxiv.org/abs/2112.10752 (latent)
+  - Peebles & Xie 2023       - https://arxiv.org/abs/2212.09748 (DiT)
 """
+
+from __future__ import annotations
 
 import math
 from typing import Optional
@@ -34,293 +108,82 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .diffusion import SDE, broadcast_to, build_sde, ode_sampler, pc_sampler
+from .networks import ContextEncoder, DiTDenoiser
 from .vae import VariationalAutoencoder
-from .transformer_backbone import TransformerBackbone
 
-
-# ---------------------------------------------------------------------------
-# Timestep embedding
-# ---------------------------------------------------------------------------
-
-class SinusoidalTimestepEmbedding(nn.Module):
-    """
-    Sinusoidal timestep embedding followed by a two-layer MLP.
-
-    Output dim is chosen to match the denoiser's internal channel width
-    so the embedding can be broadcast-added to feature maps.
-    """
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.SiLU(),
-            nn.Linear(dim * 4, dim),
-        )
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            t: (B,) integer diffusion timesteps.
-        Returns:
-            emb: (B, dim)
-        """
-        half  = self.dim // 2
-        freqs = torch.exp(
-            -math.log(10000.0)
-            * torch.arange(half, device=t.device).float()
-            / (half - 1)
-        )
-        args = t[:, None].float() * freqs[None]
-        emb  = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        if self.dim % 2 != 0:
-            emb = F.pad(emb, (0, 1))
-        return self.mlp(emb)
-
-
-# ---------------------------------------------------------------------------
-# Spatial denoiser (U-Net style)
-# ---------------------------------------------------------------------------
-
-class ResBlockSpatial(nn.Module):
-    """
-    Spatial residual block conditioned on a timestep + context embedding.
-
-    The conditioning vector is projected to (2 * channels) and used for
-    FiLM-style scale/shift modulation after the first GroupNorm, which is
-    more expressive than simple addition.
-    """
-
-    def __init__(self, channels: int, cond_dim: int, num_groups: int = 8):
-        super().__init__()
-        self.norm1 = nn.GroupNorm(num_groups, channels)
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(num_groups, channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.act   = nn.SiLU()
-
-        # FiLM conditioning: project cond → scale and shift for each channel
-        self.cond_proj = nn.Linear(cond_dim, channels * 2)
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x:    (B, C, H, W)
-            cond: (B, cond_dim)
-        Returns:
-            (B, C, H, W)
-        """
-        scale, shift = self.cond_proj(cond).chunk(2, dim=-1)   # each (B, C)
-        scale = scale[:, :, None, None]                         # (B, C, 1, 1)
-        shift = shift[:, :, None, None]
-
-        h = self.norm1(x)
-        h = h * (1.0 + scale) + shift                          # FiLM modulation
-        h = self.act(h)
-        h = self.conv1(h)
-        h = self.norm2(h)
-        h = self.act(h)
-        h = self.conv2(h)
-        return x + h
-
-
-class DenoiserNetwork(nn.Module):
-    """
-    Lightweight U-Net denoiser that operates on spatial latent maps.
-
-    Input:  (B, T_fcast, latent_channels, Hl, Wl)  — noisy forecast latents
-    Output: (B, T_fcast, latent_channels, Hl, Wl)  — predicted noise
-
-    Each forecast frame is denoised independently but conditioned on the
-    same (timestep, context) embedding, so the model is frame-agnostic
-    and generalises to any forecast length.
-
-    Architecture (per frame):
-        entry conv
-        → down1 (D)   → down2 (2D)  → bottleneck (4D)
-        → up1   (2D)  → up2   (D)
-        → exit conv
-
-    All ResBlocks are FiLM-conditioned on [t_emb + ctx_emb].
-    """
-
-    def __init__(
-        self,
-        latent_channels: int,
-        latent_size:     int,
-        context_dim:     int,
-        hidden_dim:      int = 128,
-    ):
-        """
-        Args:
-            latent_channels: Channels in the VAE latent map (e.g. 4).
-            latent_size:     Spatial size of the latent map (e.g. 32 for 256px images).
-            context_dim:     Dimension of the transformer context output token.
-            hidden_dim:      Base channel width of the U-Net.
-        """
-        super().__init__()
-
-        D        = hidden_dim
-        cond_dim = D * 4   # conditioning vector width
-
-        # ------------------------------------------------------------------ #
-        # Conditioning: timestep + context → single conditioning vector       #
-        # ------------------------------------------------------------------ #
-        self.time_emb    = SinusoidalTimestepEmbedding(D)
-        self.ctx_proj    = nn.Linear(context_dim, D)
-        self.cond_fusion = nn.Sequential(
-            nn.Linear(D * 2, cond_dim),
-            nn.SiLU(),
-            nn.Linear(cond_dim, cond_dim),
-        )
-
-        # ------------------------------------------------------------------ #
-        # U-Net encoder                                                        #
-        # ------------------------------------------------------------------ #
-        self.entry  = nn.Conv2d(latent_channels, D, kernel_size=3, padding=1)
-
-        self.down1  = nn.Conv2d(D,     D * 2, kernel_size=4, stride=2, padding=1)
-        self.res_d1 = ResBlockSpatial(D * 2, cond_dim)
-
-        self.down2  = nn.Conv2d(D * 2, D * 4, kernel_size=4, stride=2, padding=1)
-        self.res_d2 = ResBlockSpatial(D * 4, cond_dim)
-
-        # ------------------------------------------------------------------ #
-        # Bottleneck                                                           #
-        # ------------------------------------------------------------------ #
-        self.res_mid1 = ResBlockSpatial(D * 4, cond_dim)
-        self.res_mid2 = ResBlockSpatial(D * 4, cond_dim)
-
-        # ------------------------------------------------------------------ #
-        # U-Net decoder (with skip connections)                               #
-        # ------------------------------------------------------------------ #
-        self.up1    = nn.ConvTranspose2d(D * 4, D * 2, kernel_size=4, stride=2, padding=1)
-        self.res_u1 = ResBlockSpatial(D * 2, cond_dim)   # input already skip-summed
-
-        self.up2    = nn.ConvTranspose2d(D * 2, D,     kernel_size=4, stride=2, padding=1)
-        self.res_u2 = ResBlockSpatial(D, cond_dim)
-
-        # ------------------------------------------------------------------ #
-        # Exit                                                                 #
-        # ------------------------------------------------------------------ #
-        self.exit = nn.Sequential(
-            nn.GroupNorm(8, D),
-            nn.SiLU(),
-            nn.Conv2d(D, latent_channels, kernel_size=3, padding=1),
-        )
-
-    def forward(
-        self,
-        x:       torch.Tensor,   # (B, T_fcast, latent_channels, Hl, Wl)
-        t:       torch.Tensor,   # (B,)
-        context: torch.Tensor,   # (B, T_ctx, context_dim)
-    ) -> torch.Tensor:
-        """
-        Returns:
-            predicted_noise: (B, T_fcast, latent_channels, Hl, Wl)
-        """
-        B, T_fcast, C, Hl, Wl = x.shape
-
-        # Build conditioning vector: mean-pool context, fuse with time emb
-        t_emb   = self.time_emb(t)                          # (B, D)
-        ctx_emb = self.ctx_proj(context.mean(dim=1))        # (B, D)
-        cond    = self.cond_fusion(
-            torch.cat([t_emb, ctx_emb], dim=-1)
-        )                                                    # (B, 4D)
-
-        # Process each forecast frame independently
-        x_flat = x.view(B * T_fcast, C, Hl, Wl)
-
-        # Expand cond to match flattened batch
-        cond_exp = cond.unsqueeze(1).expand(-1, T_fcast, -1)  # (B, T, 4D)
-        cond_exp = cond_exp.reshape(B * T_fcast, -1)           # (B*T, 4D)
-
-        # U-Net forward
-        h0 = self.entry(x_flat)                              # (B*T, D,  Hl,   Wl  )
-
-        h1 = self.down1(h0)                                  # (B*T, 2D, Hl/2, Wl/2)
-        h1 = self.res_d1(h1, cond_exp)
-
-        h2 = self.down2(h1)                                  # (B*T, 4D, Hl/4, Wl/4)
-        h2 = self.res_d2(h2, cond_exp)
-
-        h  = self.res_mid1(h2, cond_exp)
-        h  = self.res_mid2(h,  cond_exp)
-
-        h  = self.up1(h) + h1                               # skip from down1
-        h  = self.res_u1(h, cond_exp)
-
-        h  = self.up2(h) + h0                               # skip from entry
-        h  = self.res_u2(h, cond_exp)
-
-        out = self.exit(h)                                   # (B*T, C, Hl, Wl)
-        return out.view(B, T_fcast, C, Hl, Wl)
-
-
-# ---------------------------------------------------------------------------
-# Main model
-# ---------------------------------------------------------------------------
 
 class LatentDiffusionTransformer(nn.Module):
-    """
-    Latent Diffusion Transformer (LDT) for probabilistic satellite image forecasting.
-
-    Components
-    ----------
-    VAE                  : Compresses (C, H, W) → (latent_channels, H/8, W/8).
-    TransformerBackbone  : Encodes the context latent sequence temporally.
-                           Each frame's latent map is flattened to a 1-D token
-                           via a linear projection before being passed to the
-                           transformer, then unprojected after.
-    DenoiserNetwork      : Spatial U-Net that predicts noise in the diffusion
-                           forward process, conditioned on timestep and context.
-    """
+    """Latent Diffusion Transformer for probabilistic satellite image forecasting."""
 
     def __init__(
         self,
-        image_channels:         int   = 3,
+        image_channels:         int   = 2,
         image_size:             int   = 256,
         latent_channels:        int   = 4,
         vae_hidden_dim:         int   = 128,
+        context_length:         int   = 12,
+        max_forecast_steps:     int   = 32,
+        # temporal transformer
         num_transformer_layers: int   = 4,
         num_heads:              int   = 8,
         feedforward_dim:        int   = 1024,
         transformer_dim:        int   = 512,
-        num_diffusion_steps:    int   = 1000,
-        denoiser_hidden_dim:    int   = 128,
+        max_seq_len:            int   = 64,
         dropout:                float = 0.1,
+        # DiT denoiser
+        patch_size:             int   = 4,
+        denoiser_embed_dim:     int   = 768,
+        denoiser_depth:         int   = 16,
+        denoiser_heads:         int   = 12,
+        window_size:            int   = 31,
+        ffn_mult:               float = 4.0,
+        cond_dim:               int   = 256,
+        use_natten:             Optional[bool] = None,
+        # score-based diffusion (continuous-time SDE)
+        sde:                    str   = "vp_cosine",
+        beta_min:               float = 0.1,
+        beta_max:               float = 20.0,
+        cosine_s:               float = 0.008,
+        sigma_min:              float = 0.01,
+        sigma_max:              float = 50.0,
+        t_eps:                  Optional[float] = None,
+        loss_weighting:         str   = "sigma2",
+        time_scale:             float = 1000.0,
+        latent_scale:           Optional[float] = None,
+        latent_scale_momentum:  float = 0.99,
     ):
-        """
-        Args:
-            image_channels:         Satellite image channels (e.g. 3 bands).
-            image_size:             Spatial size of input images (must be div by 8).
-            latent_channels:        VAE latent map channels (4 is standard).
-            vae_hidden_dim:         Base channel width of the VAE conv stack.
-            num_transformer_layers: Depth of the temporal transformer.
-            num_heads:              Attention heads in the transformer.
-            feedforward_dim:        FFN width inside each transformer layer.
-            transformer_dim:        Token dimension fed into the transformer.
-                                    The flattened latent map is projected to this dim.
-            num_diffusion_steps:    Total diffusion timesteps T.
-            denoiser_hidden_dim:    Base channel width of the U-Net denoiser.
-            dropout:                Dropout rate in the transformer.
-        """
         super().__init__()
 
+        # ---- 1. Construction: sub-modules, the SDE, and the latent scale ----
         self.image_channels      = image_channels
         self.latent_channels     = latent_channels
-        self.latent_size         = image_size // 8   # spatial size of latent map
-        self.num_diffusion_steps = num_diffusion_steps
+        self.latent_size         = image_size // 8
+        self.context_length      = context_length
+        self.max_forecast_steps  = max_forecast_steps
         self.transformer_dim     = transformer_dim
+        self.latent_scale_momentum = latent_scale_momentum
 
-        # Flat size of one latent frame: latent_channels * (H/8) * (W/8)
+        if loss_weighting not in ("sigma2", "likelihood"):
+            raise ValueError(
+                f"loss_weighting must be 'sigma2' or 'likelihood', got {loss_weighting!r}"
+            )
+        self.loss_weighting = loss_weighting
+
+        # Continuous-time forward SDE. Holds only Python floats, so it needs no
+        # buffers and is device-agnostic.
+        self.sde: SDE = build_sde(
+            sde, beta_min=beta_min, beta_max=beta_max, s=cosine_s,
+            sigma_min=sigma_min, sigma_max=sigma_max, t_eps=t_eps,
+        )
+        self.sde_name = sde
+
         self._latent_flat_dim = latent_channels * self.latent_size * self.latent_size
 
         # ------------------------------------------------------------------ #
-        # Sub-modules                                                          #
+        # Sub-modules                                                         #
         # ------------------------------------------------------------------ #
-
+        # 1. Pixel <-> latent compression.
         self.vae = VariationalAutoencoder(
             image_channels  = image_channels,
             latent_channels = latent_channels,
@@ -328,57 +191,57 @@ class LatentDiffusionTransformer(nn.Module):
             image_size      = image_size,
         )
 
-        # Project flat latent → transformer token dim and back
-        self.latent_to_token  = nn.Linear(self._latent_flat_dim, transformer_dim)
+        # Flattens each (C, Hl, Wl) latent map into one token for the encoder.
+        self.latent_to_token = nn.Linear(self._latent_flat_dim, transformer_dim)
 
-        self.transformer = TransformerBackbone(
+        # 2. Temporal encoder over the context sequence.
+        self.context_encoder = ContextEncoder(
             latent_dim      = transformer_dim,
             num_layers      = num_transformer_layers,
             num_heads       = num_heads,
             feedforward_dim = feedforward_dim,
             dropout         = dropout,
+            max_seq_len     = max_seq_len,
         )
 
-        self.denoiser = DenoiserNetwork(
-            latent_channels = latent_channels,
-            latent_size     = self.latent_size,
-            context_dim     = transformer_dim,
-            hidden_dim      = denoiser_hidden_dim,
+        # 3. The score network the sampler calls at every solver step.
+        self.denoiser = DiTDenoiser(
+            latent_channels    = latent_channels,
+            latent_size        = self.latent_size,
+            context_dim        = transformer_dim,
+            num_context_frames = context_length,
+            patch_size         = patch_size,
+            embed_dim          = denoiser_embed_dim,
+            depth              = denoiser_depth,
+            num_heads          = denoiser_heads,
+            window_size        = window_size,
+            mlp_ratio          = ffn_mult,
+            cond_dim           = cond_dim,
+            max_forecast_steps = max_forecast_steps,
+            use_natten         = use_natten,
+            time_scale         = time_scale,
         )
 
         # ------------------------------------------------------------------ #
-        # Cosine noise schedule (Nichol & Dhariwal 2021)                     #
+        # Latent scaling                                                      #
         # ------------------------------------------------------------------ #
-
-        betas              = self._cosine_beta_schedule(num_diffusion_steps)
-        alphas             = 1.0 - betas
-        alphas_cumprod     = torch.cumprod(alphas, dim=0)
-        alphas_cumprod_prev = torch.cat(
-            [torch.tensor([1.0]), alphas_cumprod[:-1]]
+        # `latent_std` is the running estimate the diffusion process divides by.
+        # A user-supplied value freezes it; otherwise it is tracked by EMA
+        # during training. It is a buffer so it lands in checkpoints and is
+        # broadcast across DDP ranks.
+        self.latent_scale_fixed = latent_scale is not None
+        self.register_buffer(
+            "latent_std", torch.tensor(float(latent_scale) if latent_scale else 1.0)
         )
+        self.register_buffer("latent_scale_initialised", torch.tensor(latent_scale is not None))
 
-        self.register_buffer("betas",                         betas)
-        self.register_buffer("alphas_cumprod",                alphas_cumprod)
-        self.register_buffer("alphas_cumprod_prev",           alphas_cumprod_prev)
-        self.register_buffer("sqrt_alphas_cumprod",           torch.sqrt(alphas_cumprod))
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
-
-    # ------------------------------------------------------------------ #
-    # Noise schedule                                                       #
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
-        steps     = timesteps + 1
-        t         = torch.linspace(0, timesteps, steps) / timesteps
-        alpha_bar = torch.cos((t + s) / (1.0 + s) * math.pi / 2.0) ** 2
-        alpha_bar = alpha_bar / alpha_bar[0]
-        betas     = 1.0 - alpha_bar[1:] / alpha_bar[:-1]
-        return torch.clamp(betas, min=1e-5, max=0.999)
-
-    # ------------------------------------------------------------------ #
-    # VAE helpers                                                          #
-    # ------------------------------------------------------------------ #
+    # ==========================================================================
+    # 2. Latent-space plumbing
+    #
+    # Encode frames to latents and back, applying the latent_std rescaling so the
+    # diffusion process always sees roughly unit-variance data. Also the freeze /
+    # unfreeze controls for the VAE half of the joint objective.
+    # ==========================================================================
 
     def freeze_vae(self) -> None:
         for p in self.vae.parameters():
@@ -390,184 +253,373 @@ class LatentDiffusionTransformer(nn.Module):
             p.requires_grad = True
         self.vae.train()
 
+    def _update_latent_scale(self, latents: torch.Tensor) -> None:
+        """Track an EMA of the latent standard deviation (training only)."""
+        if self.latent_scale_fixed or not self.training:
+            return
+        with torch.no_grad():
+            std = latents.detach().float().std()
+            if not torch.isfinite(std) or std <= 0:
+                return
+            if not bool(self.latent_scale_initialised):
+                # Seed from the first batch so we do not spend the early epochs
+                # crawling towards the right order of magnitude.
+                self.latent_std.fill_(std)
+                self.latent_scale_initialised.fill_(True)
+            else:
+                m = self.latent_scale_momentum
+                self.latent_std.mul_(m).add_(std * (1.0 - m))
+
+    def scale_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        return latents / self.latent_std.clamp(min=1e-3).to(latents.dtype)
+
+    def unscale_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        return latents * self.latent_std.clamp(min=1e-3).to(latents.dtype)
+
     def encode_images(
         self,
         images:        torch.Tensor,   # (B, T, C, H, W)
         deterministic: bool = True,
+        scaled:        bool = True,
     ) -> torch.Tensor:
-        """
-        Encode a frame sequence to spatial latent maps.
-
-        Returns:
-            latents: (B, T, latent_channels, Hl, Wl)
-        """
-        assert images.ndim == 5, \
-            f"Expected (B, T, C, H, W), got {images.shape}"
+        """Encode a frame sequence to spatial latent maps: (B, T, LC, Hl, Wl)."""
+        assert images.ndim == 5, f"Expected (B, T, C, H, W), got {images.shape}"
         B, T = images.shape[:2]
-        flat = images.view(B * T, *images.shape[2:])
+        flat = images.reshape(B * T, *images.shape[2:])
 
         mu, logvar = self.vae.encode(flat)
         z = mu if deterministic else self.vae.reparameterize(mu, logvar)
 
-        Hl, Wl = z.shape[-2], z.shape[-1]
-        return z.view(B, T, self.latent_channels, Hl, Wl)
+        z = z.view(B, T, self.latent_channels, *z.shape[-2:])
+        return self.scale_latents(z) if scaled else z
 
-    def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """
-        Decode spatial latent maps to image frames.
-
-        Args:
-            latents: (B, T, latent_channels, Hl, Wl)
-        Returns:
-            images:  (B, T, C, H, W)
-        """
-        assert latents.ndim == 5, \
-            f"Expected (B, T, LC, Hl, Wl), got {latents.shape}"
-        B, T = latents.shape[:2]
-        flat    = latents.view(B * T, *latents.shape[2:])
+    def decode_latents(self, latents: torch.Tensor, scaled: bool = True) -> torch.Tensor:
+        """Decode spatial latent maps to image frames: (B, T, C, H, W)."""
+        assert latents.ndim == 5, f"Expected (B, T, LC, Hl, Wl), got {latents.shape}"
+        if scaled:
+            latents = self.unscale_latents(latents)
+        B, T    = latents.shape[:2]
+        flat    = latents.reshape(B * T, *latents.shape[2:])
         decoded = self.vae.decode(flat)
         return decoded.view(B, T, *decoded.shape[1:])
 
-    def _encode_context(
-        self,
-        context_latents: torch.Tensor,          # (B, T_ctx, LC, Hl, Wl)
-        timesteps: Optional[torch.Tensor] = None,  # (B,) — if None, uses t=0
-    ) -> torch.Tensor:
+    def _encode_context(self, context_latents: torch.Tensor) -> torch.Tensor:
         """
-        Project spatial latent maps → transformer tokens → encode temporally.
-    
+        Project spatial latent maps to transformer tokens and encode temporally.
+
         Returns:
-            encoded: (B, T_ctx, transformer_dim)
+            (B, T_ctx, transformer_dim)
         """
         B, T = context_latents.shape[:2]
-    
-        # Flatten spatial dims and project to transformer dim
-        tokens = context_latents.view(B, T, -1)          # (B, T, LC*Hl*Wl)
-        tokens = self.latent_to_token(tokens)             # (B, T, transformer_dim)
-    
-        # Context is always clean (t=0); diffusion timestep only applies to
-        # the noisy forecast latents in the denoiser, not the context encoder.
-        if timesteps is None:
-            timesteps = torch.zeros(B, dtype=torch.long, device=context_latents.device)
-    
-        return self.transformer(tokens, timesteps)
+        tokens = self.latent_to_token(context_latents.reshape(B, T, -1))
+        # No diffusion time is passed: the context is always clean, so there is
+        # no noise level to condition on. Only the forecast latents are noisy,
+        # and those are handled inside the denoiser.
+        return self.context_encoder(tokens)
 
-    # ------------------------------------------------------------------ #
-    # Forward diffusion                                                    #
-    # ------------------------------------------------------------------ #
+    # ==========================================================================
+    # 3. The score function — the heart of the model
+    #
+    # Everything the sampler and the training objective need. `score()` is the
+    # public interface; `score_fn()` binds the conditioning so diffusion.py can
+    # call it as a plain s(x, t); `denoise_to_x0` is Tweedie's formula.
+    # ==========================================================================
 
-    def add_noise(
+    def perturb(
         self,
-        x:         torch.Tensor,   # (B, T, latent_channels, Hl, Wl)
-        timesteps: torch.Tensor,   # (B,)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        noise = torch.randn_like(x)
+        x:     torch.Tensor,   # (B, T, LC, Hl, Wl)
+        t:     torch.Tensor,   # (B,) continuous time in [t_eps, T]
+        noise: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample x_t ~ p(x_t | x_0). Returns (x_t, noise, sigma)."""
+        return self.sde.perturb(x, t, noise)
 
-        # Reshape schedule values for broadcasting over (T, C, H, W)
-        sqrt_ab     = self.sqrt_alphas_cumprod[timesteps].view(-1, 1, 1, 1, 1)
-        sqrt_one_ab = self.sqrt_one_minus_alphas_cumprod[timesteps].view(-1, 1, 1, 1, 1)
+    def score(
+        self,
+        x:               torch.Tensor,  # (B, T_fcast, LC, Hl, Wl) perturbed latents
+        t:               torch.Tensor,  # (B,) continuous time
+        context_tokens:  torch.Tensor,
+        context_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Estimate ``grad_x log p_t(x)``.
 
-        noisy = sqrt_ab * x + sqrt_one_ab * noise
-        return noisy, noise
+        The network emits an epsilon-scaled residual and the score is
+        ``-out / sigma(t)``; see the module docstring for why the model is
+        parameterised this way rather than regressing the score directly.
+        """
+        out = self.denoiser(x, t, context_tokens, context_latents)
+        _, sigma = self.sde.alpha_sigma(t)
+        return -out / broadcast_to(sigma, x).clamp(min=1e-8)
 
-    # ------------------------------------------------------------------ #
-    # Training forward pass                                                #
-    # ------------------------------------------------------------------ #
+    def score_fn(
+        self, context_tokens: torch.Tensor, context_latents: torch.Tensor
+    ):
+        """Bind the conditioning, yielding the ``(x, t) -> score`` closure the
+        samplers expect."""
+        def fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            return self.score(x, t, context_tokens, context_latents)
+        return fn
+
+    def denoise_to_x0(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        score: torch.Tensor,
+        clamp: Optional[float] = None,
+    ) -> torch.Tensor:
+        """
+        Tweedie's formula: E[x_0 | x_t] = (x_t + sigma^2 * score) / alpha.
+
+        The score-based counterpart of DDPM eq. 15, and the reason a score model
+        needs no separate x0-prediction head.
+
+        The 1/alpha factor is inherently ill-conditioned as t -> T: for the
+        cosine VP SDE alpha(1) ~ 1e-5, so any error in the score is amplified
+        a hundred-thousand-fold — which is unavoidable, since x_T carries no
+        information about x_0. Pass ``clamp`` to bound the estimate (latents are
+        unit-scaled, so a few standard deviations is far outside the data) when
+        the result feeds a metric that must stay finite and comparable.
+        """
+        alpha, sigma = self.sde.alpha_sigma(t)
+        x0 = (
+            x + broadcast_to(sigma, x) ** 2 * score
+        ) / broadcast_to(alpha, x).clamp(min=1e-8)
+        return x0 if clamp is None else x0.clamp(-clamp, clamp)
+
+    def sample_times(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Draw training times ~ U(t_eps, T).
+
+        Stratified over the batch rather than i.i.d.: with the small batch sizes
+        used here, i.i.d. draws leave large parts of the time axis unvisited in
+        any given step, which shows up as a noisy loss.
+        """
+        u = torch.rand(batch_size, device=device)
+        strata = (torch.arange(batch_size, device=device) + u) / batch_size
+        return self.sde.t_eps + strata * (self.sde.T - self.sde.t_eps)
+
+    # ==========================================================================
+    # 4. Training: denoising score matching
+    #
+    # One forward computes both objectives (diffusion + VAE) so DDP traces a single
+    # graph and the batch passes through the VAE encoder exactly once.
+    # ==========================================================================
 
     def forward(
         self,
-        context_images: torch.Tensor,   # (B, T_ctx,   C, H, W)
-        target_images:  torch.Tensor,   # (B, T_fcast, C, H, W)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context_images:  torch.Tensor,   # (B, T_ctx,   C, H, W)
+        target_images:   torch.Tensor,   # (B, T_fcast, C, H, W)
+        vae_loss_weight: float = 0.1,
+        vae_beta:        float = 0.01,
+        vae_ssim_weight: float = 0.1,
+        times:           Optional[torch.Tensor] = None,
+        deterministic:   bool  = False,
+        return_pixel_metrics: bool = False,
+        irradiance_channel:   int  = 0,
+    ) -> dict[str, torch.Tensor]:
         """
-        DDPM training step.
+        One step covering both the diffusion and VAE objectives.
 
-        Returns:
-            loss:            Scalar noise-prediction MSE.
-            encoded_context: (B, T_ctx, transformer_dim) for logging.
+        Both losses are computed inside this single forward so that DDP traces
+        one autograd graph — calling the VAE separately on the unwrapped module
+        would leave its gradients outside DDP's reducer. The whole batch passes
+        through the VAE encoder exactly once.
+
+        Args:
+            times: continuous diffusion times in [t_eps, T]. Drawn stratified
+                at random when omitted.
+            deterministic: use evenly-spaced times and a fixed noise draw
+                instead of random ones. Validation must be reproducible across
+                epochs, otherwise the metric driving best-model selection and
+                early stopping is mostly noise.
+            return_pixel_metrics: additionally decode the Tweedie x0 estimate
+                and score it against the target in pixel space.
+
+        Returns a dict with: loss, diffusion_loss, vae_loss, recon_loss,
+        kl_loss, and (optionally) irradiance_mse / irradiance_mae.
         """
         B      = context_images.shape[0]
         device = context_images.device
+        T_ctx  = context_images.shape[1]
 
-        # 1. Encode to spatial latents
-        context_latents = self.encode_images(context_images, deterministic=True)
-        target_latents  = self.encode_images(target_images,  deterministic=True)
+        # ---- One encoder pass over every frame ----------------------------
+        all_images = torch.cat([context_images, target_images], dim=1)
+        T_total    = all_images.shape[1]
+        flat       = all_images.reshape(B * T_total, *all_images.shape[2:])
 
-        # 2. Temporally encode context
+        mu, logvar = self.vae.encode(flat)
+
+        # ---- VAE objective (reconstruction from a sampled z) --------------
+        if vae_loss_weight > 0:
+            z_sample = self.vae.reparameterize(mu, logvar)
+            x_recon  = self.vae.decode(z_sample)
+            vae_loss, recon_loss, kl_loss = self.vae.vae_loss(
+                flat, x_recon, mu, logvar,
+                beta=vae_beta, ssim_weight=vae_ssim_weight,
+            )
+        else:
+            zero = torch.zeros((), device=device, dtype=mu.dtype)
+            vae_loss = recon_loss = kl_loss = zero
+
+        # ---- Diffusion objective on deterministic latents -----------------
+        latents = mu.view(B, T_total, self.latent_channels, *mu.shape[-2:])
+        self._update_latent_scale(latents)
+        latents = self.scale_latents(latents)
+
+        context_latents = latents[:, :T_ctx]
+        target_latents  = latents[:, T_ctx:]
+
         encoded_context = self._encode_context(context_latents)
 
-        # 3. Sample diffusion timestep
-        t = torch.randint(0, self.num_diffusion_steps, (B,), device=device)
+        noise = None
+        if times is None:
+            if deterministic:
+                times = self._eval_times(B, device)
+                generator = torch.Generator(device=device).manual_seed(0)
+                noise = torch.randn(
+                    target_latents.shape, device=device,
+                    dtype=target_latents.dtype, generator=generator,
+                )
+            else:
+                times = self.sample_times(B, device)
 
-        # 4. Corrupt target latents
-        noisy_targets, noise = self.add_noise(target_latents, t)
+        # ---- Denoising score matching (Vincent 2011; Song et al. 2021) ----
+        # The perturbation kernel's score is known exactly, -z/sigma, so the
+        # intractable score-matching objective reduces to a regression onto it.
+        x_t, noise, sigma = self.perturb(target_latents, times, noise=noise)
+        out = self.denoiser(x_t, times, encoded_context, context_latents)
+        score = -out / sigma.clamp(min=1e-8)
 
-        # 5. Predict noise
-        predicted_noise = self.denoiser(noisy_targets, t, encoded_context)
+        # Residual of  s_theta(x_t, t) - grad log p(x_t|x_0)  scaled by sigma,
+        # i.e. sigma * s_theta + z. Working in this scaled form keeps the
+        # target unit-variance at every t instead of blowing up as sigma -> 0.
+        residual = sigma * score + noise
 
-        # 6. DDPM loss
-        loss = F.mse_loss(predicted_noise, noise)
-        return loss, encoded_context
+        if self.loss_weighting == "sigma2":
+            # lambda(t) = sigma^2: the standard variance-reduced weighting.
+            per_sample = residual.flatten(1).pow(2).mean(dim=1)
+        else:
+            # lambda(t) = g(t)^2: likelihood weighting, which makes the loss an
+            # upper bound on the negative log-likelihood rather than a
+            # perceptually-tuned surrogate.
+            _, g = self.sde.sde(x_t, times)
+            weight = (g ** 2 / self.sde.alpha_sigma(times)[1].clamp(min=1e-8) ** 2)
+            per_sample = weight * residual.flatten(1).pow(2).mean(dim=1)
+
+        diffusion_loss = per_sample.mean()
+        total = diffusion_loss + vae_loss_weight * vae_loss
+
+        out = {
+            "loss":           total,
+            "diffusion_loss": diffusion_loss.detach(),
+            "vae_loss":       vae_loss.detach(),
+            "recon_loss":     recon_loss.detach(),
+            "kl_loss":        kl_loss.detach(),
+        }
+
+        if return_pixel_metrics:
+            with torch.no_grad():
+                # Clean-latent estimate straight from the score (Tweedie).
+                # Bounded: unbounded Tweedie at large t would swamp the metric.
+                pred_x0 = self.denoise_to_x0(x_t, times, score, clamp=4.0)
+                pred_images = self.decode_latents(pred_x0)
+                c = irradiance_channel
+                pred_irr   = pred_images[:,   :, c:c + 1]
+                target_irr = target_images[:, :, c:c + 1]
+                out["irradiance_mse"] = F.mse_loss(pred_irr, target_irr).detach()
+                out["irradiance_mae"] = F.l1_loss(pred_irr, target_irr).detach()
+
+        return out
+
+    # ==========================================================================
+    # 5. Evaluation
+    #
+    # Deterministic by construction: fixed times and a fixed noise draw, so the
+    # metric driving best-model selection and early stopping is not a random
+    # variable. `forecast_metrics` runs the real reverse process for true skill.
+    # ==========================================================================
+
+    def _eval_times(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Deterministic times spread evenly over [t_eps, T].
+
+        Validation must be comparable across epochs. Drawing fresh random times
+        each batch makes the metric a random variable and turns best-model
+        selection and early stopping into noise.
+        """
+        # Stratum midpoints rather than linspace endpoints. `linspace` would put
+        # a sample at exactly t = T, where alpha ~ 1e-5 makes the Tweedie x0
+        # estimate meaningless — and at the batch size used here that is a large
+        # fraction of the evaluation batch driving early stopping.
+        i = torch.arange(batch_size, device=device, dtype=torch.float32)
+        return self.sde.t_eps + ((i + 0.5) / batch_size) * (self.sde.T - self.sde.t_eps)
 
     @torch.no_grad()
     def forward_eval(
         self,
-        context_images: torch.Tensor,   # (B, T_ctx,   C, H, W)
-        target_images:  torch.Tensor,   # (B, T_fcast, C, H, W)
+        context_images: torch.Tensor,
+        target_images:  torch.Tensor,
+        irradiance_channel: int = 0,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
         """
-        Evaluation forward pass. Returns irradiance-specific pixel-space metrics
-        alongside the standard latent noise loss.
-    
-        The predicted clean image is estimated from the single-step x0 prediction
-        (DDPM eq. 15) rather than running the full reverse chain — this is fast
-        and gives a meaningful signal about denoiser quality at each noise level.
-    
-        Returns a dict with keys:
-            latent_loss       : standard noise-prediction MSE (all channels)
-            irradiance_mse    : pixel-space MSE on irradiance channel only
-            irradiance_mae    : pixel-space MAE on irradiance channel only
+        Deterministic single-step evaluation.
+
+        Thin wrapper over `forward` with fixed timesteps, a fixed noise draw
+        and pixel metrics enabled. Kept as a separate entry point for scripts
+        that only want evaluation numbers.
         """
-        B      = context_images.shape[0]
-        device = context_images.device
-    
-        context_latents = self.encode_images(context_images, deterministic=True)
-        target_latents  = self.encode_images(target_images,  deterministic=True)
-        encoded_context = self._encode_context(context_latents)
-    
-        t = torch.randint(0, self.num_diffusion_steps, (B,), device=device)
-    
-        noisy_targets, noise = self.add_noise(target_latents, t)
-        predicted_noise      = self.denoiser(noisy_targets, t, encoded_context)
-    
-        # Standard latent loss — same as training
-        latent_loss = F.mse_loss(predicted_noise, noise)
-    
-        # Recover predicted x0 from noise prediction (DDPM eq. 15)
-        sqrt_ab     = self.sqrt_alphas_cumprod[t].view(B, 1, 1, 1, 1)
-        sqrt_one_ab = self.sqrt_one_minus_alphas_cumprod[t].view(B, 1, 1, 1, 1)
-        pred_x0_latent = (
-            (noisy_targets - sqrt_one_ab * predicted_noise)
-            / sqrt_ab.clamp(min=1e-8)
+        out = self.forward(
+            context_images, target_images,
+            deterministic=True, return_pixel_metrics=True,
+            irradiance_channel=irradiance_channel, **kwargs,
         )
-    
-        # Decode to pixel space — VAE decoder is frozen so this is cheap
-        pred_images = self.decode_latents(pred_x0_latent)   # (B, T, C, H, W)
-    
-        # Score irradiance channel only
-        pred_irr   = pred_images[:, :, 0:1, :, :]
-        target_irr = target_images[:, :, 0:1, :, :]
-    
+        out["latent_loss"] = out["diffusion_loss"]
+        return out
+
+    @torch.no_grad()
+    def forecast_metrics(
+        self,
+        context_images: torch.Tensor,
+        target_images:  torch.Tensor,
+        num_steps: int = 100,
+        irradiance_channel: int = 0,
+        sampler: str = "ode",
+    ) -> dict[str, torch.Tensor]:
+        """
+        True forecast skill: integrate the reverse process fully and score the
+        result against the target in pixel space.
+
+        Defaults to the probability-flow ODE because it is deterministic, so the
+        metric reflects the model rather than the sampler's noise draw.
+
+        Far more expensive than `forward_eval`, so the trainer runs it on a
+        small fixed subset of the validation set.
+        """
+        forecast = self.sample(
+            context_images,
+            num_forecast_steps=target_images.shape[1],
+            num_samples=1,
+            num_steps=num_steps,
+            sampler=sampler,
+            generator=torch.Generator(device=context_images.device).manual_seed(0),
+        )
+        c = irradiance_channel
+        pred_irr   = forecast[:,      :, c:c + 1]
+        target_irr = target_images[:, :, c:c + 1]
         return {
-            "latent_loss":    latent_loss,
-            "irradiance_mse": F.mse_loss(pred_irr, target_irr),
-            "irradiance_mae": F.l1_loss(pred_irr, target_irr),
+            "forecast_mse":  F.mse_loss(pred_irr, target_irr),
+            "forecast_mae":  F.l1_loss(pred_irr, target_irr),
+            "forecast_rmse": torch.sqrt(F.mse_loss(pred_irr, target_irr)),
         }
 
-
-    # ------------------------------------------------------------------ #
-    # Inference: DDIM reverse diffusion                                    #
-    # ------------------------------------------------------------------ #
+    # ==========================================================================
+    # 6. Sampling
+    #
+    # Hands the bound score function to a sampler in diffusion.py, then decodes the
+    # resulting latents back to pixels.
+    # ==========================================================================
 
     @torch.no_grad()
     def sample(
@@ -575,98 +627,90 @@ class LatentDiffusionTransformer(nn.Module):
         context_images:     torch.Tensor,   # (B, T_ctx, C, H, W)
         num_forecast_steps: int,
         num_samples:        int   = 1,
-        ddim_steps:         int   = 50,
-        eta:                float = 0.0,
-        clamp_latents:      bool  = True,
+        sampler:            str   = "pc",
+        num_steps:          int   = 100,
+        corrector_steps:    int   = 1,
+        snr:                float = 0.16,
+        ode_method:         str   = "heun",
+        clamp_value:        Optional[float] = 8.0,
+        generator:          Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """
-        Generate forecast frames via DDIM reverse diffusion.
+        Generate forecast frames by integrating the reverse process.
+
+        Args:
+            sampler: ``"pc"`` runs the reverse-time SDE with a Langevin
+                corrector — stochastic, and the right choice for ensembles.
+                ``"ode"`` integrates the probability-flow ODE, which is
+                deterministic given the initial noise and shares the same
+                marginals; use it for reproducible scoring.
+            num_steps: reverse integration steps.
+            corrector_steps: Langevin steps per predictor step (``pc`` only).
+                The corrector is what lets a score model use far fewer solver
+                steps than an ancestral chain: it re-equilibrates onto p_t
+                instead of accumulating discretisation error.
+            snr: Langevin step-size signal-to-noise ratio (``pc`` only).
+            clamp_value: divergence guard on the latent iterate. Latents are
+                unit-scaled, so this sits far outside the data distribution and
+                only catches blow-ups.
 
         Returns:
-            forecast: (B * num_samples, T_fcast, C, H, W)
+            (B * num_samples, T_fcast, C, H, W)
         """
-        B      = context_images.shape[0]
+        if sampler not in ("pc", "ode"):
+            raise ValueError(f"sampler must be 'pc' or 'ode', got {sampler!r}")
+
         device = context_images.device
 
         if num_samples > 1:
             context_images = context_images.repeat_interleave(num_samples, dim=0)
-            B = context_images.shape[0]
+        B = context_images.shape[0]
 
         context_latents = self.encode_images(context_images, deterministic=True)
         encoded_context = self._encode_context(context_latents)
 
-        # DDIM timestep subsequence
-        step_ratio     = max(self.num_diffusion_steps // ddim_steps, 1)
-        ddim_timesteps = list(
-            reversed(range(0, self.num_diffusion_steps, step_ratio))
-        )[:ddim_steps]
-
-        # Start from pure noise: (B, T_fcast, LC, Hl, Wl)
-        x = torch.randn(
+        shape = (
             B, num_forecast_steps,
             self.latent_channels, self.latent_size, self.latent_size,
-            device=device,
         )
+        fn = self.score_fn(encoded_context, context_latents)
 
-        for i, t_val in enumerate(ddim_timesteps):
-            t_tensor = torch.full((B,), t_val, device=device, dtype=torch.long)
-
-            pred_noise = self.denoiser(x, t_tensor, encoded_context)
-
-            alpha_bar = self.alphas_cumprod[t_val]
-
-            t_prev = ddim_timesteps[i + 1] if i + 1 < len(ddim_timesteps) else -1
-            alpha_bar_prev = (
-                self.alphas_cumprod[t_prev]
-                if t_prev >= 0
-                else torch.tensor(1.0, device=device)
+        if sampler == "pc":
+            x = pc_sampler(
+                self.sde, fn, shape, device,
+                num_steps=num_steps, corrector_steps=corrector_steps, snr=snr,
+                clamp_value=clamp_value, generator=generator,
             )
-
-            sqrt_ab  = torch.sqrt(alpha_bar).clamp(min=1e-8)
-            pred_x0  = (x - torch.sqrt(1.0 - alpha_bar) * pred_noise) / sqrt_ab
-            if clamp_latents:
-                pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
-
-            sigma_sq_arg = (
-                (1.0 - alpha_bar_prev)
-                / (1.0 - alpha_bar).clamp(min=1e-8)
-                * (1.0 - alpha_bar / alpha_bar_prev.clamp(min=1e-8))
-            ).clamp(min=0.0)
-            sigma     = eta * torch.sqrt(sigma_sq_arg)
-            direction = torch.sqrt(
-                (1.0 - alpha_bar_prev - sigma ** 2).clamp(min=0.0)
-            ) * pred_noise
-
-            x = (
-                torch.sqrt(alpha_bar_prev) * pred_x0
-                + direction
-                + sigma * torch.randn_like(x)
+        else:
+            x = ode_sampler(
+                self.sde, fn, shape, device,
+                num_steps=num_steps, method=ode_method,
+                clamp_value=clamp_value, generator=generator,
             )
 
         return self.decode_latents(x)
-
-    # ------------------------------------------------------------------ #
-    # Deterministic forecast                                               #
-    # ------------------------------------------------------------------ #
 
     @torch.no_grad()
     def forecast_deterministic(
         self,
         context_images:     torch.Tensor,
         num_forecast_steps: int,
+        num_steps:          int = 100,
     ) -> torch.Tensor:
+        """Deterministic forecast via the probability-flow ODE."""
         return self.sample(
             context_images,
             num_forecast_steps = num_forecast_steps,
             num_samples        = 1,
-            ddim_steps         = 50,
-            eta                = 0.0,
+            sampler            = "ode",
+            num_steps          = num_steps,
         )
 
     def extra_repr(self) -> str:
         return (
             f"latent_channels={self.latent_channels}, "
             f"latent_size={self.latent_size}, "
+            f"context_length={self.context_length}, "
             f"transformer_dim={self.transformer_dim}, "
-            f"num_diffusion_steps={self.num_diffusion_steps}"
+            f"sde={self.sde_name}, weighting={self.loss_weighting}"
         )

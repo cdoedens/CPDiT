@@ -1,18 +1,45 @@
 """
-Spatial VAE for satellite image latent space compression.
+Stage 1 of the model: compression between pixel space and latent space.
 
-Encoder: (C, H, W) → (latent_channels, H/8, W/8)
-Decoder: (latent_channels, H/8, W/8) → (C, H, W)
+    Encoder: (C, H, W)                     -> (latent_channels, H/8, W/8)
+    Decoder: (latent_channels, H/8, W/8)   -> (C, H, W)
 
-For H=W=256 this gives a 32×32 latent map — spatially structured,
-not a flat vector. The diffusion model then operates on this map.
+Where this sits in the workflow
+-------------------------------
+Everything downstream — the ContextEncoder in `networks.py`, the DiTDenoiser,
+and the whole diffusion process in `diffusion.py` — operates on these latent
+maps, never on pixels. At 256x256 with 4 latent channels that is a 64x
+reduction in the number of values the diffusion model has to model, which is
+the entire point of a *latent* diffusion model.
+
+The latent is a spatial map, not a flat vector: preserving 2-D structure is what
+lets the denoiser use convolutional patch embedding and neighbourhood attention,
+and what lets the context frames be concatenated to the noisy latent
+channel-wise.
+
+`latent_diffusion.py` calls `encode` once per training step for every frame,
+`reparameterize` + `decode` for the VAE reconstruction loss, and `decode` again
+to bring samples back to pixel space. The VAE is trained jointly with the
+diffusion model rather than in a separate first stage.
 """
+
+import logging
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchmetrics.functional import structural_similarity_index_measure as ssim
-from pytorch_msssim import ms_ssim
+
+logger = logging.getLogger(__name__)
+
+# torchmetrics pulls in a fairly heavy dependency chain. Import it lazily so the
+# model can still be constructed (and unit-tested) in a minimal environment;
+# the SSIM term itself raises if it is actually asked for and unavailable.
+try:
+    from torchmetrics.functional import structural_similarity_index_measure as ssim
+except Exception as _exc:  # noqa: BLE001
+    ssim = None
+    _SSIM_IMPORT_ERROR = _exc
+    logger.warning("torchmetrics unavailable (%s); SSIM loss term disabled.", _exc)
 
 
 class ResBlock(nn.Module):
@@ -184,10 +211,6 @@ class VariationalAutoencoder(nn.Module):
         """
         return self.decoder(z)
 
-    def encode_deterministic(self, x: torch.Tensor) -> torch.Tensor:
-        mu, _ = self.encode(x)
-        return mu
-
     # ------------------------------------------------------------------ #
     # Forward                                                              #
     # ------------------------------------------------------------------ #
@@ -212,6 +235,7 @@ class VariationalAutoencoder(nn.Module):
         logvar:  torch.Tensor,
         beta:    float = 0.001,
         ssim_weight: float = 0.4,
+        ssim_data_range: float = 8.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Reconstruction (MSE + SSIM) + beta-weighted KL divergence.
@@ -220,9 +244,25 @@ class VariationalAutoencoder(nn.Module):
         by the number of latent elements so it stays on the same scale
         as the reconstruction loss regardless of latent_channels or
         image_size.
+
+        Args:
+            ssim_data_range: dynamic range of the *input data*, which is
+                z-scored rather than in [0, 1]. Standardised fields sit within
+                roughly +/-4 sigma, so 8.0 is the sensible default. This is a
+                fixed constant rather than the batch's own min-max range, so
+                the loss stays comparable from batch to batch.
         """
         recon_loss = F.mse_loss(x_recon, x, reduction="mean")
-        ssim_loss  = 1.0 - ssim(x_recon, x, data_range=1.0)
+
+        if ssim_weight > 0:
+            if ssim is None:
+                raise RuntimeError(
+                    "SSIM loss requested (ssim_weight > 0) but torchmetrics could "
+                    f"not be imported: {_SSIM_IMPORT_ERROR}"
+                )
+            ssim_loss = 1.0 - ssim(x_recon, x, data_range=ssim_data_range)
+        else:
+            ssim_loss = torch.zeros((), device=x.device, dtype=recon_loss.dtype)
 
         # KL over spatial map, mean-reduced to match recon scale
         kl_loss = -0.5 * (

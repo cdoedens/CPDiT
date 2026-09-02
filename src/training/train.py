@@ -1,12 +1,18 @@
 """Training entry point for the latent diffusion transformer."""
 
+from __future__ import annotations
+
 import argparse
+import contextlib
 import logging
 import math
 import os
+import random
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -17,16 +23,20 @@ from tqdm import tqdm
 
 try:
     import mlflow
+
     HAS_MLFLOW = True
 except ImportError:
     HAS_MLFLOW = False
 
-from src_testing.petdata import build_dataloader
-from src_testing.models import LatentDiffusionTransformer
+from src.models import LatentDiffusionTransformer
+from src.petdata import build_dataloader
+
 from .config import load_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+BEST_CHECKPOINT_NAME = "best_model.pt"
 
 
 class Trainer:
@@ -36,22 +46,34 @@ class Trainer:
         self.config     = config
         self.device     = device
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.is_primary = self.local_rank == 0
+        self.rank       = dist.get_rank() if dist.is_initialized() else 0
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.is_primary = self.rank == 0
 
         model_cfg       = config["model"]
         training_cfg    = config["training"]
         optimiser_cfg   = config["optimiser"]
         transformer_cfg = model_cfg.get("transformer", {})
         diffusion_cfg   = model_cfg.get("diffusion", {})
+        data_cfg        = config["data"]
 
         self.gradient_clip_norm = training_cfg.get("gradient_clip_norm", 1.0)
         self.checkpoint_dir     = Path(training_cfg["checkpoint_dir"])
         self.save_every         = training_cfg.get("save_every_n_epochs", 5)
+        self.keep_last_n        = training_cfg.get("keep_last_n_checkpoints", 3)
         self.vae_beta           = training_cfg.get("vae_beta", 0.01)
         self.vae_ssim_weight    = training_cfg.get("vae_ssim_weight", 0.1)
         self.vae_loss_weight    = training_cfg.get("vae_loss_weight", 0.1)
+        self.accum_steps        = max(1, int(training_cfg.get("gradient_accumulation_steps", 1)))
+        self.irradiance_channel = data_cfg.get("irradiance_channel", 0)
+        self.max_epochs         = int(training_cfg.get("max_epochs", 100))
 
-        self.max_epochs = int(training_cfg.get("max_epochs", 100))
+        eval_cfg = config.get("evaluation", {})
+        self.forecast_eval_batches = int(eval_cfg.get("forecast_eval_batches", 0))
+        self.forecast_num_steps    = int(eval_cfg.get("num_steps", 100))
+        self.forecast_sampler      = eval_cfg.get("sampler", "ode")
+
+        self._set_seed(training_cfg.get("seed", 42))
 
         if self.is_primary:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -63,34 +85,85 @@ class Trainer:
             image_size             = model_cfg["image_size"],
             latent_channels        = model_cfg["latent_channels"],
             vae_hidden_dim         = model_cfg["hidden_dim"],
+            context_length         = data_cfg["n_prior_sat"],
+            max_forecast_steps     = model_cfg.get("max_forecast_steps", 32),
             num_transformer_layers = transformer_cfg["num_layers"],
             num_heads              = transformer_cfg["num_heads"],
             feedforward_dim        = transformer_cfg["feedforward_dim"],
-            num_diffusion_steps    = diffusion_cfg["num_steps"],
-            denoiser_hidden_dim    = diffusion_cfg["denoiser_hidden_dim"],
+            transformer_dim        = transformer_cfg.get("transformer_dim", 512),
+            max_seq_len            = transformer_cfg.get("max_seq_len", 64),
             dropout                = transformer_cfg.get("dropout", 0.1),
+            patch_size             = diffusion_cfg.get("patch_size", 4),
+            denoiser_embed_dim     = diffusion_cfg.get("embed_dim", 768),
+            denoiser_depth         = diffusion_cfg.get("num_blocks", 16),
+            denoiser_heads         = diffusion_cfg.get("num_heads", 12),
+            window_size            = diffusion_cfg.get("window_size", 31),
+            ffn_mult               = diffusion_cfg.get("ffn_mult", 4),
+            cond_dim               = diffusion_cfg.get("cond_dim", 256),
+            use_natten             = diffusion_cfg.get("use_natten", None),
+            sde                    = diffusion_cfg.get("sde", "vp_cosine"),
+            beta_min               = diffusion_cfg.get("beta_min", 0.1),
+            beta_max               = diffusion_cfg.get("beta_max", 20.0),
+            cosine_s               = diffusion_cfg.get("cosine_s", 0.008),
+            sigma_min              = diffusion_cfg.get("sigma_min", 0.01),
+            sigma_max              = diffusion_cfg.get("sigma_max", 50.0),
+            t_eps                  = diffusion_cfg.get("t_eps", None),
+            loss_weighting         = diffusion_cfg.get("loss_weighting", "sigma2"),
+            time_scale             = diffusion_cfg.get("time_scale", 1000.0),
+            latent_scale           = model_cfg.get("latent_scale", None),
+            latent_scale_momentum  = model_cfg.get("latent_scale_momentum", 0.99),
         ).to(device)
 
-        # ── DDP: wrap the entire model ─────────────────────────────────────
-        if dist.is_initialized():
-            self.model = DDP(self.model, device_ids=[self.local_rank])
+        if self.is_primary:
+            n_params = sum(p.numel() for p in self.model.parameters())
+            logger.info("Model parameters: %.1fM", n_params / 1e6)
+            logger.info("Denoiser: %s", self.model.denoiser.extra_repr())
 
-        # ── Optional torch.compile ─────────────────────────────────────────
-        if training_cfg.get("compile_model", False):
-            if self.is_primary:
-                logger.info("Compiling model with torch.compile...")
-            torch._dynamo.config.optimize_ddp = False
-            self.model = torch.compile(
+        # ── DDP ────────────────────────────────────────────────────────────
+        if dist.is_initialized():
+            # With vae_loss_weight == 0 the VAE decoder never participates in
+            # the loss, so DDP must be told to expect unused parameters.
+            self.model = DDP(
                 self.model,
-                dynamic=True,
-                mode="reduce-overhead",
+                device_ids=[self.local_rank],
+                find_unused_parameters=(self.vae_loss_weight == 0),
             )
+
+        # ── Optional torch.compile (applied after DDP, per PyTorch docs) ────
+        # TF32 for the fp32 operations autocast leaves alone (optimiser maths,
+        # norms). Free accuracy-for-speed on Ampere and newer; ignored on older
+        # cards.
+        if device.startswith("cuda") and torch.cuda.get_device_capability()[0] >= 8:
+            torch.set_float32_matmul_precision(
+                training_cfg.get("matmul_precision", "high")
+            )
+
+        if training_cfg.get("compile_model", False):
+            # "reduce-overhead" turns on CUDA graphs. This graph does not capture
+            # cleanly — inductor partitions it around device copies and then
+            # segfaults on H200 — and CUDA graphs buy little at this step time
+            # anyway, so the default mode is used unless asked otherwise.
+            compile_mode = training_cfg.get("compile_mode", "default")
+            if self.is_primary:
+                logger.info("Compiling model with torch.compile (mode=%s)...", compile_mode)
+            # DDPOptimizer splits the compiled graph at DDP's gradient buckets
+            # so the all-reduce for early buckets overlaps the rest of the
+            # backward. That overlap is most of what makes multi-GPU scale, so
+            # it stays on by default; set optimize_ddp: false only if inductor
+            # chokes on the split graph.
+            torch._dynamo.config.optimize_ddp = bool(
+                training_cfg.get("optimize_ddp", True)
+            )
+            kwargs = {"dynamic": True}
+            if compile_mode not in ("default", None, ""):
+                kwargs["mode"] = compile_mode
+            self.model = torch.compile(self.model, **kwargs)
 
         # ── Optimiser ─────────────────────────────────────────────────────
         opt_cfg = optimiser_cfg.get("unified", optimiser_cfg)
         betas   = tuple(opt_cfg.get("betas", [0.9, 0.999]))
         self.optimizer = AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
+            [p for p in self.model.parameters() if p.requires_grad],
             lr           = opt_cfg["lr"],
             weight_decay = opt_cfg.get("weight_decay", 1e-4),
             betas        = betas,
@@ -110,9 +183,42 @@ class Trainer:
 
         self.scheduler = LambdaLR(self.optimizer, lr_lambda)
 
-        self.use_amp   = training_cfg.get("mixed_precision", False) and device.startswith("cuda")
-        self.amp_dtype = torch.bfloat16
-        self.scaler    = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        # ── Precision ─────────────────────────────────────────────────────
+        # bfloat16 has the dynamic range of fp32, so it needs no loss scaling;
+        # a GradScaler there costs a host sync per step for nothing. Only fp16
+        # gets the scaler.
+        precision = str(training_cfg.get("precision", "")).lower()
+        if not precision:
+            precision = "bf16" if training_cfg.get("mixed_precision", False) else "fp32"
+        if not device.startswith("cuda"):
+            precision = "fp32"
+
+        # bf16 needs Ampere (sm_80+) tensor cores. On older cards torch still
+        # *runs* it — torch.cuda.is_bf16_supported() returns True, meaning
+        # "works", not "is fast" — but it falls off the tensor-core path
+        # entirely. Measured on a V100 (sm_70): fp16 92.1 TFLOP/s, fp32 13.8,
+        # bf16 10.4. Selecting bf16 there is an 8.8x slowdown against fp16 and
+        # is even slower than plain fp32, which is a silent and very expensive
+        # mistake on the gpuvolta queue. fp16 carries the same memory saving
+        # and the GradScaler below already makes it safe.
+        if precision == "bf16" and device.startswith("cuda"):
+            major, _ = torch.cuda.get_device_capability()
+            if major < 8:
+                if self.is_primary:
+                    logger.warning(
+                        "bf16 requested on %s (sm_%d%d), which has no bf16 tensor "
+                        "cores — it would run ~9x slower than fp16 and slower than "
+                        "fp32. Using fp16 instead. Set precision: fp32 to override.",
+                        torch.cuda.get_device_name(), *torch.cuda.get_device_capability(),
+                    )
+                precision = "fp16"
+
+        self.precision = precision
+        self.use_amp   = precision in ("bf16", "fp16")
+        self.amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(precision)
+        self.scaler    = torch.amp.GradScaler("cuda", enabled=(precision == "fp16"))
+        if self.is_primary:
+            logger.info("Precision: %s", precision)
 
         logging_cfg         = config.get("logging", {})
         self.run_name       = logging_cfg.get("project_name", "baseline")
@@ -125,19 +231,70 @@ class Trainer:
     # Helpers                                                              #
     # ------------------------------------------------------------------ #
 
+    def _set_seed(self, seed: int) -> None:
+        """Seed per rank so ranks draw different noise but stay reproducible."""
+        seed = int(seed) + self.rank
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
     def _get_inner_model(self) -> LatentDiffusionTransformer:
         """Unwrap DDP and/or torch.compile to get the raw LDT."""
         m = self.model
-        if hasattr(m, "_orig_mod"):   # torch.compile
-            m = m._orig_mod
-        if isinstance(m, DDP):        # DDP
-            m = m.module
-        if hasattr(m, "_orig_mod"):   # compile(DDP(...))
-            m = m._orig_mod
+        for _ in range(3):
+            if hasattr(m, "_orig_mod"):
+                m = m._orig_mod
+            elif isinstance(m, DDP):
+                m = m.module
+            else:
+                break
         return m
 
-    def _get_vae(self):
-        return self._get_inner_model().vae
+    def _autocast(self):
+        if not self.use_amp:
+            return contextlib.nullcontext()
+        return torch.amp.autocast("cuda", dtype=self.amp_dtype)
+
+    def _synced_batches(self, loader: DataLoader) -> Iterator:
+        """
+        Iterate a loader so every DDP rank stops on the same step.
+
+        The dataset is an IterableDataset that silently drops samples with
+        missing data or NaNs, so ranks do not produce identical batch counts.
+        Without this guard the first rank to run dry would leave the others
+        blocked forever in the next gradient all-reduce.
+        """
+        iterator = iter(loader)
+        while True:
+            try:
+                batch = next(iterator)
+                have  = 1
+            except StopIteration:
+                batch = None
+                have  = 0
+
+            if self.world_size > 1:
+                flag = torch.tensor([have], device=self.device, dtype=torch.int32)
+                dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+                if int(flag.item()) == 0:
+                    return
+            elif have == 0:
+                return
+
+            yield batch
+
+    def _reduce_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
+        """Average a metric dict across DDP ranks so every rank agrees."""
+        if self.world_size == 1 or not metrics:
+            return metrics
+        keys   = sorted(metrics)
+        tensor = torch.tensor(
+            [metrics[k] for k in keys], device=self.device, dtype=torch.float64
+        )
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor /= self.world_size
+        return dict(zip(keys, tensor.tolist()))
 
     # ------------------------------------------------------------------ #
     # Data                                                                 #
@@ -147,170 +304,421 @@ class Trainer:
         if self.is_primary:
             logger.info("Setting up datasets...")
         train_loader = build_dataloader("train", self.config, shuffle=True)
-        val_loader   = build_dataloader("val",   self.config, shuffle=False)
+        # drop_last on validation throws away up to batch_size-1 samples for no
+        # benefit, and on a small split can discard every batch there is.
+        val_loader   = build_dataloader("val", self.config, shuffle=False,
+                                        drop_last=False)
         return train_loader, val_loader
-
-    # ------------------------------------------------------------------ #
-    # Forward steps                                                        #
-    # ------------------------------------------------------------------ #
-
-    def _unified_step(
-        self,
-        context:  torch.Tensor,
-        forecast: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Single forward pass for end-to-end training.
-
-        Returns:
-            loss:      combined loss (diffusion + vae_loss_weight * vae)
-            diff_loss: diffusion component (detached)
-            vae_loss:  VAE reconstruction + KL component (detached)
-        """
-        images      = torch.cat([context, forecast], dim=1)   # (B, T, C, H, W)
-        flat_images = images.reshape(-1, *images.shape[2:])   # (B*T, C, H, W)
-
-        with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
-            # VAE loss — keeps encoder/decoder well-conditioned during joint training
-            vae                     = self._get_vae()
-            x_recon, mu, logvar     = vae(flat_images)
-            vae_loss, _, _          = vae.vae_loss(
-                flat_images, x_recon, mu, logvar,
-                beta=self.vae_beta, ssim_weight=self.vae_ssim_weight,
-            )
-
-            # Diffusion loss
-            diff_loss, _ = self.model(context, forecast)
-
-            loss = diff_loss + self.vae_loss_weight * vae_loss
-
-        return loss, diff_loss.detach(), vae_loss.detach()
 
     # ------------------------------------------------------------------ #
     # Epoch loops                                                          #
     # ------------------------------------------------------------------ #
 
-    def train_epoch(
-        self,
-        train_loader: DataLoader,
-        epoch:        int,
-    ) -> dict[str, float]:
-        if hasattr(train_loader.sampler, "set_epoch"):
+    def train_epoch(self, train_loader: DataLoader, epoch: int) -> dict[str, float]:
+        dataset = train_loader.dataset
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
+        if hasattr(getattr(train_loader, "sampler", None), "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
 
         self.model.train()
-        total_loss = 0.0
-        total_diff = 0.0
-        total_vae  = 0.0
-        n_steps    = 0
+        totals  = {"total": 0.0, "diffusion": 0.0, "vae": 0.0, "recon": 0.0, "kl": 0.0}
+        n_steps = 0
 
-        pbar = tqdm(train_loader, desc="Training", disable=not self.is_primary)
+        # Split wall-clock into "waiting for a batch" and "computing on it".
+        # This is the number that says whether the GPUs are being used: the
+        # loss curve cannot distinguish a fed GPU from a starved one.
+        t_data = 0.0
+        t_compute = 0.0
+        n_samples = 0
+        if self.device.startswith("cuda"):
+            torch.cuda.reset_peak_memory_stats()
+        epoch_start = time.perf_counter()
+        wait_start = time.perf_counter()
 
-        for context, forecast in pbar:
+        pbar = tqdm(
+            self._synced_batches(train_loader),
+            desc="Training",
+            disable=not self.is_primary,
+        )
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        for step, (context, forecast) in enumerate(pbar):
+            t_data += time.perf_counter() - wait_start
+            compute_start = time.perf_counter()
+
             context  = context.to(self.device, non_blocking=True)
             forecast = forecast.to(self.device, non_blocking=True)
+            n_samples += context.shape[0]
 
-            self.optimizer.zero_grad()
+            is_accum_boundary = (step + 1) % self.accum_steps == 0
 
-            loss, diff_loss, vae_loss = self._unified_step(context, forecast)
+            # Skip DDP's gradient all-reduce on non-boundary micro-steps.
+            sync_ctx = (
+                self.model.no_sync()
+                if (self.world_size > 1 and not is_accum_boundary
+                    and hasattr(self.model, "no_sync"))
+                else contextlib.nullcontext()
+            )
 
-            self.scaler.scale(loss).backward()
+            with sync_ctx:
+                with self._autocast():
+                    out = self.model(
+                        context, forecast,
+                        vae_loss_weight = self.vae_loss_weight,
+                        vae_beta        = self.vae_beta,
+                        vae_ssim_weight = self.vae_ssim_weight,
+                    )
+                    loss = out["loss"] / self.accum_steps
+                self.scaler.scale(loss).backward()
 
-            if self.gradient_clip_norm > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), max_norm=self.gradient_clip_norm
-                )
+            if is_accum_boundary:
+                if self.gradient_clip_norm > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=self.gradient_clip_norm
+                    )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # .item() below already synchronises, so the timing is honest and
+            # does not need an extra torch.cuda.synchronize().
+            totals["total"]     += out["loss"].item()
+            totals["diffusion"] += out["diffusion_loss"].item()
+            totals["vae"]       += out["vae_loss"].item()
+            totals["recon"]     += out["recon_loss"].item()
+            totals["kl"]        += out["kl_loss"].item()
+            n_steps += 1
 
-            total_loss += loss.item()
-            total_diff += diff_loss.item()
-            total_vae  += vae_loss.item()
-            n_steps    += 1
+            t_compute += time.perf_counter() - compute_start
 
             if self.is_primary:
+                elapsed = max(time.perf_counter() - epoch_start, 1e-9)
                 pbar.set_postfix({
-                    "loss": f"{loss.item():.4f}",
-                    "diff": f"{diff_loss.item():.4f}",
-                    "vae":  f"{vae_loss.item():.4f}",
+                    "loss":  f"{out['loss'].item():.4f}",
+                    "diff":  f"{out['diffusion_loss'].item():.4f}",
+                    "smp/s": f"{n_samples / elapsed:.2f}",
+                    "wait":  f"{100 * t_data / elapsed:.0f}%",
                 })
 
-        n = max(1, n_steps)
-        return {
-            "total":     total_loss / n,
-            "diffusion": total_diff / n,
-            "vae":       total_vae  / n,
-        }
+            wait_start = time.perf_counter()
 
-    def validate(
-        self,
-        val_loader: Optional[DataLoader],
-    ) -> Optional[dict[str, float]]:
+        # With num_workers > 0 the dataset object here is the parent's copy and
+        # its counters stay at zero — the real iteration happens in the worker
+        # processes, which have their own copies.
+        if (hasattr(dataset, "log_epoch_summary") and self.is_primary
+                and train_loader.num_workers == 0):
+            dataset.log_epoch_summary()
+
+        if n_steps == 0:
+            # Zero batches used to be averaged as max(1, 0), reporting a
+            # flawless 0.0 loss for an epoch that never touched any data — a
+            # run could "train" for 100 epochs on nothing and look perfect.
+            raise RuntimeError(
+                "The training dataloader produced no batches. With an "
+                "IterableDataset every worker batches independently, so a split "
+                "needs at least batch_size x num_workers samples before any "
+                "batch appears, and drop_last then discards each worker's "
+                "remainder. Check data.splits.train, data.sample_stride "
+                f"(currently {self.config['data'].get('sample_stride', 1)}), "
+                f"dataloader.batch_size x num_workers "
+                f"({train_loader.batch_size} x {train_loader.num_workers}), and "
+                "dataloader.drop_last."
+            )
+
+        if self.is_primary and n_steps:
+            wall = max(time.perf_counter() - epoch_start, 1e-9)
+            peak = (
+                torch.cuda.max_memory_allocated() / 2**30
+                if self.device.startswith("cuda") else 0.0
+            )
+            logger.info(
+                "Throughput — %.2f samples/s/rank (%.2f global) | %.2fs/step | "
+                "data wait %.0f%% | compute %.0f%% | peak mem %.1f GiB",
+                n_samples / wall, n_samples * self.world_size / wall,
+                wall / n_steps, 100 * t_data / wall, 100 * t_compute / wall, peak,
+            )
+            if t_data > 0.5 * wall:
+                logger.warning(
+                    "The GPU spent %.0f%% of the epoch waiting for data. Raise "
+                    "dataloader.num_workers or data.sample_stride — more GPUs "
+                    "will not help until this is under control.",
+                    100 * t_data / wall,
+                )
+
+        n = max(1, n_steps)
+        metrics = self._reduce_metrics({k: v / n for k, v in totals.items()})
+        metrics["samples_per_s"] = n_samples / max(time.perf_counter() - epoch_start, 1e-9)
+        return metrics
+
+    @torch.no_grad()
+    def validate(self, val_loader: Optional[DataLoader]) -> Optional[dict[str, float]]:
         if val_loader is None:
             return None
 
         self.model.eval()
         totals = {
-            "total_loss":    0.0,
-            "diff_loss":     0.0,
-            "vae_loss":      0.0,
-            "irradiance_mse": 0.0,
-            "irradiance_mae": 0.0,
+            "total_loss": 0.0, "diff_loss": 0.0, "vae_loss": 0.0,
+            "irradiance_mse": 0.0, "irradiance_mae": 0.0,
         }
+        forecast_totals = {"forecast_mse": 0.0, "forecast_mae": 0.0, "forecast_rmse": 0.0}
         n_batches = 0
+        n_forecast_batches = 0
 
-        with torch.no_grad():
-            for context, forecast in tqdm(
-                val_loader, desc="Validation", disable=not self.is_primary
-            ):
-                context  = context.to(self.device)
-                forecast = forecast.to(self.device)
+        inner = self._get_inner_model()
 
-                loss, diff_loss, vae_loss = self._unified_step(context, forecast)
-                totals["total_loss"] += loss.item()
-                totals["diff_loss"]  += diff_loss.item()
-                totals["vae_loss"]   += vae_loss.item()
+        for context, forecast in tqdm(
+            self._synced_batches(val_loader), desc="Validation", disable=not self.is_primary
+        ):
+            context  = context.to(self.device, non_blocking=True)
+            forecast = forecast.to(self.device, non_blocking=True)
 
-                # Irradiance-space metrics
-                inner   = self._get_inner_model()
-                metrics = inner.forward_eval(context, forecast)
-                for k, v in metrics.items():
-                    if k in totals:
-                        totals[k] += v.item()
+            with self._autocast():
+                # One pass gives the losses and the pixel metrics: deterministic
+                # timesteps and a fixed noise draw make it comparable epoch to
+                # epoch.
+                out = self.model(
+                    context, forecast,
+                    vae_loss_weight      = self.vae_loss_weight,
+                    vae_beta             = self.vae_beta,
+                    vae_ssim_weight      = self.vae_ssim_weight,
+                    deterministic        = True,
+                    return_pixel_metrics = True,
+                    irradiance_channel   = self.irradiance_channel,
+                )
 
-                n_batches += 1
+            totals["total_loss"]     += out["loss"].item()
+            totals["diff_loss"]      += out["diffusion_loss"].item()
+            totals["vae_loss"]       += out["vae_loss"].item()
+            totals["irradiance_mse"] += out["irradiance_mse"].item()
+            totals["irradiance_mae"] += out["irradiance_mae"].item()
+            n_batches += 1
 
-        n = max(1, n_batches)
-        return {k: v / n for k, v in totals.items()}
+            # Real forecast skill via the full DDIM chain, on a small fixed
+            # subset because it is far more expensive than the single-step
+            # estimate above.
+            if n_forecast_batches < self.forecast_eval_batches:
+                with self._autocast():
+                    fm = inner.forecast_metrics(
+                        context, forecast,
+                        num_steps=self.forecast_num_steps,
+                        sampler=self.forecast_sampler,
+                        irradiance_channel=self.irradiance_channel,
+                    )
+                for k, v in fm.items():
+                    forecast_totals[k] += v.item()
+                n_forecast_batches += 1
+
+        if n_batches == 0:
+            # Dividing by max(1, 0) would report a flawless 0.0 for every
+            # metric, and best-model selection would happily save that as the
+            # best model ever seen. No data means no metric.
+            logger.warning(
+                "Validation produced no batches — check data.splits.val, "
+                "data.sample_stride, and dataloader.drop_last. Skipping "
+                "validation, best-model selection and early stopping this epoch."
+            )
+            return None
+
+        metrics = {k: v / n_batches for k, v in totals.items()}
+        if n_forecast_batches:
+            metrics.update({k: v / n_forecast_batches for k, v in forecast_totals.items()})
+
+        return self._reduce_metrics(metrics)
+
+    # ------------------------------------------------------------------ #
+    # Benchmarking                                                         #
+    # ------------------------------------------------------------------ #
+
+    def benchmark(
+        self,
+        batch_sizes: Optional[list[int]] = None,
+        steps: int = 12,
+        warmup: int = 4,
+    ) -> list[dict]:
+        """
+        Measure GPU-side throughput on synthetic batches.
+
+        The real dataloader reads ~20s of satellite archive per sample, which
+        completely masks how fast the model itself is. Feeding it random tensors
+        of the correct shape removes that and answers two separate questions:
+
+          1. How many samples/s can this GPU actually push through the model?
+             Compare against the loader's rate to see which side is the limit.
+          2. How large a batch fits? At 143 GiB an H200 has room the config is
+             not using, and larger batches amortise the per-step overheads that
+             dominate at batch size 2.
+
+        Each batch size is timed independently. Note torch.compile with
+        dynamic=True will recompile on the first step of each new shape, which
+        is why `warmup` steps are discarded.
+        """
+        data_cfg  = self.config["data"]
+        model_cfg = self.config["model"]
+        T_ctx     = data_cfg["n_prior_sat"]
+        T_fcast   = data_cfg["n_post"]
+        C         = model_cfg["image_channels"]
+        H = W     = model_cfg["image_size"]
+
+        if batch_sizes is None:
+            batch_sizes = [self.config.get("dataloader", {}).get("batch_size", 2)]
+
+        results = []
+        self.model.train()
+
+        for bs in batch_sizes:
+            try:
+                context  = torch.randn(bs, T_ctx,   C, H, W, device=self.device)
+                forecast = torch.randn(bs, T_fcast, C, H, W, device=self.device)
+
+                if self.device.startswith("cuda"):
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
+
+                for i in range(warmup + steps):
+                    if i == warmup and self.device.startswith("cuda"):
+                        torch.cuda.synchronize()
+                        t0 = time.perf_counter()
+
+                    with self._autocast():
+                        out = self.model(
+                            context, forecast,
+                            vae_loss_weight = self.vae_loss_weight,
+                            vae_beta        = self.vae_beta,
+                            vae_ssim_weight = self.vae_ssim_weight,
+                        )
+                    self.scaler.scale(out["loss"]).backward()
+                    if self.gradient_clip_norm > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), max_norm=self.gradient_clip_norm
+                        )
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
+
+                if self.device.startswith("cuda"):
+                    torch.cuda.synchronize()
+                dt = (time.perf_counter() - t0) / steps
+                peak = (
+                    torch.cuda.max_memory_allocated() / 2**30
+                    if self.device.startswith("cuda") else 0.0
+                )
+                results.append({
+                    "batch_size":     bs,
+                    "s_per_step":     dt,
+                    "samples_per_s":  bs / dt,
+                    "peak_mem_gib":   peak,
+                })
+                if self.is_primary:
+                    logger.info(
+                        "batch=%3d | %6.3f s/step | %6.2f samples/s/rank | peak %5.1f GiB",
+                        bs, dt, bs / dt, peak,
+                    )
+            except torch.cuda.OutOfMemoryError:
+                if self.is_primary:
+                    logger.warning("batch=%d | out of memory", bs)
+                torch.cuda.empty_cache()
+                break
+            finally:
+                del context, forecast
+                self.optimizer.zero_grad(set_to_none=True)
+
+        return results
+
+    # ------------------------------------------------------------------ #
+    # Cache priming                                                        #
+    # ------------------------------------------------------------------ #
+
+    def prime_cache(self, splits: tuple[str, ...] = ("train", "val")) -> None:
+        """
+        Walk the dataloader once to populate the sample cache, without touching
+        the model.
+
+        The first epoch is the expensive one: every sample costs ~16-20s of
+        archive I/O, and the GPU is 93% idle throughout. Since the cache lives
+        on /scratch and persists across jobs, that pass does not need a GPU at
+        all — run this on the `normal` queue with plenty of CPUs, then the GPU
+        job is compute-bound from its very first epoch.
+
+        Safe to re-run and safe to interrupt: entries are written atomically and
+        a partly-populated cache is simply a partly-warm one.
+        """
+        for split in splits:
+            loader = build_dataloader(split, self.config, shuffle=False,
+                                      drop_last=False)
+            dataset = loader.dataset
+            cache = getattr(dataset, "cache", None)
+            if cache is not None and not cache.enabled:
+                logger.warning(
+                    "dataloader.cache_dir is not set — priming would do nothing."
+                )
+                return
+
+            logger.info("Priming '%s' cache into %s ...", split, cache.root)
+            t0, n = time.perf_counter(), 0
+            for _ in tqdm(loader, desc=f"Priming {split}",
+                          disable=not self.is_primary):
+                n += 1
+            wall = time.perf_counter() - t0
+            logger.info(
+                "Primed '%s': %d batches in %.0fs (%.2f batches/s)",
+                split, n, wall, n / max(wall, 1e-9),
+            )
+            if cache is not None and loader.num_workers == 0:
+                logger.info("[%s] %s", split, cache.summary())
 
     # ------------------------------------------------------------------ #
     # Checkpointing                                                        #
     # ------------------------------------------------------------------ #
 
-    def save_checkpoint(
-        self,
-        epoch:       int,
-        val_metrics: Optional[dict[str, float]] = None,
-    ) -> Path:
-        inner = self._get_inner_model()
-
-        checkpoint = {
+    def _checkpoint_payload(self, epoch: int, val_metrics) -> dict:
+        return {
             "epoch":                epoch,
-            "model_state_dict":     inner.state_dict(),
+            "model_state_dict":     self._get_inner_model().state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "scaler_state_dict":    self.scaler.state_dict(),
             "config":               self.config,
             "val_metrics":          val_metrics,
         }
-        path = self.checkpoint_dir / f"checkpoint_epoch_{epoch:03d}.pt"
-        torch.save(checkpoint, path)
 
-        if self.is_primary:
-            logger.info(f"Checkpoint saved to {path}")
+    def save_checkpoint(
+        self,
+        epoch:       int,
+        val_metrics: Optional[dict[str, float]] = None,
+        is_best:     bool = False,
+    ) -> Path:
+        """
+        Write a checkpoint. The best model goes to a stable filename so it can
+        actually be found later; periodic checkpoints are epoch-numbered and
+        rotated.
+        """
+        payload = self._checkpoint_payload(epoch, val_metrics)
+        name    = BEST_CHECKPOINT_NAME if is_best else f"checkpoint_epoch_{epoch:03d}.pt"
+        path    = self.checkpoint_dir / name
+
+        # Write to a temporary file first so an interrupted job cannot leave a
+        # truncated checkpoint behind.
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save(payload, tmp)
+        tmp.replace(path)
+
+        logger.info("Checkpoint saved to %s", path)
+        if not is_best:
+            self._rotate_checkpoints()
         return path
+
+    def _rotate_checkpoints(self) -> None:
+        if not self.keep_last_n or self.keep_last_n <= 0:
+            return
+        checkpoints = sorted(self.checkpoint_dir.glob("checkpoint_epoch_*.pt"))
+        for stale in checkpoints[:-self.keep_last_n]:
+            with contextlib.suppress(OSError):
+                stale.unlink()
+                logger.debug("Removed old checkpoint %s", stale)
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> int:
         """Load a checkpoint and return the epoch it was saved at."""
@@ -318,7 +726,7 @@ class Trainer:
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self._get_inner_model().load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -326,7 +734,7 @@ class Trainer:
 
         epoch = checkpoint.get("epoch", 0)
         if self.is_primary:
-            logger.info(f"Resumed from checkpoint {path} (epoch {epoch})")
+            logger.info("Resumed from checkpoint %s (epoch %d)", path, epoch)
         return epoch
 
     # ------------------------------------------------------------------ #
@@ -355,18 +763,19 @@ class Trainer:
         num_epochs:   int,
         start_epoch:  int = 0,
     ) -> None:
-        best_val_loss = float("inf")
+        best_metric = float("inf")
 
         es_cfg      = self.config["training"].get("early_stopping", {})
         es_enabled  = es_cfg.get("enabled", False)
         es_patience = es_cfg.get("patience", 20)
         es_counter  = 0
+        monitor     = es_cfg.get("monitor", "irradiance_mse")
 
         for epoch in range(start_epoch, num_epochs):
             if self.is_primary:
                 logger.info(
-                    f"\nEpoch {epoch + 1}/{num_epochs}  "
-                    f"(lr={self.optimizer.param_groups[0]['lr']:.2e})"
+                    "Epoch %d/%d  (lr=%.2e)",
+                    epoch + 1, num_epochs, self.optimizer.param_groups[0]["lr"],
                 )
 
             train_metrics = self.train_epoch(train_loader, epoch)
@@ -374,26 +783,52 @@ class Trainer:
 
             self.scheduler.step()
 
+            # Metrics are all-reduced, so every rank computes the same
+            # decisions here. Only the file writes are rank-0, which keeps the
+            # control flow identical across ranks and cannot deadlock.
+            primary_metric = None
+            if val_metrics is not None:
+                primary_metric = val_metrics.get(monitor)
+                if primary_metric is None:
+                    primary_metric = val_metrics.get("total_loss")
+
+            is_best = primary_metric is not None and primary_metric < best_metric
+            if is_best:
+                best_metric = primary_metric
+                es_counter  = 0
+            elif es_enabled and primary_metric is not None:
+                es_counter += 1
+
             if self.is_primary:
                 logger.info(
-                    f"Train — total: {train_metrics['total']:.6f} | "
-                    f"diffusion: {train_metrics['diffusion']:.6f} | "
-                    f"vae: {train_metrics['vae']:.6f}"
+                    "Train — total: %.6f | diffusion: %.6f | vae: %.6f "
+                    "(recon %.6f, kl %.6f)",
+                    train_metrics["total"], train_metrics["diffusion"],
+                    train_metrics["vae"], train_metrics["recon"], train_metrics["kl"],
                 )
-
                 if val_metrics is not None:
                     logger.info(
-                        f"Val   — total: {val_metrics['total_loss']:.6f} | "
-                        f"diffusion: {val_metrics['diff_loss']:.6f} | "
-                        f"vae: {val_metrics['vae_loss']:.6f} | "
-                        f"irradiance MSE: {val_metrics['irradiance_mse']:.6f} | "
-                        f"irradiance MAE: {val_metrics['irradiance_mae']:.6f}"
+                        "Val   — total: %.6f | diffusion: %.6f | vae: %.6f | "
+                        "irradiance MSE: %.6f | MAE: %.6f",
+                        val_metrics["total_loss"], val_metrics["diff_loss"],
+                        val_metrics["vae_loss"], val_metrics["irradiance_mse"],
+                        val_metrics["irradiance_mae"],
                     )
+                    if "forecast_rmse" in val_metrics:
+                        logger.info(
+                            "Val   — DDIM forecast RMSE: %.6f | MAE: %.6f",
+                            val_metrics["forecast_rmse"], val_metrics["forecast_mae"],
+                        )
+                logger.info("Latent scale (EMA std): %.4f",
+                            float(self._get_inner_model().latent_std))
 
                 if self.mlflow_enabled:
                     for k, v in train_metrics.items():
                         mlflow.log_metric(f"train_{k}", v, step=epoch)
                     mlflow.log_metric("lr", self.optimizer.param_groups[0]["lr"], step=epoch)
+                    mlflow.log_metric(
+                        "latent_std", float(self._get_inner_model().latent_std), step=epoch
+                    )
                     if val_metrics is not None:
                         for k, v in val_metrics.items():
                             mlflow.log_metric(f"val_{k}", v, step=epoch)
@@ -401,23 +836,16 @@ class Trainer:
                 if (epoch + 1) % self.save_every == 0:
                     self.save_checkpoint(epoch + 1, val_metrics)
 
-                # Primary metric: irradiance MSE if available, else total val loss
-                primary_metric = (
-                    val_metrics.get("irradiance_mse") or val_metrics.get("total_loss")
-                    if val_metrics is not None else None
-                )
+                if is_best:
+                    self.save_checkpoint(epoch + 1, val_metrics, is_best=True)
+                    logger.info("New best model — %s: %.6f", monitor, best_metric)
+                elif es_enabled and primary_metric is not None:
+                    logger.info("No improvement (%d/%d)", es_counter, es_patience)
 
-                if primary_metric is not None and primary_metric < best_val_loss:
-                    best_val_loss = primary_metric
-                    es_counter    = 0
-                    self.save_checkpoint(epoch + 1, val_metrics)
-                    logger.info(f"New best model — primary metric: {primary_metric:.6f}")
-                elif es_enabled:
-                    es_counter += 1
-                    logger.info(f"No improvement ({es_counter}/{es_patience})")
-                    if es_counter >= es_patience:
-                        logger.info("Early stopping triggered.")
-                        break
+            if es_enabled and es_counter >= es_patience:
+                if self.is_primary:
+                    logger.info("Early stopping triggered.")
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -440,23 +868,50 @@ def _flatten(d: dict, parent_key: str = "", sep: str = ".") -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train the CPDiT latent diffusion transformer")
-    parser.add_argument("--config",     type=str, default="configs/train_config.yaml")
-    parser.add_argument("--resume",     type=str, default=None,
+    parser = argparse.ArgumentParser(
+        description="Train the CPDiT latent diffusion transformer"
+    )
+    parser.add_argument("--config", type=str, default="configs/train_config.yaml")
+    parser.add_argument("--resume", type=str, default=None,
                         help="Path to a checkpoint to resume training from")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Override the device (e.g. cpu, cuda:0)")
+    parser.add_argument("--prime-cache", action="store_true",
+                        help="Populate the sample cache and exit. Needs no GPU: "
+                             "run it on the normal queue so the GPU job starts "
+                             "with a warm cache.")
+    parser.add_argument("--benchmark", type=str, default=None, metavar="SIZES",
+                        help="Benchmark GPU throughput on synthetic batches "
+                             "instead of training, e.g. --benchmark 2,4,8,16. "
+                             "Isolates model speed from archive I/O.")
     args = parser.parse_args()
 
-    dist.init_process_group(backend="nccl")
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = f"cuda:{local_rank}"
+    # Only initialise the process group when actually launched under torchrun,
+    # so single-GPU and CPU debugging runs work with a plain `python -m`.
+    distributed = "LOCAL_RANK" in os.environ and int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if distributed:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+    elif args.device:
+        device = args.device
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     config  = load_config(args.config)
     trainer = Trainer(config, device=device)
-    trainer.train(resume_from=args.resume)
-
-    dist.destroy_process_group()
+    try:
+        if args.prime_cache:
+            trainer.prime_cache()
+        elif args.benchmark:
+            sizes = [int(x) for x in args.benchmark.split(",") if x.strip()]
+            trainer.benchmark(batch_sizes=sizes)
+        else:
+            trainer.train(resume_from=args.resume)
+    finally:
+        if distributed:
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
