@@ -1,0 +1,1 @@
+qsub -I -q gpuhopper -P v46 -l walltime=1:00:00,ncpus=12,ngpus=1,mem=255GB,jobfs=255GB,storage=scratch/er8+gdata/su28+gdata/gb02+gdata/wr45+gdata/er8+gdata/ob53+gdata/dk92+gdata/rt52+scratch/nf33+gdata/rv74+gdata/rq0+gdata/ra22+gdata/rq0+gdata/xp65
