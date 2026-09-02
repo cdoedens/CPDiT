@@ -1,339 +1,312 @@
-# Latent Diffusion Transformer for Satellite Image Forecasting
+# CPDiT — Latent Diffusion Transformer for Solar Irradiance Nowcasting
 
-A deep learning framework for forecasting future satellite images using latent diffusion transformers. This architecture combines:
-
-- **Variational Autoencoder (VAE)**: Compresses high-dimensional satellite images into a compact latent space
-- **Transformer**: Models temporal dependencies in latent space sequences  
-- **Diffusion Model**: Generates probabilistic forecasts of future satellite observations
-
-## Architecture Overview
+Probabilistic nowcasting of surface solar irradiance from Himawari-8/9 satellite
+imagery, conditioned on BARRA-R2 reanalysis fields.
 
 ```
-Input Images → VAE Encoder → Latent Codes → Transformer → Diffusion Model → Future Images
+Himawari + BARRA  →  VAE encoder  →  latent maps  →  temporal transformer
+                                          ↓                    ↓
+                                   DiT denoiser (adaLN-Zero, neighbourhood attn)
+                                          ↓
+                        reverse-SDE / PF-ODE sampling → VAE decoder → forecast
 ```
 
-### Components
+## Architecture
 
-1. **VAE** (`src/models/vae.py`): Encodes/decodes between image and latent spaces
-2. **Transformer** (`src/models/transformer_backbone.py`): Temporal sequence modeling
-3. **Latent Diffusion Transformer** (`src/models/latent_diffusion.py`): Complete forecasting model
-4. **Data Loaders** (`src/data/__init__.py`): Multi-dataset support (HIMAWARI, GOES, etc.)
+| Component | File | Role |
+|---|---|---|
+| VAE | [src/models/vae.py](src/models/vae.py) | `(C, 256, 256) → (4, 32, 32)` spatial latents |
+| Networks | [src/models/networks.py](src/models/networks.py) | `ContextEncoder` (temporal) + `DiTDenoiser` (score network) |
+| Diffusion process | [src/models/diffusion.py](src/models/diffusion.py) | VP / cosine-VP / VE SDEs + PC and PF-ODE samplers; no parameters |
+| Full model | [src/models/latent_diffusion.py](src/models/latent_diffusion.py) | Assembly: `score()`, the DSM objective, `sample()` |
 
-## Installation
+Four modules, split by role: `vae.py` moves between pixels and latents,
+`networks.py` holds everything with learned weights, `diffusion.py` holds the
+maths with none, and `latent_diffusion.py` is the only class training and
+inference touch.
+| Data pipeline | [src/petdata/\_\_init\_\_.py](src/petdata/__init__.py) | pyearthtools → `(context, forecast)` tensors |
 
-1. **Clone and setup**:
+### Score-based, not DDPM
+
+The generative model is **score-based** in the SDE framework of
+[Song et al. 2021](https://arxiv.org/abs/2011.13456). It learns
+`s_theta(x, t) ≈ ∇_x log p_t(x)` over **continuous** time under a forward SDE,
+rather than epsilon-prediction over a discrete `betas` / `alphas_cumprod` ladder.
+
+| | |
+|---|---|
+| Forward | `dx = f(x,t) dt + g(t) dw`, kernel `N(alpha(t) x0, sigma(t)^2 I)` |
+| Objective | denoising score matching against the exact kernel score `-z/sigma` |
+| Sampling | reverse-time SDE + Langevin corrector, or probability-flow ODE |
+| SDEs | `vp_cosine` (default), `vp`, `ve` — see `model.diffusion.sde` |
+
+The network emits `out` and the score is **defined** as `-out/sigma(t)`. That
+keeps the regression target unit-variance at every noise level instead of asking
+the network to learn an O(1/sigma) blow-up. A consequence worth being explicit
+about: under the default `sigma^2` weighting this objective is numerically the
+same as epsilon-prediction MSE. That equivalence is a known property of the VP
+family, not a sign the change is cosmetic — what it buys is everything built on
+having a score: continuous time, a choice of SDE, the Langevin corrector, the
+deterministic PF-ODE, and `loss_weighting: likelihood` (`lambda = g(t)^2`), which
+is *not* equivalent to epsilon-MSE and targets the log-likelihood bound.
+
+The corrector is the practical payoff: it re-equilibrates onto `p_t` at each
+noise level rather than letting discretisation error accumulate down the chain,
+so the sampler tolerates far fewer steps than an ancestral chain would.
+
+Checkpoints from the DDPM version will not load — the noise-schedule buffers are
+gone and `model.diffusion` keys changed.
+
+### The DiT denoiser
+
+The denoiser is a Diffusion Transformer, not a U-Net. Per forecast frame:
+
+1. The noisy latent is concatenated with **all context latent frames along the
+   channel axis**, giving `latent_channels × (1 + context_length)` input channels.
+2. A **4×4 strided convolution** patch-embeds that stack into tokens.
+3. Fixed 2-D sin-cos positional embeddings are added.
+4. **`num_blocks` transformer blocks** apply **2-D neighbourhood attention** (local window)
+   followed by an MLP, each modulated by **adaLN-Zero**.
+5. A zero-initialised final layer projects tokens back to patch pixels.
+
+Conditioning enters two ways, deliberately:
+
+- **Spatially**, through the channel concatenation, so the denoiser keeps the
+  full spatial structure of the recent past. A single pooled context vector
+  cannot tell a convolutional or attention stack *where* the clouds are.
+- **Globally**, through adaLN-Zero, from the diffusion timestep, a pooled
+  summary of the temporal transformer output, and a **lead-time embedding**.
+
+The lead-time embedding is what makes different forecast frames distinguishable.
+Without it, every frame of the horizon is an identical draw from the same
+conditional distribution.
+
+### Neighbourhood attention window sizing
+
+Neighbourhood attention only helps when the window is *smaller* than the token
+grid. The grid is `image_size / 8 / patch_size`, so:
+
+| `image_size` | `patch_size` | Token grid | Largest usable window | Tokens/frame |
+|---:|---:|---:|---:|---:|
+| 256 | 4 | 8×8 | **7** (31 clamps down) | 64 |
+| 256 | 2 | 16×16 | 15 | 256 |
+| 256 | 1 | 32×32 | **31** | 1024 |
+| 512 | 4 | 16×16 | 15 | 256 |
+| 1024 | 4 | 32×32 | **31** | 1024 |
+
+At the default 256 px with patch size 4 the grid is only 8×8, so a 31×31 window
+is clamped to 7 and attention is effectively global. The model logs a warning
+when this happens. This is correct but wasteful — the sparsity buys nothing at
+this resolution. To make the 31×31 window meaningful, either raise `image_size`
+to 1024 or drop `patch_size` to 1.
+
+`NATTEN`'s fused CUDA kernels are used automatically when importable; otherwise
+an exact masked-softmax fallback runs, which is mathematically identical and
+perfectly adequate at these grid sizes.
+
+## Data
+
+Each sample is `n_prior_sat` context frames immediately before time *t*, and
+`n_post` forecast frames starting at *t*. With the defaults (12 context, 1
+forecast, 10-minute cadence) that is a 10-minute-ahead nowcast from two hours
+of history.
+
+Channels follow `xr.merge` order, so the Himawari variables come first and
+`irradiance_channel: 0` is `himawari_vars[0]`.
+
+> **Normalisation.** `stats_path` holds means and standard deviations in **raw
+> physical units** (W/m², %). The pipeline must therefore apply *no* other
+> scaling before the z-score. Composing a second scaling with these statistics
+> collapses the data to a near-constant field, and training will appear to
+> converge beautifully while learning nothing.
+
+Regenerate statistics with:
+
 ```bash
-cd /path/to/solar-nowcast/CPDiT
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+python scripts/calc_norm_stats.py
 ```
 
-2. **Install MLflow (optional, for experiment tracking)**:
+## Setup
+
 ```bash
-pip install mlflow
-mlflow server --backend-store-uri sqlite:///mlflow.db
+source hpc_setup.sh        # loads the pet/0.6.2 module on NCI Gadi
 ```
 
-## Data Preparation
+## Training
 
-### Supported Datasets
+Single GPU or CPU:
 
-- **HIMAWARI-8/9**: Japanese geostationary satellite imagery
-- Custom satellite data (must be in netCDF format)
-
-### Expected Data Format
-
-Data should be stored as netCDF files with structure:
+```bash
+python -m src.training.train --config configs/train_config.yaml
 ```
-dataset.nc
-├── time (unlimited dimension)
-├── lat (latitude coordinates)
-├── lon (longitude coordinates)
-└── TBD (brightness temperature data)
-    └── shape: (time, lat, lon)
+
+Multi-GPU:
+
+```bash
+torchrun --nproc_per_node=4 -m src.training.train --config configs/train_config.yaml
 ```
+
+Resume:
+
+```bash
+python -m src.training.train --resume /path/to/checkpoint_epoch_050.pt
+```
+
+Training is single-stage: the VAE and the diffusion model are optimised
+together, with `training.vae_loss_weight` balancing the two. Set it to `0` to
+train the diffusion model against a frozen-in-practice VAE.
+
+### Checkpoints
+
+The best model is written to a stable `best_model.pt`; periodic checkpoints are
+epoch-numbered and rotated to the last `keep_last_n_checkpoints`. Every
+checkpoint embeds its config, so inference reconstructs the architecture without
+a second config file.
+
+### Latent scaling
+
+Diffusion assumes roughly unit-variance data, but VAE latents have an arbitrary
+scale. The model tracks an EMA of the latent standard deviation and divides by
+it — the running-statistics analogue of Stable Diffusion's fixed `0.18215`. The
+value is logged each epoch as `Latent scale (EMA std)`. Once the VAE has
+converged, freeze it by setting `model.latent_scale` to that number.
+
+## Evaluation and inference
+
+```bash
+python scripts/evaluate.py  --checkpoint .../best_model.pt --split val
+python scripts/inference.py --checkpoint .../best_model.pt --num-samples 8
+```
+
+`evaluate.py` integrates the full reverse process, reports metrics in physical units, and
+prints a **persistence baseline** with a skill score. A nowcast that does not
+beat persistence is not a nowcast.
+
+During training two validation signals are logged:
+
+- `irradiance_mse` / `irradiance_mae` — a cheap single-step x̂₀ estimate at fixed
+  times with a fixed noise draw, so it is reproducible across epochs.
+- `forecast_rmse` / `forecast_mae` — the full reverse process (PF-ODE), on the first
+  `evaluation.forecast_eval_batches` validation batches only, because it is
+  expensive.
 
 ## Configuration
 
-### Training Configuration (`configs/train_config.yaml`)
+[configs/train_config.yaml](configs/train_config.yaml) is the single source of
+truth, and every key in it is read by the code. Notable ones:
 
 ```yaml
 model:
-  image_channels: 3
-  latent_dim: 256
-  num_transformer_layers: 4
-  
-training:
-  batch_size: 32
-  num_epochs: 100
-  learning_rate: 1.0e-4
-  
+  image_size: 256
+  latent_scale: null              # null = EMA-tracked; a float freezes it
+  diffusion:
+    patch_size: 4                 # 4x4 strided-conv patch embedding
+    embed_dim: 768
+    num_blocks: 4
+    num_heads: 12
+    window_size: 31               # neighbourhood window (odd; clamped to the grid)
+
 data:
-  context_length: 12    # Input sequence length
-  forecast_length: 6    # Output sequence length
-  train_data_paths: [...]
-  val_data_paths: [...]
+  n_prior_sat: 12                 # context frames
+  n_post: 1                       # forecast frames
+  sample_stride: 1                # skip overlapping windows
+
+dataloader:
+  batch_size: 1
+  num_workers: 10                 # pipeline is built per worker, so >0 is safe
+  shuffle_buffer: 256             # reservoir shuffle over the date-ordered stream
+  shuffle_min_fill: 8             # emitted from here; the buffer is not pre-filled
+
+training:
+  precision: bf16                 # auto-falls back to fp16 on pre-Ampere GPUs
+  gradient_accumulation_steps: 4
 ```
 
-### Inference Configuration (`configs/inference_config.yaml`)
+Values above track [configs/train_config.yaml](configs/train_config.yaml); it is
+the source of truth if they ever drift.
 
-```yaml
-model:
-  checkpoint_path: outputs/checkpoints/best_model.pt
-  
-inference:
-  num_forecast_steps: 6
-  num_samples: 1
-  batch_size: 32
-```
-
-## Usage
-
-### Training
-
-**Local GPU:**
-```bash
-bash scripts/train.sh configs/train_config.yaml
-```
-
-**Python script:**
-```python
-from src.training import Trainer, TrainingConfig
-
-config = TrainingConfig.from_yaml('configs/train_config.yaml')
-trainer = Trainer(config)
-trainer.train()
-```
-
-**HPC (PBS/SLURM):**
-```bash
-qsub scripts/train.pbs
-```
-
-### Inference
-
-**Generate forecasts:**
-```bash
-python scripts/inference.py \
-    --checkpoint outputs/checkpoints/best_model.pt \
-    --data-paths /path/to/himawari/test/ \
-    --forecast-steps 6
-```
-
-**Python API:**
-```python
-from src.inference import load_model_from_checkpoint
-
-model, forecaster = load_model_from_checkpoint('path/to/checkpoint.pt')
-
-# Generate deterministic forecast
-forecast = forecaster.forecast_deterministic(context_images, num_steps=6)
-
-# Generate probabilistic samples (with diffusion)
-samples = forecaster.forecast(context_images, num_steps=6, num_samples=10)
-
-# Extended autoregressive sequence
-full_sequence = forecaster.forecast_sequence(context_images, num_steps=24, autoregressive=True)
-```
-
-## Model Components
-
-### Variational Autoencoder
-
-```python
-from src.models import VariationalAutoencoder
-
-vae = VariationalAutoencoder(
-    image_channels=3,
-    latent_dim=256,
-    hidden_dim=256
-)
-
-# Encode images to latent space
-mu, logvar = vae.encode(images)  # (batch, latent_dim)
-
-# Reparameterize
-z = vae.reparameterize(mu, logvar)
-
-# Decode back to images
-reconstructed = vae.decode(z)
-```
-
-### Transformer Backbone
-
-```python
-from src.models import TransformerBackbone
-
-transformer = TransformerBackbone(
-    latent_dim=256,
-    num_layers=4,
-    num_heads=8,
-    feedforward_dim=1024
-)
-
-# Process latent sequences
-encoded = transformer(latent_sequence)  # (batch, seq_len, latent_dim)
-```
-
-### Complete Model
-
-```python
-from src.models import LatentDiffusionTransformer
-
-model = LatentDiffusionTransformer(
-    image_channels=3,
-    latent_dim=256,
-    num_transformer_layers=4,
-    num_diffusion_steps=1000
-)
-
-# Training forward pass
-predictions, encoded_context = model(context_images, target_images)
-
-# Inference sampling
-samples = model.sample(context_images, num_forecast_steps=6, num_samples=1)
-```
-
-## Experiment Tracking
-
-Monitor training with MLflow:
+## Testing
 
 ```bash
-# Start MLflow UI
-mlflow ui
-
-# View experiments at http://localhost:5000
+python -m pytest tests/ -q
 ```
 
-The trainer automatically logs:
-- Model hyperparameters
-- Training/validation loss
-- Model checkpoints
+The tests cover neighbourhood-attention semantics (window centring, boundary
+shifting, locality, and equivalence with full attention when the window spans
+the grid), adaLN-Zero initialisation, lead-time conditioning, SDE consistency
+construction, and latent scaling. They do not import `src.petdata`, so they run
+without the pyearthtools runtime.
 
-## Performance Monitoring
+## Performance notes
 
-Key metrics tracked during training:
-- **Train Loss**: MSE between predictions and targets
-- **Validation Loss**: Generalization performance
-- **Diffusion Loss**: KL divergence for VAE component
-
-## Output Structure
-
-```
-outputs/
-├── checkpoints/
-│   ├── checkpoint_epoch_010.pt
-│   ├── checkpoint_epoch_020.pt
-│   └── best_model.pt
-├── logs/
-│   ├── training.log
-│   └── inference.log
-└── predictions/
-    ├── contexts.npy        # Input sequences
-    ├── predictions.npy     # Generated forecasts
-    └── metrics.json        # Evaluation metrics
-```
-
-## Advanced Usage
-
-### Custom Datasets
-
-```python
-from src.data import SatelliteDataset
-
-custom_dataset = SatelliteDataset(
-    data_paths=['data1.nc', 'data2.nc'],
-    context_length=12,
-    forecast_length=6,
-    stride=2,  # Temporal stride
-    normalize=True
-)
-```
-
-### Fine-tuning
-
-```python
-from src.inference import load_model_from_checkpoint
-from src.training import Trainer, TrainingConfig
-
-# Load pre-trained model
-model, _ = load_model_from_checkpoint('pretrained.pt')
-
-# Fine-tune on new data
-config = TrainingConfig()
-config.learning_rate = 1e-5  # Lower LR for fine-tuning
-trainer = Trainer(config)
-trainer.model = model  # Use loaded weights
-trainer.train()
-```
-
-### Ensemble Predictions
-
-```python
-# Generate multiple samples
-num_samples = 10
-samples_list = []
-for _ in range(num_samples):
-    samples = forecaster.forecast(context_images, num_steps=6, num_samples=1)
-    samples_list.append(samples)
-
-# Compute ensemble statistics
-ensemble = np.concatenate(samples_list, axis=0)
-mean_forecast = ensemble.mean(axis=0)
-std_forecast = ensemble.std(axis=0)
-```
-
-## Troubleshooting
-
-### CUDA Out of Memory
-
-Reduce `batch_size` in config or use gradient accumulation:
-
-```python
-# In training loop
-accumulated_loss = 0
-for i, (context, target) in enumerate(dataloader):
-    loss = compute_loss(model(context), target)
-    (loss / accumulation_steps).backward()
-    
-    if (i + 1) % accumulation_steps == 0:
-        optimizer.step()
-        optimizer.zero_grad()
-```
-
-### Data Loading Issues
-
-Verify data format:
-```python
-import xarray as xr
-ds = xr.open_dataset('your_data.nc')
-print(ds)  # Check dimensions and variables
-```
-
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@software{cpdft2024,
-  author = {Your Name},
-  title = {Latent Diffusion Transformer for Satellite Image Forecasting},
-  year = {2024},
-  url = {https://github.com/your-repo/CPDiT}
-}
-```
-
-## License
-
-MIT License - see LICENSE file for details
+- **The dataloader is the usual bottleneck.** The pipeline is built inside each
+  worker, so `num_workers > 0` is safe and important; the GPU otherwise waits on
+  xarray I/O and interpolation.
+- **bf16 needs Ampere. The gpuvolta queue is V100 (sm_70).** Measured on a
+  V100-SXM2-32GB: fp16 **92.1** TFLOP/s, fp32 13.8, bf16 **10.4** — bf16 is
+  8.8x slower than fp16 and slower than plain fp32, because it has no
+  tensor-core path before sm_80. `torch.cuda.is_bf16_supported()` returns True
+  on a V100; it means "runs", not "is fast". End to end this was **3.8 s/it
+  against 1.2 s/it** on 4xV100. The trainer now detects a pre-Ampere card and
+  falls back to fp16 (which the GradScaler already covers), so `precision:
+  bf16` stays correct on newer hardware.
+- **The cache stores frames, not samples.** Samples overlap heavily — the window
+  is `n_prior_sat + n_post` frames but advances only `sample_stride` — so
+  caching assembled samples would store and decode each frame ~4 times. Caching
+  frames stores each timestamp once: ~11 GB per year instead of ~56 GB, and a
+  correspondingly cheaper cold pass. `scripts/verify_frame_equivalence.py`
+  confirms per-frame assembly reproduces the old windowed pipeline bit-for-bit.
+  `n_prior_sat`/`n_post` are deliberately *not* part of the cache key, so
+  changing the window reuses the frames instead of rebuilding.
+- **Night-time anchors are skipped before any I/O.** A sample needs its whole
+  context window in daylight; outside that the irradiance field is absent or
+  NaN. Measured over this domain (145-151.5E, UTC+10), UTC hours 09-21 produced
+  0 usable samples out of 26 attempts. `data.skip_utc_hours: [9, 21]` drops them
+  without a fetch, removing 13 of 24 hours from the cold pass. It is a fixed
+  clock window, not a solar calculation, so it is conservative in summer.
+- **The sample cache is what makes the GPUs usable.** Building one sample from
+  the archive costs ~16-20s; reading it back from `/scratch` costs ~3 ms. The
+  recipe is deterministic, so `dataloader.cache_dir` stores each processed
+  sample as one `.npy` keyed by timestamp, under a namespace hashing the
+  variables, bounds, window, crop and normalisation statistics — change any of
+  them and you get a fresh namespace, so stale tensors can never be served.
+  Measured on one H200: epoch 1 (cold) 0.36 samples/s with the GPU 93% idle;
+  epoch 2 (warm) **7.89 samples/s with the GPU 96% busy** — a 22x speedup that
+  turns an I/O-bound run into a compute-bound one. Prime it with
+  `--prime-cache` on a CPU-only job first; the cache outlives the job.
+- **Never block the loader to fill a buffer.** A sample costs ~20s of archive
+  I/O, so anything that holds samples back before the first yield is billed
+  directly as GPU idle time. The in-stream shuffle therefore emits from
+  `shuffle_min_fill` (~one batch) onward and grows its buffer while running,
+  instead of pre-filling `shuffle_buffer` slots — which cost 264 fetches, about
+  80 minutes per worker, before the first batch reached the GPU.
+- **Shard the date iterator, never the output stream.** One sample costs
+  ~20s of archive I/O (measured), so a shard must only *request* the samples it
+  will actually yield. `_build_pipeline` therefore takes `shard_index` /
+  `num_shards` and offsets and strides its `DateRange`. Filtering the output
+  stream instead (`itertools.islice`) still pulls every discarded sample
+  through the pipeline: with 4 ranks x 4 workers that threw away 15 of every 16
+  fetches and pushed time-to-first-batch past half an hour, which is
+  indistinguishable from a hang (GPU memory allocated, 0% SM utilisation).
+- **DataLoader workers are spawned, not forked** — a precaution, since
+  `_build_pipeline` is not fork-safe and CUDA/NCCL are live by then. This was
+  not the cause of any observed hang.
+- **Windows overlap heavily.** At a 10-minute cadence with a 12-frame window,
+  consecutive samples share 11 of 12 frames. `sample_stride` and
+  `shuffle_buffer` exist to decorrelate them.
+- **Memory scales with `batch_size × (n_prior_sat + n_post)`**, since every
+  frame passes through the VAE. Prefer gradient accumulation over a large batch.
+- **`bf16` needs no `GradScaler`**; the scaler is enabled only for `fp16`.
 
 ## References
 
-- [Latent Diffusion Models](https://arxiv.org/abs/2112.10752)
-- [Attention is All You Need](https://arxiv.org/abs/1706.03762)
-- [Auto-Encoding Variational Bayes](https://arxiv.org/abs/1312.6114)
+- [Latent Diffusion Models](https://arxiv.org/abs/2112.10752) — Rombach et al. 2022
+- [Scalable Diffusion Models with Transformers](https://arxiv.org/abs/2212.09748) — Peebles & Xie 2023
+- [Neighborhood Attention Transformer](https://arxiv.org/abs/2204.07143) — Hassani et al. 2023
+- [Denoising Diffusion Probabilistic Models](https://arxiv.org/abs/2006.11239) — Ho et al. 2020
+- [Denoising Diffusion Implicit Models](https://arxiv.org/abs/2010.02502) — Song et al. 2020
+- [Improved DDPM](https://arxiv.org/abs/2102.09672) — Nichol & Dhariwal 2021
 
-## Contact
+## License
 
-For questions or issues, please open an issue on GitHub.
+MIT — see [LICENSE](LICENSE).
