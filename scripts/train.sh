@@ -1,22 +1,20 @@
 #!/bin/bash
 
 # Training script for latent diffusion transformer
-# Usage: bash scripts/train.sh [config_path]
 
-CONFIG_PATH=${1:-configs/train_config.yaml}
-DEVICE=${2:-cuda}
 
-echo "Starting training with config: $CONFIG_PATH"
-echo "Device: $DEVICE"
+echo "Skipping environment set up. Make sure this is done prior to running train.sh" 
 
-source hpc_setup.sh
+NPROC="${NPROC:-1}"
 
-# Run training
-python -m src.training.train \
-    --config "$CONFIG_PATH" \
-    --device "$DEVICE"
+echo $NPROC
 
-# torchrun --nproc_per_node=4 -m src_testing.training.train \
-#     --config "$CONFIG_PATH" \
+if [ "$NPROC" -gt 1 ]; then
+    torchrun --nproc_per_node="$NPROC" -m src.training.train \
+        --config configs/train_config.yaml "$@"
+else
+    # Single GPU / CPU: no torchrun needed.
+    python -m src.training.train --config configs/train_config.yaml "$@"
+fi
 
 echo "Training completed!"
