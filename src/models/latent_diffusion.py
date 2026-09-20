@@ -58,6 +58,29 @@ deviation and divide by it, which is the running-statistics analogue of Stable
 Diffusion's fixed 0.18215 factor. Set ``latent_scale`` explicitly in the config
 to freeze it (appropriate once the VAE has stopped moving).
 
+Why the diffusion loss must not reach the encoder
+-------------------------------------------------
+``detach_latents`` defaults to True, and that default is load-bearing. The
+objective below reduces to epsilon-MSE, so if the encoder is free to shrink
+``mu`` towards zero then ``x_t = alpha*0 + sigma*z = sigma*z`` and the denoiser
+recovers ``z = x_t/sigma`` exactly: **collapsing the latent is the global
+minimum of the diffusion loss**. Nothing opposes it — reconstruction is
+scale-free (the decoder simply grows its weights) and the KL pushes the same
+way. A joint run without the detach did exactly this: the latent std fell 10x
+over 11 epochs while the diffusion loss fell 3x and forecast skill got 2.4x
+worse, because the sampler starts from N(0, I) and the score network had only
+ever seen latents with a fraction of that variance.
+
+Two mechanisms make it safe to re-enable the joint gradient (see
+``latent_norm`` and ``pixel_loss_weight``):
+
+  - ``latent_norm="batch"`` divides by a standard deviation computed *with*
+    gradient attached, which makes the loss exactly scale-invariant, so
+    shrinking the latent buys nothing at all.
+  - ``pixel_loss_weight`` adds a decoded-x0-against-truth term at low t. A
+    collapsed latent decodes to the climatological mean and scores terribly on
+    it, so this is a task-aware signal that cannot be gamed by shrinking.
+
 Score-based formulation
 -----------------------
 This is a score-based generative model in the SDE framework of Song et al.
@@ -101,6 +124,8 @@ References:
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import math
 from typing import Optional
 
@@ -111,6 +136,13 @@ import torch.nn.functional as F
 from .diffusion import SDE, broadcast_to, build_sde, ode_sampler, pc_sampler
 from .networks import ContextEncoder, DiTDenoiser
 from .vae import VariationalAutoencoder
+
+logger = logging.getLogger(__name__)
+
+# Floor on the latent standard deviation used for scaling. Reaching it means the
+# latent has collapsed; scaling silently stops working past this point, so the
+# model warns rather than carrying on with a broken normalisation.
+LATENT_STD_FLOOR = 1e-3
 
 
 class LatentDiffusionTransformer(nn.Module):
@@ -152,6 +184,7 @@ class LatentDiffusionTransformer(nn.Module):
         time_scale:             float = 1000.0,
         latent_scale:           Optional[float] = None,
         latent_scale_momentum:  float = 0.99,
+        latent_norm:            str   = "ema",
     ):
         super().__init__()
 
@@ -169,6 +202,17 @@ class LatentDiffusionTransformer(nn.Module):
                 f"loss_weighting must be 'sigma2' or 'likelihood', got {loss_weighting!r}"
             )
         self.loss_weighting = loss_weighting
+
+        # "ema"   divide by the running buffer — a constant w.r.t. autograd.
+        # "batch" divide by this batch's own std, computed *with* gradient, so
+        #         the loss is exactly invariant to the latent scale. Only that
+        #         second mode is safe to combine with detach_latents=False.
+        if latent_norm not in ("ema", "batch"):
+            raise ValueError(
+                f"latent_norm must be 'ema' or 'batch', got {latent_norm!r}"
+            )
+        self.latent_norm = latent_norm
+        self._floor_warned = False
 
         # Continuous-time forward SDE. Holds only Python floats, so it needs no
         # buffers and is device-agnostic.
@@ -229,6 +273,13 @@ class LatentDiffusionTransformer(nn.Module):
         # A user-supplied value freezes it; otherwise it is tracked by EMA
         # during training. It is a buffer so it lands in checkpoints and is
         # broadcast across DDP ranks.
+        if latent_scale is not None and float(latent_scale) <= LATENT_STD_FLOOR:
+            raise ValueError(
+                f"latent_scale={latent_scale} is at or below the {LATENT_STD_FLOOR:.0e} "
+                "scaling floor, so it would be clamped and the diffusion process "
+                "would see mis-scaled data. A value this small almost always means "
+                "it was measured from an already-collapsed VAE."
+            )
         self.latent_scale_fixed = latent_scale is not None
         self.register_buffer(
             "latent_std", torch.tensor(float(latent_scale) if latent_scale else 1.0)
@@ -270,11 +321,50 @@ class LatentDiffusionTransformer(nn.Module):
                 m = self.latent_scale_momentum
                 self.latent_std.mul_(m).add_(std * (1.0 - m))
 
+    def _effective_latent_std(self, dtype: torch.dtype) -> torch.Tensor:
+        """
+        The latent standard deviation used for scaling, floored.
+
+        Deliberately free of any host-side inspection of the buffer: this sits
+        on the per-step training path and inside the sampler's decode, and a
+        `bool(tensor)` here would force a device sync every call and break the
+        compiled graph. The collapse warning lives in `_update_latent_scale`,
+        which already synchronises and runs once per training step.
+        """
+        return self.latent_std.clamp(min=LATENT_STD_FLOOR).to(dtype)
+
+    def check_latent_health(self) -> None:
+        """
+        Warn, once, when the latent std has reached the scaling floor.
+
+        Past the floor the divisor stops tracking the data, so the sampler's
+        N(0, I) prior no longer matches anything the score network was trained
+        on. That used to happen silently, which turned a diagnosable failure
+        into a mystery.
+
+        **Call this once per epoch, not per step.** Reading the buffer host-side
+        is a `Tensor.item()`, which dynamo reports as a graph break inside the
+        compiled forward — measured on an H200, so this is not hypothetical.
+        The trainer calls it from the epoch summary, where it is free.
+        """
+        std = self.latent_std
+        if self._floor_warned or float(std) > LATENT_STD_FLOOR:
+            return
+        self._floor_warned = True
+        logger.warning(
+            "Latent std %.2e has reached the %.0e floor — the latent space has "
+            "collapsed and the diffusion prior no longer matches the data. "
+            "Check that detach_latents is on (or latent_norm='batch'), and see "
+            "the 'Why the diffusion loss must not reach the encoder' note in "
+            "this module.",
+            float(std), LATENT_STD_FLOOR,
+        )
+
     def scale_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        return latents / self.latent_std.clamp(min=1e-3).to(latents.dtype)
+        return latents / self._effective_latent_std(latents.dtype)
 
     def unscale_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        return latents * self.latent_std.clamp(min=1e-3).to(latents.dtype)
+        return latents * self._effective_latent_std(latents.dtype)
 
     def encode_images(
         self,
@@ -413,6 +503,11 @@ class LatentDiffusionTransformer(nn.Module):
         vae_loss_weight: float = 0.1,
         vae_beta:        float = 0.01,
         vae_ssim_weight: float = 0.1,
+        diffusion_loss_weight: float = 1.0,
+        detach_latents:  bool  = True,
+        vae_max_frames:  Optional[int] = None,
+        pixel_loss_weight:  float = 0.0,
+        pixel_loss_max_t:   float = 0.3,
         times:           Optional[torch.Tensor] = None,
         deterministic:   bool  = False,
         return_pixel_metrics: bool = False,
@@ -427,6 +522,26 @@ class LatentDiffusionTransformer(nn.Module):
         through the VAE encoder exactly once.
 
         Args:
+            diffusion_loss_weight: 0 skips the context encoder and denoiser
+                entirely, which is what makes stage-1 VAE-only training cheap.
+            vae_max_frames: score the VAE loss on at most this many frames from
+                each sample instead of all T_ctx + T_fcast of them. The VAE is a
+                per-frame model and a sample's frames are 10 minutes apart, so
+                they are near-duplicates: reconstructing all 13 costs 13x the
+                decoder memory for very little extra signal. MEASURED on an
+                H200 at 256px: all-frames needed 113 GiB at batch 16 and went
+                OOM at 32, which forces a batch size far below what the rest of
+                training uses.
+            detach_latents: cut the diffusion gradient at the encoder. Leave
+                this on unless ``latent_norm='batch'`` is also set — see the
+                module docstring for why collapsing the latent is otherwise the
+                global minimum of this objective.
+            pixel_loss_weight: weight on a decoded-x0-against-truth term. Unlike
+                the latent epsilon-MSE, a collapsed latent scores *badly* on
+                this, so it is a task-aware signal the encoder cannot game.
+            pixel_loss_max_t: only samples with t below this contribute to that
+                term. Above it the 1/alpha factor in Tweedie amplifies score
+                error by orders of magnitude and the gradient is noise.
             times: continuous diffusion times in [t_eps, T]. Drawn stratified
                 at random when omitted.
             deterministic: use evenly-spaced times and a fixed noise draw
@@ -437,7 +552,8 @@ class LatentDiffusionTransformer(nn.Module):
                 and score it against the target in pixel space.
 
         Returns a dict with: loss, diffusion_loss, vae_loss, recon_loss,
-        kl_loss, and (optionally) irradiance_mse / irradiance_mae.
+        kl_loss, latent_scale_ratio, and — when the diffusion branch runs and
+        pixel metrics are requested — irradiance_mse / irradiance_mae.
         """
         B      = context_images.shape[0]
         device = context_images.device
@@ -448,24 +564,86 @@ class LatentDiffusionTransformer(nn.Module):
         T_total    = all_images.shape[1]
         flat       = all_images.reshape(B * T_total, *all_images.shape[2:])
 
+        # When the diffusion branch is off (stage 1) nothing downstream needs a
+        # latent for every frame, so the subsample happens before the encoder
+        # and saves both halves of the autoencoder. Otherwise every frame must
+        # be encoded and only the decoder is spared.
+        needs_all_latents = diffusion_loss_weight > 0
+        vae_idx = self._vae_frame_indices(
+            B, T_total, vae_max_frames, device, deterministic
+        )
+
+        if vae_idx is not None and not needs_all_latents:
+            flat = flat[vae_idx]
+            vae_idx = None                       # already applied
+
         mu, logvar = self.vae.encode(flat)
 
         # ---- VAE objective (reconstruction from a sampled z) --------------
+        zero = torch.zeros((), device=device, dtype=mu.dtype)
         if vae_loss_weight > 0:
-            z_sample = self.vae.reparameterize(mu, logvar)
+            target   = flat if vae_idx is None else flat[vae_idx]
+            mu_v     = mu if vae_idx is None else mu[vae_idx]
+            logvar_v = logvar if vae_idx is None else logvar[vae_idx]
+            z_sample = self.vae.reparameterize(mu_v, logvar_v)
             x_recon  = self.vae.decode(z_sample)
             vae_loss, recon_loss, kl_loss = self.vae.vae_loss(
-                flat, x_recon, mu, logvar,
+                target, x_recon, mu_v, logvar_v,
                 beta=vae_beta, ssim_weight=vae_ssim_weight,
             )
         else:
-            zero = torch.zeros((), device=device, dtype=mu.dtype)
             vae_loss = recon_loss = kl_loss = zero
 
-        # ---- Diffusion objective on deterministic latents -----------------
-        latents = mu.view(B, T_total, self.latent_channels, *mu.shape[-2:])
-        self._update_latent_scale(latents)
-        latents = self.scale_latents(latents)
+        if not needs_all_latents:
+            # Stage 1: no diffusion, so report VAE numbers and stop. The latent
+            # scale still tracks, because stage 2 reads it as a starting point.
+            latents_raw = mu.detach()
+            self._update_latent_scale(latents_raw)
+            return {
+                "loss":       vae_loss_weight * vae_loss,
+                "vae_loss":   vae_loss.detach(),
+                "recon_loss": recon_loss.detach(),
+                "kl_loss":    kl_loss.detach(),
+                "diffusion_loss": zero,
+                "pixel_loss":     zero,
+                "latent_scale_ratio": (
+                    latents_raw.float().std()
+                    / self.latent_std.float().clamp(min=1e-12)
+                ).detach(),
+            }
+
+        # ---- Latents ------------------------------------------------------
+        # The detach is what stops the diffusion loss from reshaping the latent
+        # space; see the module docstring. It is on by default and only turned
+        # off in a stage-3 joint fine-tune, alongside latent_norm='batch'.
+        latents_raw = (mu.detach() if detach_latents else mu).view(
+            B, T_total, self.latent_channels, *mu.shape[-2:]
+        )
+        self._update_latent_scale(latents_raw)
+
+        if self.latent_norm == "batch" and self.training:
+            # Differentiable denominator: the loss becomes exactly invariant to
+            # the latent scale, so shrinking mu cannot reduce it.
+            latent_scale_value = (
+                latents_raw.float().std().clamp(min=LATENT_STD_FLOOR).to(latents_raw.dtype)
+            )
+        else:
+            # Evaluation always uses the buffer, so validation matches sampling.
+            latent_scale_value = self._effective_latent_std(latents_raw.dtype)
+
+        latents = latents_raw / latent_scale_value
+
+        out: dict[str, torch.Tensor] = {
+            "vae_loss":   vae_loss.detach(),
+            "recon_loss": recon_loss.detach(),
+            "kl_loss":    kl_loss.detach(),
+            # Health check: the ratio of the true latent std to the one the
+            # sampler's N(0, I) prior assumes. Anything far from 1.0 means the
+            # reverse process starts somewhere the score network has never been.
+            "latent_scale_ratio": (
+                latents_raw.detach().float().std() / self.latent_std.float().clamp(min=1e-12)
+            ).detach(),
+        }
 
         context_latents = latents[:, :T_ctx]
         target_latents  = latents[:, T_ctx:]
@@ -488,8 +666,8 @@ class LatentDiffusionTransformer(nn.Module):
         # The perturbation kernel's score is known exactly, -z/sigma, so the
         # intractable score-matching objective reduces to a regression onto it.
         x_t, noise, sigma = self.perturb(target_latents, times, noise=noise)
-        out = self.denoiser(x_t, times, encoded_context, context_latents)
-        score = -out / sigma.clamp(min=1e-8)
+        eps_pred = self.denoiser(x_t, times, encoded_context, context_latents)
+        score = -eps_pred / sigma.clamp(min=1e-8)
 
         # Residual of  s_theta(x_t, t) - grad log p(x_t|x_0)  scaled by sigma,
         # i.e. sigma * s_theta + z. Working in this scaled form keeps the
@@ -508,28 +686,53 @@ class LatentDiffusionTransformer(nn.Module):
             per_sample = weight * residual.flatten(1).pow(2).mean(dim=1)
 
         diffusion_loss = per_sample.mean()
-        total = diffusion_loss + vae_loss_weight * vae_loss
+        total = diffusion_loss_weight * diffusion_loss + vae_loss_weight * vae_loss
 
-        out = {
-            "loss":           total,
-            "diffusion_loss": diffusion_loss.detach(),
-            "vae_loss":       vae_loss.detach(),
-            "recon_loss":     recon_loss.detach(),
-            "kl_loss":        kl_loss.detach(),
-        }
+        out["diffusion_loss"] = diffusion_loss.detach()
 
-        if return_pixel_metrics:
-            with torch.no_grad():
-                # Clean-latent estimate straight from the score (Tweedie).
-                # Bounded: unbounded Tweedie at large t would swamp the metric.
-                pred_x0 = self.denoise_to_x0(x_t, times, score, clamp=4.0)
-                pred_images = self.decode_latents(pred_x0)
-                c = irradiance_channel
-                pred_irr   = pred_images[:,   :, c:c + 1]
-                target_irr = target_images[:, :, c:c + 1]
+        # ---- Decoded-x0 term: pixel loss (trainable) and/or metrics -------
+        want_loss    = pixel_loss_weight > 0
+        pixel_loss   = zero
+        if want_loss or return_pixel_metrics:
+            c = irradiance_channel
+            target_irr = target_images[:, :, c:c + 1]
+
+            # nullcontext, not enable_grad: the loss path must inherit the
+            # ambient grad mode so `forward_eval`'s no_grad still holds.
+            with contextlib.nullcontext() if want_loss else torch.no_grad():
+                # Clean-latent estimate straight from the score (Tweedie). The
+                # metric path bounds it, because unbounded Tweedie at large t
+                # would swamp the number; the loss path does not, because the
+                # clamp would zero the gradient exactly where it binds.
+                pred_x0 = self.denoise_to_x0(
+                    x_t, times, score, clamp=None if want_loss else 4.0
+                )
+                # Unscale with the same factor used above, which under
+                # latent_norm='batch' is *not* the buffer.
+                pred_images = self.decode_latents(
+                    pred_x0 * latent_scale_value, scaled=False
+                )
+                pred_irr = pred_images[:, :, c:c + 1]
+
+            if return_pixel_metrics:
                 out["irradiance_mse"] = F.mse_loss(pred_irr, target_irr).detach()
                 out["irradiance_mae"] = F.l1_loss(pred_irr, target_irr).detach()
 
+            if want_loss:
+                # Restrict to low t, where Tweedie is well conditioned. The mask
+                # is applied as a weighted mean rather than by indexing so the
+                # shapes stay static and torch.compile does not have to
+                # specialise on a data-dependent size.
+                mask = (times <= pixel_loss_max_t).to(pred_irr.dtype)
+                denom = mask.sum().clamp(min=1.0)
+                per_sample_pixel = (
+                    (pred_irr - target_irr).pow(2).flatten(1).mean(dim=1)
+                )
+                pixel_loss = (per_sample_pixel * mask).sum() / denom
+                total = total + pixel_loss_weight * pixel_loss
+
+        out["loss"] = total
+        out["pixel_loss"] = pixel_loss.detach()
         return out
 
     # ==========================================================================
@@ -539,6 +742,37 @@ class LatentDiffusionTransformer(nn.Module):
     # metric driving best-model selection and early stopping is not a random
     # variable. `forecast_metrics` runs the real reverse process for true skill.
     # ==========================================================================
+
+    def _vae_frame_indices(
+        self,
+        batch:         int,
+        frames:        int,
+        max_frames:    Optional[int],
+        device:        torch.device,
+        deterministic: bool,
+    ) -> Optional[torch.Tensor]:
+        """
+        Which of each sample's frames the VAE loss should score.
+
+        Returns flat indices into the (batch * frames) stack, or None to keep
+        every frame. Frames are drawn independently per sample so a step still
+        sees a spread of times of day rather than the same slot in every sample.
+
+        Validation passes ``deterministic`` and gets an evenly spaced subset, so
+        the reconstruction metric driving stage-1 early stopping is comparable
+        from epoch to epoch rather than a fresh random draw each time.
+        """
+        if not max_frames or max_frames >= frames:
+            return None
+
+        if deterministic:
+            picks = torch.linspace(0, frames - 1, max_frames, device=device).long()
+            picks = picks.unsqueeze(0).expand(batch, -1)
+        else:
+            picks = torch.rand(batch, frames, device=device).argsort(dim=1)[:, :max_frames]
+
+        offsets = torch.arange(batch, device=device).unsqueeze(1) * frames
+        return (picks + offsets).reshape(-1)
 
     def _eval_times(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """
@@ -596,6 +830,16 @@ class LatentDiffusionTransformer(nn.Module):
 
         Far more expensive than `forward_eval`, so the trainer runs it on a
         small fixed subset of the validation set.
+
+        Two reference forecasts are returned alongside the model's, because an
+        RMSE with nothing to compare it against says nothing about skill:
+
+          persistence  copy the last context frame across the horizon. For a
+                       10-minute nowcast this is the number to beat, and a model
+                       that does not beat it has no value regardless of how its
+                       training loss looks.
+          climatology  predict the dataset mean. The fields are z-scored, so
+                       that is exactly zero, and its RMSE is ~1 by construction.
         """
         forecast = self.sample(
             context_images,
@@ -608,10 +852,16 @@ class LatentDiffusionTransformer(nn.Module):
         c = irradiance_channel
         pred_irr   = forecast[:,      :, c:c + 1]
         target_irr = target_images[:, :, c:c + 1]
+
+        # Last observed frame, held constant over the whole horizon.
+        persistence = context_images[:, -1:, c:c + 1].expand_as(target_irr)
+
         return {
-            "forecast_mse":  F.mse_loss(pred_irr, target_irr),
-            "forecast_mae":  F.l1_loss(pred_irr, target_irr),
-            "forecast_rmse": torch.sqrt(F.mse_loss(pred_irr, target_irr)),
+            "forecast_mse":     F.mse_loss(pred_irr, target_irr),
+            "forecast_mae":     F.l1_loss(pred_irr, target_irr),
+            "forecast_rmse":    torch.sqrt(F.mse_loss(pred_irr, target_irr)),
+            "persistence_rmse": torch.sqrt(F.mse_loss(persistence, target_irr)),
+            "climatology_rmse": torch.sqrt(target_irr.pow(2).mean()),
         }
 
     # ==========================================================================
@@ -712,5 +962,6 @@ class LatentDiffusionTransformer(nn.Module):
             f"latent_size={self.latent_size}, "
             f"context_length={self.context_length}, "
             f"transformer_dim={self.transformer_dim}, "
-            f"sde={self.sde_name}, weighting={self.loss_weighting}"
+            f"sde={self.sde_name}, weighting={self.loss_weighting}, "
+            f"latent_norm={self.latent_norm}"
         )

@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 SAT_TIMESTEP_MINUTES = 10
 
+# Yielded instead of real tensors while priming. Collating these is free, which
+# keeps the priming loop measuring archive throughput rather than memcpy.
+_PRIME_PLACEHOLDER = torch.zeros(1)
+
 
 # ---------------------------------------------------------------------------
 # Pipeline construction
@@ -160,6 +164,25 @@ def _build_date_range(
     )
 
 
+def channel_names(config: dict) -> list[str]:
+    """
+    The channel order of every frame this module produces, as variable names.
+
+    Satellite variables first, then BARRA, each in the order the config lists
+    them -- so `data.irradiance_channel` (default 0) is `himawari_vars[0]`.
+
+    This is the single definition of that order. It is NOT the order the
+    archive hands the variables back in: the Himawari accessor's `data_vars`
+    order varies between fetches of the very same timestamp (MEASURED: two runs
+    over 20240101T0000 gave ['surface_global_irradiance', 'solar_elevation']
+    and the reverse), so stacking in `data_vars` order silently permuted the
+    channels of an arbitrary subset of frames.
+    """
+    data_cfg = config["data"]
+    return (list(data_cfg.get("himawari_vars", ["surface_global_irradiance"]))
+            + list(data_cfg.get("barra_vars", ["RH24mean"])))
+
+
 def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipeline]:
     """
     Two pipelines that each return a SINGLE timestamp.
@@ -250,7 +273,10 @@ def _cache_namespace(config: dict) -> str:
         # Normalisation is applied before caching, so the statistics are part
         # of the recipe. Recomputing stats must invalidate the cache.
         "stats":         {k: [v["mean"], v["std"]] for k, v in sorted(stats.items())},
-        "version":       2,   # frame-level layout
+        # 3: channels stacked in the configured order. Version 2 frames were
+        #    stacked in the archive's `data_vars` order, which varies between
+        #    fetches, so a fraction of them have their channels permuted.
+        "version":       3,
     }
     blob = json.dumps(recipe, sort_keys=True).encode()
     return hashlib.sha1(blob).hexdigest()[:16]
@@ -307,6 +333,28 @@ class FrameCache:
         stamp = str(date).replace("-", "").replace(":", "").replace("T", "")[:12]
         day = self.root / stamp[:8]
         return day / f"{stamp}.npy", day / f"{stamp}.bad"
+
+    def exists(self, date) -> tuple[bool, bool]:
+        """
+        Return (frame_present, known_bad) using stat() only.
+
+        Priming only needs each frame to BE on disk; it never looks at the
+        values. Reading a cached frame back costs ~3 ms, which is nothing per
+        frame but ~26 minutes of pure re-reading across a 60k-frame cache — paid
+        again on every re-run, and priming gets re-run every time a job hits
+        walltime. A stat() is ~1000x cheaper and answers the only question that
+        matters here.
+        """
+        if not self.enabled:
+            return False, False
+        path, bad = self._paths(date)
+        if bad.exists():
+            self.known_bad += 1
+            return False, True
+        if path.exists():
+            self.hits += 1
+            return True, False
+        return False, False
 
     def load(self, date) -> tuple[Optional[torch.Tensor], bool]:
         """Return (tensor, known_bad). Both None/False on a miss."""
@@ -412,15 +460,19 @@ class PipelineDataset(IterableDataset):
     so extending the forecast horizon cannot silently leak target frames into
     the context.
 
-    Channel order follows `xr.merge`, which preserves the order the datasets
-    are passed in, so satellite variables come first and `irradiance_channel`
-    (default 0) is `himawari_vars[0]`.
+    Channel order is fixed by `channel_names()`, not by the order the archive
+    returns its variables in, so satellite variables come first and
+    `irradiance_channel` (default 0) is `himawari_vars[0]`.
     """
 
-    def __init__(self, split: str, config: dict, shuffle: bool = False):
+    def __init__(self, split: str, config: dict, shuffle: bool = False,
+                 prime_mode: bool = False):
         super().__init__()
         self.split  = split
         self.config = config
+        # Priming populates the disk cache and never reads the tensors, so it
+        # skips the decode/stack entirely and yields a placeholder.
+        self.prime_mode = prime_mode
 
         data_cfg = config["data"]
         self.context_length  = data_cfg.get("n_prior_sat", 12)
@@ -465,6 +517,19 @@ class PipelineDataset(IterableDataset):
         self.n_skipped_nan   = 0
         self.n_skipped_error = 0
         self.n_skipped_shape = 0
+
+        # A whole era of missing data looks exactly like "slow" from outside:
+        # the loader keeps working, yields nothing, and the progress bar sits at
+        # zero batches. Counting consecutive failures turns that into a message.
+        self.n_consecutive_fail = 0
+        self.first_failed_anchor = None
+        self._fail_warn_at = self.CONSECUTIVE_FAIL_WARN
+
+    # Consecutive unusable anchors before the stream complains, and the factor
+    # by which the threshold grows after each warning so a genuinely sparse
+    # period does not spam the log.
+    CONSECUTIVE_FAIL_WARN = 200
+    CONSECUTIVE_FAIL_BACKOFF = 4
 
     def set_epoch(self, epoch: int) -> None:
         """Reseed the shuffle buffer so each epoch sees a different order."""
@@ -527,7 +592,17 @@ class PipelineDataset(IterableDataset):
             longitude = slice(o, o + self.image_size),
         )
 
-        arr = np.stack([combined[v].values for v in combined.data_vars], axis=0)
+        # Explicit channel order. `combined.data_vars` is not reproducible --
+        # see channel_names() -- so ordering by it gives frames whose channels
+        # are permuted at random relative to each other.
+        names = channel_names(self.config)
+        missing = [v for v in names if v not in combined.data_vars]
+        if missing:
+            raise KeyError(
+                f"Frame {stamp} is missing requested variable(s) {missing}; "
+                f"the pipeline returned {list(combined.data_vars)}."
+            )
+        arr = np.stack([combined[v].values for v in names], axis=0)
         frame = torch.from_numpy(np.ascontiguousarray(arr)).float()   # (C, H, W)
 
         if tuple(frame.shape[-2:]) != (self.image_size, self.image_size):
@@ -538,6 +613,21 @@ class PipelineDataset(IterableDataset):
             self.n_skipped_nan += 1
             return None
         return frame
+
+    def _ensure_frame(self, stamp: str) -> bool:
+        """
+        Make sure one frame is on disk, without decoding it.
+
+        The priming counterpart of `_frame`: same fetch-and-store path on a
+        miss, but a cache hit costs a stat() instead of a read + tensor
+        construction.
+        """
+        present, known_bad = self.cache.exists(stamp)
+        if known_bad:
+            return False
+        if present:
+            return True
+        return self._frame(stamp) is not None
 
     def _frame(self, stamp: str) -> Optional[torch.Tensor]:
         """Cache-first access to a single frame."""
@@ -574,8 +664,18 @@ class PipelineDataset(IterableDataset):
         Any unusable frame invalidates the whole sample — and because bad frames
         are marked in the cache, later epochs reject it without any I/O.
         """
+        stamps = frame_times(anchor, self.context_length, self.forecast_length)
+
+        if self.prime_mode:
+            # Only the side effect matters: every frame ends up on disk, or the
+            # sample is unusable. Nothing is decoded or stacked.
+            for stamp in stamps:
+                if not self._ensure_frame(stamp):
+                    return None
+            return _PRIME_PLACEHOLDER
+
         frames = []
-        for stamp in frame_times(anchor, self.context_length, self.forecast_length):
+        for stamp in stamps:
             frame = self._frame(stamp)
             if frame is None:
                 return None
@@ -610,9 +710,35 @@ class PipelineDataset(IterableDataset):
 
             tensor = self._sample(stamp)
             if tensor is None:
+                if self.first_failed_anchor is None:
+                    self.first_failed_anchor = stamp
+                self.n_consecutive_fail += 1
+                if self.n_consecutive_fail >= self._fail_warn_at:
+                    logger.warning(
+                        "[%s] %d consecutive anchors yielded no usable sample "
+                        "(%s .. %s). Nothing is being produced, so this looks "
+                        "like slowness rather than a failure. The usual cause is "
+                        "a split that starts before the archive does — check "
+                        "data.splits.%s.start against what the archive actually "
+                        "serves.",
+                        self.split, self.n_consecutive_fail,
+                        self.first_failed_anchor, stamp, self.split,
+                    )
+                    self._fail_warn_at *= self.CONSECUTIVE_FAIL_BACKOFF
                 continue
 
             logger.debug("sample %s", stamp)
+            if self.prime_mode:
+                self.n_consecutive_fail = 0
+                self.first_failed_anchor = None
+                self._fail_warn_at = self.CONSECUTIVE_FAIL_WARN
+                self.n_yielded += 1
+                yield _PRIME_PLACEHOLDER, _PRIME_PLACEHOLDER
+                continue
+
+            self.n_consecutive_fail = 0
+            self.first_failed_anchor = None
+            self._fail_warn_at = self.CONSECUTIVE_FAIL_WARN
             self.n_yielded += 1
             yield tensor[:self.context_length], tensor[self.context_length:]
 
@@ -672,6 +798,15 @@ class PipelineDataset(IterableDataset):
             self.split, self.n_yielded, self.n_skipped_hour, self.n_skipped_nan,
             self.n_skipped_error, self.n_skipped_shape, self.cache.summary(),
         )
+        attempted = self.n_yielded + self.n_skipped_nan + self.n_skipped_error
+        if attempted and self.n_yielded < 0.5 * attempted:
+            logger.warning(
+                "[%s] only %d of %d attempted anchors produced a sample (%.0f%%). "
+                "Every failure still costs an archive lookup, so this is where "
+                "the wall-clock is going.",
+                self.split, self.n_yielded, attempted,
+                100 * self.n_yielded / attempted,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -679,10 +814,12 @@ class PipelineDataset(IterableDataset):
 # ---------------------------------------------------------------------------
 
 def build_dataloader(
-    split:     str,
-    config:    dict,
-    shuffle:   bool = False,
-    drop_last: Optional[bool] = None,
+    split:      str,
+    config:     dict,
+    shuffle:    bool = False,
+    drop_last:  Optional[bool] = None,
+    batch_size: Optional[int] = None,
+    prime_mode: bool = False,
 ) -> DataLoader:
     """
     Build a DataLoader for the given split using the pyearthtools pipeline.
@@ -693,12 +830,19 @@ def build_dataloader(
         shuffle:   enable the in-stream reservoir shuffle (train only)
         drop_last: override dataloader.drop_last. Validation passes False so a
                    small split cannot lose every batch it has.
+        prime_mode: populate the cache without decoding frames. Yields
+                   placeholders, so the caller must not use the tensors.
+        batch_size: override dataloader.batch_size. Cache priming passes a small
+                   value: it never looks at the collated tensors, and a large
+                   batch makes every worker hold that many assembled samples
+                   (~10 MB each) before emitting anything.
 
     Returns:
         A DataLoader yielding (context, forecast) tensor pairs of shape
         (B, context_length, C, H, W) and (B, forecast_length, C, H, W).
     """
-    dataset    = PipelineDataset(split, config, shuffle=shuffle)
+    dataset    = PipelineDataset(split, config, shuffle=shuffle,
+                                 prime_mode=prime_mode)
     loader_cfg = config.get("dataloader", {})
 
     num_workers = int(loader_cfg.get("num_workers", 0))
@@ -721,7 +865,8 @@ def build_dataloader(
 
     return DataLoader(
         dataset,
-        batch_size  = loader_cfg.get("batch_size", 8),
+        batch_size  = (int(loader_cfg.get("batch_size", 8))
+                       if batch_size is None else int(batch_size)),
         num_workers = num_workers,
         pin_memory  = loader_cfg.get("pin_memory", True),
         drop_last   = bool(loader_cfg.get("drop_last", True))

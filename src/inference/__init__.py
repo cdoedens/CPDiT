@@ -66,6 +66,7 @@ def build_model_from_config(config: dict) -> LatentDiffusionTransformer:
         time_scale             = diffusion_cfg.get("time_scale", 1000.0),
         latent_scale           = model_cfg.get("latent_scale", None),
         latent_scale_momentum  = model_cfg.get("latent_scale_momentum", 0.99),
+        latent_norm            = model_cfg.get("latent_norm", "ema"),
     )
 
 

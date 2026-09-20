@@ -40,7 +40,22 @@ BEST_CHECKPOINT_NAME = "best_model.pt"
 
 
 class Trainer:
-    """Training loop manager for end-to-end (single-stage) LDM training."""
+    """
+    Training loop manager.
+
+    Training is staged, not single-pass. `training.vae_loss_weight`,
+    `training.diffusion_loss_weight`, `training.freeze_vae` and
+    `training.detach_latents` select which stage this run is:
+
+        stage 1  configs/stage1_vae.yaml     VAE alone
+        stage 2  configs/train_config.yaml   diffusion, frozen VAE
+        stage 3  configs/stage3_joint.yaml   joint fine-tune, both guards on
+
+    The staging is not stylistic. The diffusion objective reduces to
+    epsilon-MSE, so an encoder that is free to shrink `mu` towards zero can
+    drive that loss to zero while destroying the latent space — see the module
+    docstring in src/models/latent_diffusion.py.
+    """
 
     def __init__(self, config: dict, device: str = "cuda"):
         self.config     = config
@@ -68,10 +83,34 @@ class Trainer:
         self.irradiance_channel = data_cfg.get("irradiance_channel", 0)
         self.max_epochs         = int(training_cfg.get("max_epochs", 100))
 
+        # ── Stage controls ────────────────────────────────────────────────
+        # stage 1  vae_loss_weight > 0, diffusion_loss_weight = 0, VAE trainable
+        # stage 2  vae_loss_weight = 0, diffusion_loss_weight = 1, VAE frozen
+        # stage 3  both > 0, VAE unfrozen at a reduced LR, detach off, and
+        #          model.latent_norm = "batch" plus a pixel_loss_weight to make
+        #          the joint gradient safe. See the module docstring in
+        #          latent_diffusion.py for why those two are not optional.
+        self.diffusion_loss_weight = float(training_cfg.get("diffusion_loss_weight", 1.0))
+        self.detach_latents        = bool(training_cfg.get("detach_latents", True))
+        self.pixel_loss_weight     = float(training_cfg.get("pixel_loss_weight", 0.0))
+        self.pixel_loss_max_t      = float(training_cfg.get("pixel_loss_max_t", 0.3))
+        self.freeze_vae            = bool(training_cfg.get("freeze_vae", False))
+        self.vae_lr_mult           = float(training_cfg.get("vae_lr_mult", 1.0))
+        self.vae_max_frames        = training_cfg.get("vae_max_frames", None)
+
+        if not self.detach_latents and model_cfg.get("latent_norm", "ema") != "batch":
+            logger.warning(
+                "detach_latents is off but model.latent_norm is not 'batch'. "
+                "Collapsing the latent is then the global minimum of the diffusion "
+                "loss, which is exactly the failure this guard exists to prevent. "
+                "Set model.latent_norm: batch, or leave detach_latents on."
+            )
+
         eval_cfg = config.get("evaluation", {})
         self.forecast_eval_batches = int(eval_cfg.get("forecast_eval_batches", 0))
         self.forecast_num_steps    = int(eval_cfg.get("num_steps", 100))
         self.forecast_sampler      = eval_cfg.get("sampler", "ode")
+        self.max_val_batches       = int(eval_cfg.get("max_val_batches", 0))
 
         self._set_seed(training_cfg.get("seed", 42))
 
@@ -112,21 +151,44 @@ class Trainer:
             time_scale             = diffusion_cfg.get("time_scale", 1000.0),
             latent_scale           = model_cfg.get("latent_scale", None),
             latent_scale_momentum  = model_cfg.get("latent_scale_momentum", 0.99),
+            latent_norm            = model_cfg.get("latent_norm", "ema"),
         ).to(device)
+
+        # Freeze before the optimiser is built: AdamW below filters on
+        # requires_grad, so this ordering is what keeps frozen VAE parameters
+        # out of the optimiser (and out of DDP's reducer) entirely.
+        if self.freeze_vae:
+            self.model.freeze_vae()
+            if self.is_primary:
+                logger.info("VAE frozen — training the diffusion stack only.")
 
         if self.is_primary:
             n_params = sum(p.numel() for p in self.model.parameters())
-            logger.info("Model parameters: %.1fM", n_params / 1e6)
+            n_train  = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            logger.info(
+                "Model parameters: %.1fM (%.1fM trainable)", n_params / 1e6, n_train / 1e6
+            )
             logger.info("Denoiser: %s", self.model.denoiser.extra_repr())
+            logger.info(
+                "Stage — vae_loss_weight=%.3g diffusion_loss_weight=%.3g "
+                "pixel_loss_weight=%.3g detach_latents=%s freeze_vae=%s latent_norm=%s",
+                self.vae_loss_weight, self.diffusion_loss_weight,
+                self.pixel_loss_weight, self.detach_latents, self.freeze_vae,
+                model_cfg.get("latent_norm", "ema"),
+            )
 
         # ── DDP ────────────────────────────────────────────────────────────
         if dist.is_initialized():
             # With vae_loss_weight == 0 the VAE decoder never participates in
-            # the loss, so DDP must be told to expect unused parameters.
+            # the loss, and with diffusion_loss_weight == 0 the context encoder
+            # and denoiser do not either, so DDP must be told to expect unused
+            # parameters in both cases.
             self.model = DDP(
                 self.model,
                 device_ids=[self.local_rank],
-                find_unused_parameters=(self.vae_loss_weight == 0),
+                find_unused_parameters=(
+                    self.vae_loss_weight == 0 or self.diffusion_loss_weight == 0
+                ),
             )
 
         # ── Optional torch.compile (applied after DDP, per PyTorch docs) ────
@@ -154,7 +216,28 @@ class Trainer:
             torch._dynamo.config.optimize_ddp = bool(
                 training_cfg.get("optimize_ddp", True)
             )
-            kwargs = {"dynamic": True}
+            # Static shapes. `dynamic=True` forces symbolic shapes AND lifts the
+            # float keyword arguments of `forward` into the graph as tensors, so
+            # `diffusion_loss_weight > 0` becomes an in-graph `.item()`/`gt`
+            # rather than a Python branch folded at trace time. Those scalars —
+            # a bool, and T_ctx / T_total read off `.shape[1]` — then have to
+            # cross DDPOptimizer's bucket split, and inductor's
+            # FakifiedOutWrapper asks every output node for `.meta["val"]`:
+            #   AttributeError: 'bool' object has no attribute 'meta'
+            # which is what killed stage 3 the moment the VAE became trainable
+            # and DDP put buckets inside the encoder. (Stage 2 escaped it only
+            # because a frozen VAE leaves no bucket boundary there, and the
+            # validation path escapes it by calling the unwrapped module — see
+            # the comment in `validate`.) Reproduced and fixed on torch 2.10;
+            # `dynamic=True` fails with optimize_ddp off as well, on a
+            # symbolic-shape error inside inductor, so this is the setting to
+            # change rather than the bucket split, which is worth keeping.
+            #
+            # Nothing here needs dynamic shapes: dataloader.drop_last is true,
+            # so every batch the compiled wrapper sees has identical shape.
+            # Validation and forecast_metrics run the unwrapped module. A shape
+            # that does vary costs a recompile, not a failure.
+            kwargs = {"dynamic": bool(training_cfg.get("compile_dynamic", False))}
             if compile_mode not in ("default", None, ""):
                 kwargs["mode"] = compile_mode
             self.model = torch.compile(self.model, **kwargs)
@@ -162,17 +245,45 @@ class Trainer:
         # ── Optimiser ─────────────────────────────────────────────────────
         opt_cfg = optimiser_cfg.get("unified", optimiser_cfg)
         betas   = tuple(opt_cfg.get("betas", [0.9, 0.999]))
+        base_lr = opt_cfg["lr"]
+
+        # A stage-3 joint fine-tune wants the pretrained encoder to move much
+        # more slowly than the freshly-trained diffusion stack, so the VAE gets
+        # its own parameter group. At the default multiplier of 1.0 this is
+        # exactly one group, as before.
+        # Unwrapped: by this point self.model may be DDP- and/or compile-wrapped,
+        # and DDP does not forward attribute access, so `self.model.vae` would
+        # raise. The parameter objects are shared, so grouping on the inner
+        # module still selects exactly the right tensors.
+        inner    = self._get_inner_model()
+        vae_ids  = {id(p) for p in inner.vae.parameters()}
+        vae_par  = [p for p in inner.vae.parameters() if p.requires_grad]
+        rest_par = [
+            p for p in inner.parameters()
+            if p.requires_grad and id(p) not in vae_ids
+        ]
+        groups = [{"params": rest_par, "lr": base_lr}]
+        if vae_par and self.vae_lr_mult != 1.0:
+            groups.append({"params": vae_par, "lr": base_lr * self.vae_lr_mult})
+            if self.is_primary:
+                logger.info("VAE parameter group at lr x%.3g", self.vae_lr_mult)
+        elif vae_par:
+            groups[0]["params"] = rest_par + vae_par
+
         self.optimizer = AdamW(
-            [p for p in self.model.parameters() if p.requires_grad],
-            lr           = opt_cfg["lr"],
+            groups,
+            lr           = base_lr,
             weight_decay = opt_cfg.get("weight_decay", 1e-4),
             betas        = betas,
         )
 
         sched_cfg     = optimiser_cfg.get("scheduler", {})
-        warmup_epochs = sched_cfg.get("warmup_epochs", 0)
+        warmup_epochs = int(sched_cfg.get("warmup_epochs", 0))
         min_lr        = sched_cfg.get("min_lr", 1e-6)
-        base_lr       = opt_cfg["lr"]
+        # Early stopping must not count strikes while the LR is still ramping:
+        # a run whose best score was set at 20% of the target LR has not been
+        # given a chance yet.
+        self.warmup_epochs = warmup_epochs
 
         def lr_lambda(epoch: int) -> float:
             if epoch < warmup_epochs:
@@ -322,7 +433,10 @@ class Trainer:
             train_loader.sampler.set_epoch(epoch)
 
         self.model.train()
-        totals  = {"total": 0.0, "diffusion": 0.0, "vae": 0.0, "recon": 0.0, "kl": 0.0}
+        totals  = {
+            "total": 0.0, "diffusion": 0.0, "vae": 0.0, "recon": 0.0, "kl": 0.0,
+            "pixel": 0.0, "latent_scale_ratio": 0.0,
+        }
         n_steps = 0
 
         # Split wall-clock into "waiting for a batch" and "computing on it".
@@ -366,9 +480,15 @@ class Trainer:
                 with self._autocast():
                     out = self.model(
                         context, forecast,
-                        vae_loss_weight = self.vae_loss_weight,
-                        vae_beta        = self.vae_beta,
-                        vae_ssim_weight = self.vae_ssim_weight,
+                        vae_loss_weight       = self.vae_loss_weight,
+                        vae_beta              = self.vae_beta,
+                        vae_ssim_weight       = self.vae_ssim_weight,
+                        diffusion_loss_weight = self.diffusion_loss_weight,
+                        detach_latents        = self.detach_latents,
+                        vae_max_frames        = self.vae_max_frames,
+                        pixel_loss_weight     = self.pixel_loss_weight,
+                        pixel_loss_max_t      = self.pixel_loss_max_t,
+                        irradiance_channel    = self.irradiance_channel,
                     )
                     loss = out["loss"] / self.accum_steps
                 self.scaler.scale(loss).backward()
@@ -390,6 +510,8 @@ class Trainer:
             totals["vae"]       += out["vae_loss"].item()
             totals["recon"]     += out["recon_loss"].item()
             totals["kl"]        += out["kl_loss"].item()
+            totals["pixel"]     += out["pixel_loss"].item()
+            totals["latent_scale_ratio"] += out["latent_scale_ratio"].item()
             n_steps += 1
 
             t_compute += time.perf_counter() - compute_start
@@ -459,11 +581,11 @@ class Trainer:
             return None
 
         self.model.eval()
-        totals = {
-            "total_loss": 0.0, "diff_loss": 0.0, "vae_loss": 0.0,
-            "irradiance_mse": 0.0, "irradiance_mae": 0.0,
-        }
-        forecast_totals = {"forecast_mse": 0.0, "forecast_mae": 0.0, "forecast_rmse": 0.0}
+        # Keys are collected from whatever the model returns rather than fixed
+        # up front: stage 1 skips the denoiser, so it has no irradiance metrics
+        # to report and must not contribute zeros to an average.
+        totals: dict[str, float] = {}
+        forecast_totals: dict[str, float] = {}
         n_batches = 0
         n_forecast_batches = 0
 
@@ -472,43 +594,70 @@ class Trainer:
         for context, forecast in tqdm(
             self._synced_batches(val_loader), desc="Validation", disable=not self.is_primary
         ):
+            if self.max_val_batches and n_batches >= self.max_val_batches:
+                break
+
             context  = context.to(self.device, non_blocking=True)
             forecast = forecast.to(self.device, non_blocking=True)
 
             with self._autocast():
                 # One pass gives the losses and the pixel metrics: deterministic
                 # timesteps and a fixed noise draw make it comparable epoch to
-                # epoch.
-                out = self.model(
+                # epoch. The pixel *loss* stays off here — validation only ever
+                # measures.
+                #
+                # `inner`, not `self.model`: the wrapper is DDP + torch.compile,
+                # and this call's kwargs (deterministic, return_pixel_metrics)
+                # trace a different graph from the training step, so it forces a
+                # fresh compile under no_grad. DDPOptimizer's bucket split feeds
+                # a plain Python int into the AOT inference path there and dies
+                # with "'int' object has no attribute 'meta'". Neither wrapper
+                # earns its keep here: no_grad means no gradient all-reduce, and
+                # the metrics are reduced explicitly below. `forecast_metrics`
+                # already runs on `inner` for the same reason.
+                out = inner(
                     context, forecast,
-                    vae_loss_weight      = self.vae_loss_weight,
-                    vae_beta             = self.vae_beta,
-                    vae_ssim_weight      = self.vae_ssim_weight,
-                    deterministic        = True,
-                    return_pixel_metrics = True,
-                    irradiance_channel   = self.irradiance_channel,
+                    vae_loss_weight       = self.vae_loss_weight,
+                    vae_beta              = self.vae_beta,
+                    vae_ssim_weight       = self.vae_ssim_weight,
+                    diffusion_loss_weight = self.diffusion_loss_weight,
+                    detach_latents        = self.detach_latents,
+                    vae_max_frames        = self.vae_max_frames,
+                    deterministic         = True,
+                    return_pixel_metrics  = True,
+                    irradiance_channel    = self.irradiance_channel,
                 )
 
-            totals["total_loss"]     += out["loss"].item()
-            totals["diff_loss"]      += out["diffusion_loss"].item()
-            totals["vae_loss"]       += out["vae_loss"].item()
-            totals["irradiance_mse"] += out["irradiance_mse"].item()
-            totals["irradiance_mae"] += out["irradiance_mae"].item()
+            named = {
+                "total_loss": out["loss"], "diff_loss": out["diffusion_loss"],
+                "vae_loss":   out["vae_loss"], "recon_loss": out["recon_loss"],
+                "kl_loss":    out["kl_loss"],
+                "latent_scale_ratio": out["latent_scale_ratio"],
+            }
+            for key in ("irradiance_mse", "irradiance_mae"):
+                if key in out:
+                    named[key] = out[key]
+            for k, v in named.items():
+                totals[k] = totals.get(k, 0.0) + v.item()
             n_batches += 1
 
-            # Real forecast skill via the full DDIM chain, on a small fixed
+            # Real forecast skill via the full reverse process, on a small fixed
             # subset because it is far more expensive than the single-step
             # estimate above.
+            #
+            # Deliberately OUTSIDE the autocast: this integrates 100+ sequential
+            # solver steps, and bf16's 8 mantissa bits accumulate real error
+            # over a chain that long. The metric gating early stopping should
+            # not be a measure of the sampler's rounding.
             if n_forecast_batches < self.forecast_eval_batches:
-                with self._autocast():
-                    fm = inner.forecast_metrics(
-                        context, forecast,
-                        num_steps=self.forecast_num_steps,
-                        sampler=self.forecast_sampler,
-                        irradiance_channel=self.irradiance_channel,
-                    )
+                fm = inner.forecast_metrics(
+                    context, forecast,
+                    num_steps=self.forecast_num_steps,
+                    sampler=self.forecast_sampler,
+                    irradiance_channel=self.irradiance_channel,
+                )
                 for k, v in fm.items():
-                    forecast_totals[k] += v.item()
+                    forecast_totals[k] = forecast_totals.get(k, 0.0) + v.item()
                 n_forecast_batches += 1
 
         if n_batches == 0:
@@ -551,9 +700,10 @@ class Trainer:
              not using, and larger batches amortise the per-step overheads that
              dominate at batch size 2.
 
-        Each batch size is timed independently. Note torch.compile with
-        dynamic=True will recompile on the first step of each new shape, which
-        is why `warmup` steps are discarded.
+        Each batch size is timed independently. Note torch.compile recompiles
+        on the first step of each new shape (the trainer compiles with static
+        shapes — see the `dynamic` comment in `__init__`), which is why
+        `warmup` steps are discarded.
         """
         data_cfg  = self.config["data"]
         model_cfg = self.config["model"]
@@ -583,11 +733,21 @@ class Trainer:
                         t0 = time.perf_counter()
 
                     with self._autocast():
+                        # Same stage settings as a real step, so the measurement
+                        # reflects what will actually run — the stage-3 pixel
+                        # loss in particular puts the decoder in the graph and
+                        # changes the memory picture substantially.
                         out = self.model(
                             context, forecast,
-                            vae_loss_weight = self.vae_loss_weight,
-                            vae_beta        = self.vae_beta,
-                            vae_ssim_weight = self.vae_ssim_weight,
+                            vae_loss_weight       = self.vae_loss_weight,
+                            vae_beta              = self.vae_beta,
+                            vae_ssim_weight       = self.vae_ssim_weight,
+                            diffusion_loss_weight = self.diffusion_loss_weight,
+                            detach_latents        = self.detach_latents,
+                            vae_max_frames        = self.vae_max_frames,
+                            pixel_loss_weight     = self.pixel_loss_weight,
+                            pixel_loss_max_t      = self.pixel_loss_max_t,
+                            irradiance_channel    = self.irradiance_channel,
                         )
                     self.scaler.scale(out["loss"]).backward()
                     if self.gradient_clip_norm > 0:
@@ -633,42 +793,8 @@ class Trainer:
     # ------------------------------------------------------------------ #
 
     def prime_cache(self, splits: tuple[str, ...] = ("train", "val")) -> None:
-        """
-        Walk the dataloader once to populate the sample cache, without touching
-        the model.
-
-        The first epoch is the expensive one: every sample costs ~16-20s of
-        archive I/O, and the GPU is 93% idle throughout. Since the cache lives
-        on /scratch and persists across jobs, that pass does not need a GPU at
-        all — run this on the `normal` queue with plenty of CPUs, then the GPU
-        job is compute-bound from its very first epoch.
-
-        Safe to re-run and safe to interrupt: entries are written atomically and
-        a partly-populated cache is simply a partly-warm one.
-        """
-        for split in splits:
-            loader = build_dataloader(split, self.config, shuffle=False,
-                                      drop_last=False)
-            dataset = loader.dataset
-            cache = getattr(dataset, "cache", None)
-            if cache is not None and not cache.enabled:
-                logger.warning(
-                    "dataloader.cache_dir is not set — priming would do nothing."
-                )
-                return
-
-            logger.info("Priming '%s' cache into %s ...", split, cache.root)
-            t0, n = time.perf_counter(), 0
-            for _ in tqdm(loader, desc=f"Priming {split}",
-                          disable=not self.is_primary):
-                n += 1
-            wall = time.perf_counter() - t0
-            logger.info(
-                "Primed '%s': %d batches in %.0fs (%.2f batches/s)",
-                split, n, wall, n / max(wall, 1e-9),
-            )
-            if cache is not None and loader.num_workers == 0:
-                logger.info("[%s] %s", split, cache.summary())
+        """Deprecated shim: priming needs no model, so it is a free function."""
+        prime_cache(self.config, splits=splits, is_primary=self.is_primary)
 
     # ------------------------------------------------------------------ #
     # Checkpointing                                                        #
@@ -728,6 +854,7 @@ class Trainer:
 
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self._get_inner_model().load_state_dict(checkpoint["model_state_dict"])
+        self._reapply_fixed_latent_scale()
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
@@ -737,17 +864,76 @@ class Trainer:
             logger.info("Resumed from checkpoint %s (epoch %d)", path, epoch)
         return epoch
 
+    def init_from(self, checkpoint_path: str | Path) -> None:
+        """
+        Load *only* the weights from a checkpoint and start a fresh run.
+
+        This is how a stage begins from the previous stage's result. `--resume`
+        is the wrong tool: it also restores the optimiser moments, the LR
+        schedule and the epoch counter, all of which belong to the run that
+        produced the checkpoint, not to the new stage that is about to start
+        with a different objective and learning rate.
+
+        Loaded non-strictly so a stage-1 VAE-only checkpoint can seed a stage-2
+        run even if the diffusion stack was reshaped in between.
+        """
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        missing, unexpected = self._get_inner_model().load_state_dict(
+            checkpoint["model_state_dict"], strict=False
+        )
+        self._reapply_fixed_latent_scale()
+        if self.is_primary:
+            logger.info(
+                "Initialised weights from %s (epoch %s); %d missing, %d unexpected keys",
+                path, checkpoint.get("epoch", "?"), len(missing), len(unexpected),
+            )
+            if missing:
+                logger.info("  missing (left at init): %s", sorted(missing)[:8])
+            if unexpected:
+                logger.info("  unexpected (ignored): %s", sorted(unexpected)[:8])
+
+    def _reapply_fixed_latent_scale(self) -> None:
+        """
+        Restore a config-pinned `latent_scale` after a state-dict load.
+
+        `latent_std` is a buffer, so loading a checkpoint overwrites it with
+        whatever the *previous* stage's EMA had drifted to — silently discarding
+        the value just measured with scripts/measure_latent_scale.py and putting
+        the sampler's prior back out of step with the data.
+        """
+        configured = self.config["model"].get("latent_scale")
+        if configured is None:
+            return
+        inner = self._get_inner_model()
+        inner.latent_std.fill_(float(configured))
+        inner.latent_scale_initialised.fill_(True)
+        if self.is_primary:
+            logger.info(
+                "Re-applied fixed model.latent_scale=%g after load", float(configured)
+            )
+
     # ------------------------------------------------------------------ #
     # Top-level train entry point                                          #
     # ------------------------------------------------------------------ #
 
-    def train(self, num_epochs: Optional[int] = None, resume_from: Optional[str] = None):
+    def train(
+        self,
+        num_epochs:   Optional[int] = None,
+        resume_from:  Optional[str] = None,
+        init_from:    Optional[str] = None,
+    ):
         num_epochs               = num_epochs or self.max_epochs
         train_loader, val_loader = self.setup_data()
 
         start_epoch = 0
         if resume_from is not None:
             start_epoch = self.load_checkpoint(resume_from)
+        elif init_from is not None:
+            self.init_from(init_from)
 
         if self.mlflow_enabled:
             with mlflow.start_run(run_name=self.run_name):
@@ -789,38 +975,88 @@ class Trainer:
             primary_metric = None
             if val_metrics is not None:
                 primary_metric = val_metrics.get(monitor)
-                if primary_metric is None:
-                    primary_metric = val_metrics.get("total_loss")
+                if primary_metric is None and self.is_primary:
+                    # This used to fall back to total_loss, which is dominated
+                    # by the diffusion loss — the one quantity that *improves*
+                    # while a collapsing latent destroys forecast skill. Silently
+                    # monitoring it made the failure invisible, so refuse instead.
+                    logger.error(
+                        "early_stopping.monitor=%r is not in the validation "
+                        "metrics %s — skipping best-model selection and early "
+                        "stopping this epoch. (forecast_* keys need "
+                        "evaluation.forecast_eval_batches > 0.)",
+                        monitor, sorted(val_metrics),
+                    )
 
             is_best = primary_metric is not None and primary_metric < best_metric
             if is_best:
                 best_metric = primary_metric
                 es_counter  = 0
+            elif epoch < self.warmup_epochs:
+                # The LR is still ramping; a "no improvement" here says nothing
+                # about the model. The previous run stopped at epoch 11 having
+                # set its best score at epoch 1 on lr=2e-5, four epochs before
+                # the LR ever reached its target.
+                es_counter = 0
             elif es_enabled and primary_metric is not None:
                 es_counter += 1
 
             if self.is_primary:
                 logger.info(
-                    "Train — total: %.6f | diffusion: %.6f | vae: %.6f "
-                    "(recon %.6f, kl %.6f)",
+                    "Train — total: %.6f | diffusion: %.6f | pixel: %.6f | "
+                    "vae: %.6f (recon %.6f, kl %.6f)",
                     train_metrics["total"], train_metrics["diffusion"],
-                    train_metrics["vae"], train_metrics["recon"], train_metrics["kl"],
+                    train_metrics["pixel"], train_metrics["vae"],
+                    train_metrics["recon"], train_metrics["kl"],
                 )
                 if val_metrics is not None:
                     logger.info(
-                        "Val   — total: %.6f | diffusion: %.6f | vae: %.6f | "
-                        "irradiance MSE: %.6f | MAE: %.6f",
+                        "Val   — total: %.6f | diffusion: %.6f | vae: %.6f "
+                        "(recon %.6f) | irradiance MSE: %s | MAE: %s",
                         val_metrics["total_loss"], val_metrics["diff_loss"],
-                        val_metrics["vae_loss"], val_metrics["irradiance_mse"],
-                        val_metrics["irradiance_mae"],
+                        val_metrics["vae_loss"], val_metrics["recon_loss"],
+                        _fmt(val_metrics.get("irradiance_mse")),
+                        _fmt(val_metrics.get("irradiance_mae")),
                     )
                     if "forecast_rmse" in val_metrics:
-                        logger.info(
-                            "Val   — DDIM forecast RMSE: %.6f | MAE: %.6f",
-                            val_metrics["forecast_rmse"], val_metrics["forecast_mae"],
+                        # Persistence is the number that matters. A forecast
+                        # RMSE above it means the model is worse than copying
+                        # the last observed frame, whatever the losses say.
+                        skill = val_metrics["forecast_rmse"] / max(
+                            val_metrics.get("persistence_rmse", float("nan")), 1e-12
                         )
-                logger.info("Latent scale (EMA std): %.4f",
-                            float(self._get_inner_model().latent_std))
+                        logger.info(
+                            "Val   — forecast RMSE: %.6f | MAE: %.6f || "
+                            "persistence: %.6f | climatology: %.6f || "
+                            "vs persistence: %.2fx %s",
+                            val_metrics["forecast_rmse"], val_metrics["forecast_mae"],
+                            val_metrics.get("persistence_rmse", float("nan")),
+                            val_metrics.get("climatology_rmse", float("nan")),
+                            skill, "(BEATS IT)" if skill < 1.0 else "(WORSE)",
+                        )
+                # Host-side read of the latent buffer: once per epoch here, never
+                # inside the compiled step.
+                self._get_inner_model().check_latent_health()
+                ratio = val_metrics.get("latent_scale_ratio") if val_metrics else None
+                logger.info(
+                    "Latent scale (EMA std): %.4g | true/assumed std ratio: %s",
+                    float(self._get_inner_model().latent_std), _fmt(ratio),
+                )
+                # Only meaningful once something consumes the scale. In stage 1
+                # there is no diffusion and no sampling, and the EMA is expected
+                # to lag a fast-moving encoder, so warning there would fire every
+                # epoch of every run and train the reader to ignore it.
+                if (self.diffusion_loss_weight > 0 and ratio is not None
+                        and not 0.5 < ratio < 2.0):
+                    logger.warning(
+                        "Latent scale ratio %.3f is far from 1.0 — the sampler "
+                        "starts from N(0, I) but the score network is seeing "
+                        "latents of a very different scale, so samples will be "
+                        "poor however low the diffusion loss goes. If the VAE is "
+                        "trainable here, lower model.latent_scale_momentum "
+                        "(0.9 tracked to within 1%% where 0.99 lagged 15-40%%).",
+                        ratio,
+                    )
 
                 if self.mlflow_enabled:
                     for k, v in train_metrics.items():
@@ -852,6 +1088,124 @@ class Trainer:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _fmt(value: Optional[float]) -> str:
+    """Format an optional metric — stage 1 has no diffusion-derived metrics."""
+    return "n/a" if value is None else f"{value:.6f}"
+
+
+# Batch size used while priming the cache. Priming never looks at the collated
+# tensors -- it walks the stream purely so the per-frame disk cache fills -- but
+# a large batch still makes EVERY worker hold that many assembled samples
+# (~10 MB each) before it emits anything, and DataLoader prefetches two batches
+# deep. At the training batch size of 32 that is ~650 MB per worker of pure
+# overhead, which is memory that could have paid for more workers. It also makes
+# the progress bar tick 16x less often, which reads as "priming got slower".
+PRIME_BATCH_SIZE = 2
+
+
+def prime_cache(
+    config:     dict,
+    splits:     tuple[str, ...] = ("train", "val"),
+    is_primary: bool = True,
+) -> None:
+    """
+    Walk the dataloader once to populate the frame cache.
+
+    Deliberately a free function, not a Trainer method: priming touches no
+    model, and constructing a Trainer builds a 163M-parameter network, an AdamW
+    state for it and a torch.compile wrapper before doing any I/O at all. That
+    is pure waste on a CPU-only priming job, and on a memory-bound node it is
+    waste that competes with the workers actually doing the work.
+
+    Every sample costs ~16-20s of archive I/O against ~3 ms to read back from
+    /scratch, so this pass is the expensive one. The cache outlives the job, so
+    run it once on the `normal` queue and every GPU job afterwards starts
+    compute-bound.
+
+    Safe to re-run and safe to interrupt: entries are written atomically and a
+    partly-populated cache is simply a partly-warm one.
+    """
+    for split in splits:
+        loader = build_dataloader(split, config, shuffle=False,
+                                  drop_last=False, batch_size=PRIME_BATCH_SIZE,
+                                  prime_mode=True)
+        dataset = loader.dataset
+        cache = getattr(dataset, "cache", None)
+        if cache is not None and not cache.enabled:
+            logger.warning(
+                "dataloader.cache_dir is not set — priming would do nothing."
+            )
+            return
+
+        span = config["data"]["splits"][split]
+        logger.info(
+            "Priming '%s' (%s .. %s) into %s | %d workers, batch %d ...",
+            split, span.get("start"), span.get("end"), cache.root,
+            loader.num_workers, loader.batch_size,
+        )
+        # A long run of zero batches means the archive is serving nothing for
+        # this date range, not that the loader is slow; the dataset warns about
+        # that directly. This bar cannot show it, because it only advances when
+        # a batch actually arrives.
+        t0, n = time.perf_counter(), 0
+        bar = tqdm(loader, desc=f"Priming {split}", disable=not is_primary,
+                   unit="batch")
+        for _ in bar:
+            n += 1
+            if is_primary and n % 20 == 0:
+                elapsed = max(time.perf_counter() - t0, 1e-9)
+                bar.set_postfix({
+                    "samples/s": f"{n * loader.batch_size / elapsed:.1f}",
+                })
+        wall = time.perf_counter() - t0
+        logger.info(
+            "Primed '%s': %d batches (%d anchors) in %.0fs (%.2f anchors/s)",
+            split, n, n * loader.batch_size, wall,
+            n * loader.batch_size / max(wall, 1e-9),
+        )
+        if n == 0:
+            logger.error(
+                "Priming '%s' produced NO samples at all. The split range "
+                "(%s .. %s) is almost certainly outside what the archive "
+                "serves — check it before re-running.",
+                split, span.get("start"), span.get("end"),
+            )
+        if cache is not None and loader.num_workers == 0:
+            logger.info("[%s] %s", split, cache.summary())
+
+
+# Above this, a --workers override gets a warning rather than silent
+# acceptance. See the comment at its call site and dataloader.num_workers in
+# train_config.yaml for the measurements behind the number.
+HIGH_WORKER_COUNT_THRESHOLD = 20
+
+
+def warn_on_high_worker_count(n: int) -> None:
+    """
+    Warn when a worker count is well above what this pipeline has been tested
+    at, without blocking the run — some environments genuinely have the
+    headroom, so this is advisory, not a refusal.
+
+    MEASURED: 12 workers alone reached ~35 GiB resident and was still rising
+    after 2 minutes of real fetching; a --workers value naively derived from a
+    node's CPU count (ncpus - 2 = 46 on a 48-CPU normal-queue node) OOM-killed
+    a DataLoader worker on a 188 GiB node. Each worker re-imports the full
+    pyearthtools/dask/xarray stack and keeps growing while it iterates, so this
+    pipeline does not scale safely with CPU count the way a lightweight
+    IterableDataset would.
+    """
+    if n > HIGH_WORKER_COUNT_THRESHOLD:
+        logger.warning(
+            "%d workers is well above the range this has been tested at "
+            "(measured safe default: 10). Each worker's memory use grows "
+            "during iteration, not just at import, so this can exhaust a "
+            "node's memory well before its CPUs are the bottleneck. Watch "
+            "`free -g` on this node while priming runs, and prefer raising "
+            "this in small steps over deriving it from ncpus.",
+            n,
+        )
+
+
 def _flatten(d: dict, parent_key: str = "", sep: str = ".") -> dict:
     items = {}
     for k, v in d.items():
@@ -873,13 +1227,29 @@ def main():
     )
     parser.add_argument("--config", type=str, default="configs/train_config.yaml")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path to a checkpoint to resume training from")
+                        help="Path to a checkpoint to resume training from "
+                             "(restores optimiser, scheduler and epoch)")
+    parser.add_argument("--init-from", type=str, default=None,
+                        help="Path to a checkpoint to take WEIGHTS ONLY from, "
+                             "starting a fresh run at epoch 0 with a new "
+                             "optimiser. This is how stage 2 starts from a "
+                             "stage-1 VAE, and stage 3 from stage 2.")
     parser.add_argument("--device", type=str, default=None,
                         help="Override the device (e.g. cpu, cuda:0)")
     parser.add_argument("--prime-cache", action="store_true",
                         help="Populate the sample cache and exit. Needs no GPU: "
                              "run it on the normal queue so the GPU job starts "
                              "with a warm cache.")
+    parser.add_argument("--workers", type=int, default=None, metavar="N",
+                        help="Override dataloader.num_workers for this run. "
+                             "MEMORY-bound, not just CPU-bound: each worker "
+                             "re-imports the full pyearthtools/dask/xarray "
+                             "stack and keeps growing while it iterates -- "
+                             "measured at 12 workers reaching ~35 GiB and "
+                             "still rising after 2 minutes, and 46 workers "
+                             "OOM-killed a 188 GiB node. Do not scale this to "
+                             "the node's CPU count; raise it in small steps "
+                             "while watching `free -g` on the node.")
     parser.add_argument("--benchmark", type=str, default=None, metavar="SIZES",
                         help="Benchmark GPU throughput on synthetic batches "
                              "instead of training, e.g. --benchmark 2,4,8,16. "
@@ -900,15 +1270,29 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     config  = load_config(args.config)
+    if args.workers is not None:
+        config.setdefault("dataloader", {})["num_workers"] = max(0, args.workers)
+        logger.info("dataloader.num_workers overridden to %d", args.workers)
+        warn_on_high_worker_count(args.workers)
+    # Priming builds no model, so it must not pay for one: constructing a
+    # Trainer here would allocate a 163M-parameter network plus AdamW state and
+    # wrap it in torch.compile before a single frame is read, competing for
+    # memory with the workers that do the actual work.
+    if args.prime_cache:
+        try:
+            prime_cache(config)
+        finally:
+            if distributed:
+                dist.destroy_process_group()
+        return
+
     trainer = Trainer(config, device=device)
     try:
-        if args.prime_cache:
-            trainer.prime_cache()
-        elif args.benchmark:
+        if args.benchmark:
             sizes = [int(x) for x in args.benchmark.split(",") if x.strip()]
             trainer.benchmark(batch_sizes=sizes)
         else:
-            trainer.train(resume_from=args.resume)
+            trainer.train(resume_from=args.resume, init_from=args.init_from)
     finally:
         if distributed:
             dist.destroy_process_group()
