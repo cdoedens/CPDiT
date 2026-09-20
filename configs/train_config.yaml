@@ -6,25 +6,48 @@
 # -----------------------------------------------------------------------------
 
 model:
-  image_channels: 2              # surface_global_irradiance + RH24mean
+  # surface_global_irradiance + solar_elevation (Himawari) + RH24mean (BARRA)
+  image_channels: 3
   image_size: 256                # Spatial size of input patches (H = W)
   latent_channels: 4
   hidden_dim: 128                # VAE conv base channel width (D -> 2D -> 4D)
   max_forecast_steps: 32         # Upper bound for the lead-time embedding table
 
-  # Latent scaling for the diffusion process. Leave null to track the latent
-  # standard deviation by EMA during training (appropriate while the VAE is
-  # still learning). Set a float to freeze it — do this once the VAE has
-  # converged, using the "Latent scale (EMA std)" value logged each epoch.
-  latent_scale: null
+  # Latent scaling for the diffusion process.
+  #
+  # >>> ACTION REQUIRED before stage 2: replace null with the value printed by
+  # >>>   python scripts/measure_latent_scale.py --checkpoint <stage-1 best_model.pt>
+  #
+  # Leaving it null makes the divisor an EMA — a moving target the sampler's
+  # N(0, I) prior cannot track, and with the VAE frozen there is nothing left to
+  # track anyway. Pinning it is what Stable Diffusion's fixed 0.18215 does.
+  # Both --resume and --init-from re-apply this value after loading, so a
+  # checkpoint's own drifted buffer cannot silently override it.
+  latent_scale: 2.06237
+  # MEASURED: while the VAE is still moving, 0.99 leaves the EMA 15-40% behind
+  # the true latent std, which puts the sampler's N(0, I) prior out of step with
+  # the data. 0.9 tracked to within 1% in the same test. Use 0.9 whenever the
+  # encoder is trainable (stages 1 and 3); it is irrelevant once frozen.
   latent_scale_momentum: 0.99
+
+  # How the diffusion process normalises the latent.
+  #   ema    divide by the running buffer. It is a no_grad buffer, so the loss
+  #          is NOT scale-invariant and shrinking the latent lowers it — safe
+  #          only with training.detach_latents on (the default).
+  #   batch  divide by this batch's own std, computed WITH gradient, making the
+  #          loss exactly scale-invariant. Required before the diffusion
+  #          gradient may reach the encoder (stage 3).
+  latent_norm: ema
 
   # Temporal transformer over the context latent sequence
   transformer:
     num_layers: 4
     num_heads: 8
     feedforward_dim: 1024
-    transformer_dim: 128         # Token dim for the temporal (context) stream
+    # Each context frame is a 4x32x32 = 4096-value latent map flattened to one
+    # token. At 128 the projection threw the context away before the temporal
+    # encoder ever saw it.
+    transformer_dim: 512         # Token dim for the temporal (context) stream
     dropout: 0.1
     max_seq_len: 64
 
@@ -54,13 +77,23 @@ model:
     # embedding, whose frequencies expect the O(1000) range.
     time_scale: 1000.0
 
-    patch_size:  4               # 4x4 strided-conv patch embedding
+    # 2x2 patches over the 32x32 latent give a 16x16 = 256-token grid. At the
+    # previous patch_size 4 the grid was 8x8, i.e. one token per 32x32 pixel
+    # block — and cloud advection over a 10-minute lead is a few pixels, so the
+    # thing being forecast was invisible at that resolution.
+    patch_size:  2
     embed_dim:   768             # DiT token width
-    num_blocks:  4              # DiT depth
+    # DiT-B depth. 4 blocks is far below anything this architecture is
+    # validated at, and left the VAE holding more parameters than the score
+    # network — backwards for a latent diffusion model.
+    num_blocks:  12
     num_heads:   12
     ffn_mult:    4
     cond_dim:    256             # Width of the adaLN-Zero conditioning vector
-    window_size: 31              # 2-D neighbourhood attention window (must be odd)
+    # Spans the 16x16 grid, i.e. global attention — 256 tokens is cheap enough
+    # that locality buys nothing here, and this states it rather than relying on
+    # the clamp warning. Revisit if patch_size ever drops to 1.
+    window_size: 15
 
     # null = use the fused NATTEN kernels when importable, else the exact
     # PyTorch fallback. Force with true/false.
@@ -102,18 +135,40 @@ data:
 
   barra_domain: "AUST-11"
   barra_freq:   "1hr"
+  # solar_elevation comes from the same heliosat product and already has
+  # statistics in combined_stats.json. Irradiance is z-scored globally, so the
+  # diurnal cycle dominates its variance; without this channel the model has to
+  # infer time of day from the cloud field alone.
+  # NOTE: changing this changes the frame cache namespace — re-prime with
+  #   python -m src.training.train --config <cfg> --prime-cache
   himawari_vars:
     - surface_global_irradiance
+    - solar_elevation
   barra_vars:
     - RH24mean
 
+  # ARCHIVE RANGE: petdata.archive.Himawari reads
+  #   /g/data/rv74/.../himawari-ahi/solar/p1s/latest/   (latest -> v1.1)
+  # whose first date is 2019-04-01. The v1.0 tree does hold 2015-2019/03 and
+  # does contain solar_elevation, but `latest` does not point at it, so the
+  # accessor cannot see it and every request before 2019-04-01 raises
+  # DataNotFoundError.
+  #
+  # MEASURED: a start of 2016-01-01 spent 3.2 of a 3.4-minute priming run
+  # writing 26,232 "known bad" markers for dates that cannot exist, yielding
+  # nothing and showing zero batches on the progress bar the whole time. Do not
+  # set train.start earlier than 2019-04-01 without checking that `latest` has
+  # moved.
   splits:
     train:
-      start: "20200101T0000"
-      end:   "20210101T0000"
+      start: "20190401T0000"
+      end:   "20240101T0000"
     val:
-      start: "20210101T0000"
-      end:   "20220101T0000"
+      start: "20240101T0000"
+      end:   "20250101T0000"
+    test:
+      start: "20250101T0000"
+      end:   "20260101T0000"
 
   # Statistics are in RAW PHYSICAL UNITS. The pipeline must not apply any other
   # scaling to these fields before the z-score, or the two compose and collapse
@@ -124,7 +179,19 @@ data:
 # DataLoader
 # -----------------------------------------------------------------------------
 dataloader:
-  batch_size: 2
+  # MEASURED on 1x H200 (--benchmark), stage 2 at the geometry above:
+  #    batch  4 ...  5.6 GiB ... 30.4 samples/s
+  #    batch  8 ...  9.7 GiB ... 41.4 samples/s
+  #    batch 16 ... 17.9 GiB ... 50.0 samples/s
+  #    batch 32 ... 29.3 GiB ... 54.1 samples/s   <- saturates here
+  #    batch 64 ... 49.1 GiB ... 53.3 samples/s
+  #    batch 96 ... 68.9 GiB ... 47.7 samples/s   <- past the peak
+  # 32 is the knee: throughput stops rising and 96 is measurably slower. The
+  # failed run used 2 with accum 2 (effective batch 4) and reached 6.75
+  # samples/s, so this is an 8x throughput change on the same hardware.
+  # Re-measure after any architecture change:
+  #    python -m src.training.train --config <cfg> --benchmark 8,16,32,64
+  batch_size: 32
   # MEASURED on 1x H200 (12 CPUs), September 2026:
   #   archive read, 10 workers ......... 1.04 samples/s
   #   warm cache read, 0 workers ....... 304   samples/s  (3.3 ms/sample)
@@ -136,12 +203,21 @@ dataloader:
   #
   # With the cache warm the run is GPU-bound, so workers barely matter: a
   # single worker already serves 40x what the GPU can eat, and num_workers: 0
-  # avoids the spawn startup entirely. Workers only help the COLD pass. They
-  # are I/O-bound, not CPU-bound (load avg 21 with 87% CPU idle), and
-  # oversubscribing does not work — 24 spawn workers never finished starting in
-  # 15 minutes, because each re-imports pyearthtools inside the container.
-  # Keep this at roughly (CPUs per GPU - 2) while priming; drop it to 0-2 once
-  # the cache is warm.
+  # avoids the spawn startup entirely. Workers only help the COLD pass.
+  #
+  # Oversubscribing does NOT work, and it fails two different ways:
+  #   - 24 spawn workers never finished starting in 15 minutes, because each
+  #     re-imports pyearthtools inside the container (~700 MB and several
+  #     seconds of import alone, MEASURED).
+  #   - Per-worker memory keeps GROWING during iteration, not just at import:
+  #     MEASURED 12 workers alone reaching ~35 GiB and still rising after 2
+  #     minutes of real fetching on a 188 GiB node. scripts/prime_cache.sh once
+  #     derived its worker count from the node's CPU count (ncpus - 2 = 46 on a
+  #     48-CPU normal-queue node) and OOM-killed a DataLoader worker as a
+  #     result — this pipeline is memory-bound at scale, not CPU-bound, so
+  #     never size workers off CPU count.
+  # Keep this at roughly (CPUs per GPU - 2) while priming, raised in small
+  # steps while watching `free -g`; drop it to 0-2 once the cache is warm.
   num_workers: 10                # Pipeline is built per worker, so >0 is safe
   # Workers are spawned (not forked): the pipeline is not fork-safe and
   # CUDA/NCCL are live by the time the loader is built. Precautionary.
@@ -197,6 +273,13 @@ training:
   # CUDA graphs, which segfault on this graph (inductor partitions it around
   # device copies) and gain little at this step time.
   compile_mode: default
+  # Static shapes. true forces symbolic shapes and lifts forward()'s float
+  # keyword arguments into the graph as tensors; the resulting scalar
+  # (bool / int) graph outputs cannot cross DDPOptimizer's bucket split and
+  # inductor dies with "'bool' object has no attribute 'meta'" — which is what
+  # broke stage 3 once the VAE became trainable. drop_last is true, so every
+  # compiled batch has the same shape and dynamic shapes buy nothing here.
+  compile_dynamic: false
   # bf16 | fp16 | fp32. bf16 needs no GradScaler, but it also needs Ampere
   # (sm_80+): on the V100s of the gpuvolta queue it has no tensor-core path and
   # measured 10.4 TFLOP/s against fp16's 92.1 — slower even than fp32. The
@@ -205,18 +288,38 @@ training:
   precision: bf16
 
   max_epochs: 100
-  gradient_accumulation_steps: 2
+  # None needed: batch_size 32 already gives 32/rank, 128 across 4 GPUs, which
+  # is the target effective batch. Accumulation would only add step overhead.
+  gradient_accumulation_steps: 1
   gradient_clip_norm: 1.0
 
-  # Joint VAE + diffusion training
-  vae_loss_weight: 0.1
-  vae_beta: 0.01                 # KL weight
+  # ---- Stage 2: diffusion against a frozen, pretrained VAE ----------------
+  # Stage 1 (configs/stage1_vae.yaml) trains the VAE alone; stage 3
+  # (configs/stage3_joint.yaml) optionally fine-tunes it with the nowcast.
+  #
+  # The VAE is frozen and the diffusion gradient is detached from the encoder.
+  # Both matter: the diffusion objective reduces to epsilon-MSE, so if the
+  # encoder can shrink mu towards zero then x_t = sigma*z and the denoiser
+  # recovers z exactly — collapsing the latent is the GLOBAL MINIMUM of this
+  # loss. Reconstruction does not oppose it (the decoder just grows its
+  # weights) and the KL helps it along. See the module docstring in
+  # src/models/latent_diffusion.py.
+  vae_loss_weight: 0.0
+  diffusion_loss_weight: 1.0
+  freeze_vae: true
+  detach_latents: true
+  vae_beta: 0.01                 # KL weight (unused while the VAE is frozen)
   vae_ssim_weight: 0.1
 
   early_stopping:
     enabled: true
-    patience: 10
-    monitor: irradiance_mse      # Key from the validation metrics dict
+    patience: 15
+    # The full reverse-process score, not the single-step Tweedie proxy.
+    # irradiance_mse is evaluated at only `batch_size` fixed times, half of them
+    # where alpha is small enough that the x0 estimate is meaningless — and it
+    # kept improving through the run that destroyed forecast skill.
+    # Needs evaluation.forecast_eval_batches > 0.
+    monitor: forecast_rmse
 
   checkpoint_dir: /scratch/er8/cd3022/CPDiT/testing_checkpoints/
   save_every_n_epochs: 5
@@ -229,18 +332,27 @@ training:
 evaluation:
   # Integrating the full reverse process is expensive, so forecast skill is
   # only measured on the first N validation batches. 0 disables it.
-  forecast_eval_batches: 4
-  num_steps: 100
+  # This is now the early-stopping metric, so it needs enough samples to gate
+  # on: 4 batches of 2 was 8 samples, which is mostly noise.
+  forecast_eval_batches: 16
+  # 50 for the in-training metric, to offset the extra batches above. Score the
+  # final model at 100.
+  num_steps: 50
   # ODE by default: deterministic, so the metric tracks the model rather than
   # the sampler's noise draw.
   sampler: ode
+  # Cap on validation batches per epoch. The val split at sample_stride 3 over a
+  # full year produced 2664 batches against 2658 training batches, so half of
+  # every epoch was spent revalidating a number that had already converged.
+  max_val_batches: 200
 
 # -----------------------------------------------------------------------------
 # Optimiser
 # -----------------------------------------------------------------------------
 optimiser:
   name: adamw
-  lr: 1.0e-4
+  # Scaled for the ~32x larger effective batch (4 -> 128). Stage 1 keeps 1e-4.
+  lr: 2.0e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
 

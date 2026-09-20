@@ -1,0 +1,61 @@
+# -----------------------------------------------------------------------------
+# Fast end-to-end smoke test: a real training loop over a few cached days.
+#
+# Not a training config. It exists so the whole path -- dataloader, model,
+# optimiser, validation, forecast metrics, checkpointing -- can be exercised in
+# minutes rather than hours, on a range small enough to sit in the frame cache.
+#
+# It defaults to STAGE 1, because that is the only stage that is meaningful on
+# its own. Smoking stage 2 against the inherited `freeze_vae: true` without a
+# stage-1 checkpoint trains a denoiser against a randomly initialised, frozen
+# VAE: the loop runs and the losses fall, but the decoder is noise, so the
+# forecast metrics are meaningless. Chain the stages instead:
+#
+#   python -m src.training.train --config configs/smoke.yaml
+#   python -m src.training.train --config configs/smoke2.yaml \
+#       --init-from /scratch/er8/cd3022/CPDiT_smoke/checkpoints/best_model.pt
+# -----------------------------------------------------------------------------
+
+extends: train_config.yaml
+
+data:
+  splits:
+    train:
+      start: "20190401T0000"
+      end:   "20190420T0000"
+    val:
+      start: "20190420T0000"
+      end:   "20190425T0000"
+
+model:
+  # Match stage1_vae.yaml: the encoder is trainable here, and at 0.99 the EMA
+  # runs well behind it.
+  latent_scale_momentum: 0.9
+
+dataloader:
+  batch_size: 8
+
+training:
+  # Stage 1 settings, so this config stands alone.
+  vae_loss_weight: 1.0
+  diffusion_loss_weight: 0.0
+  freeze_vae: false
+  vae_beta: 1.0e-6
+  vae_ssim_weight: 0.5
+  vae_max_frames: 3
+
+  max_epochs: 2
+  compile_model: false           # readable tracebacks; compile is not under test
+  checkpoint_dir: /scratch/er8/cd3022/CPDiT_smoke/checkpoints/
+  log_dir: /scratch/er8/cd3022/CPDiT_smoke/logs/
+  early_stopping:
+    enabled: false
+    # Still needed with ES off: best-model selection reads the same key, and
+    # stage 1 has no denoiser so there is no forecast to score.
+    monitor: recon_loss
+
+evaluation:
+  # No denoiser in stage 1, so there is no forecast to score.
+  forecast_eval_batches: 0
+  num_steps: 20
+  max_val_batches: 8

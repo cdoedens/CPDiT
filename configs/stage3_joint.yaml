@@ -1,0 +1,110 @@
+# -----------------------------------------------------------------------------
+# Stage 3 (optional) — task-aware latents: fine-tune the VAE with the nowcast.
+#
+# The motivation is sound: a latent tuned to the forecasting task should beat
+# one tuned only to reconstruction. But the latent epsilon-MSE is the WRONG
+# signal to carry it — minimising that only makes latents easier to denoise, and
+# the easiest latent to denoise is no latent at all. That is the collapse this
+# whole staging exists to avoid.
+#
+# So the joint gradient is re-enabled only with two guards in place:
+#
+#   latent_norm: batch    divides by a std computed WITH gradient, making the
+#                         diffusion loss exactly scale-invariant. Shrinking the
+#                         latent then buys nothing whatsoever.
+#   pixel_loss_weight     scores the DECODED x0 against the truth frame. A
+#                         collapsed latent decodes to the climatological mean
+#                         and scores terribly, so this term is task-aware and
+#                         cannot be gamed by shrinking. Measured separation
+#                         between an intact and a collapsed encoder: ~350x.
+#
+# Start from the stage-2 result and keep its number to beat:
+#   python -m src.training.train --config configs/stage3_joint.yaml \
+#          --init-from /scratch/er8/cd3022/CPDiT/testing_checkpoints/best_model.pt
+#
+# SHIPS ONLY IF forecast_rmse improves on stage 2 under the same sampler, step
+# count and validation subset. Abort if latent_scale_ratio drifts from 1.0.
+# Expect a modest gain or none: task-aware latents are a refinement on a working
+# model, not a route to one.
+# -----------------------------------------------------------------------------
+
+extends: train_config.yaml
+
+model:
+  # Non-negotiable alongside detach_latents: false. load_config rejects the
+  # other combination outright.
+  latent_norm: batch
+  # The EMA resumes tracking, because the encoder is moving again.
+  latent_scale: null
+  # MEASURED: with the encoder trainable, 0.99 left the buffer 15-40% behind the
+  # true latent std, while 0.9 tracked to within 1%. Training is invariant to
+  # that under latent_norm: batch, but SAMPLING is not — the reverse process
+  # starts from N(0, I) and unscales with this buffer, so a lagging EMA quietly
+  # mis-scales every forecast.
+  latent_scale_momentum: 0.9
+
+training:
+  vae_loss_weight: 0.5           # reconstruction still anchors the encoder
+  diffusion_loss_weight: 1.0
+  vae_beta: 1.0e-6
+  vae_ssim_weight: 0.5
+
+  freeze_vae: false
+  detach_latents: false          # the joint gradient, deliberately re-enabled
+
+  # Auxiliary, not the main objective. Large enough to shape the latent, small
+  # enough that it does not take over from the diffusion loss.
+  pixel_loss_weight: 0.05
+  # Only samples below this t contribute. Above it the 1/alpha factor in
+  # Tweedie amplifies score error by orders of magnitude and the gradient is
+  # noise rather than signal.
+  pixel_loss_max_t: 0.3
+
+  # The pretrained encoder should move far more slowly than the diffusion stack
+  # it is being adapted to. Gives the VAE its own AdamW parameter group.
+  vae_lr_mult: 0.1
+
+  # This stage carries the whole autoencoder in the autograd graph AND decodes
+  # again for the pixel loss, so it is by far the most memory-hungry of the
+  # three. MEASURED on 1x H200 without subsampling: 114.8 GiB at batch 16 and
+  # OOM at 32. Same reasoning as stage 1 -- the VAE is per-frame and a sample's
+  # frames are near-duplicates.
+  #
+  # MEASURED with vae_max_frames 3:
+  #    batch  8 ...  32.5 GiB ... 13.1 samples/s
+  #    batch 16 ...  62.8 GiB ... 13.3 samples/s   <- see dataloader below
+  #    batch 32 ... 123.3 GiB ... 13.4 samples/s
+  # Roughly half the memory and 1.8x the throughput of scoring all 13 frames.
+  vae_max_frames: 3
+
+  max_epochs: 30
+  early_stopping:
+    enabled: true
+    patience: 8
+    monitor: forecast_rmse
+
+  checkpoint_dir: /scratch/er8/cd3022/CPDiT/stage3_checkpoints/
+
+dataloader:
+  # Throughput saturates at ~13.4 samples/s from batch 8 upward, so the largest
+  # batch that fits buys nothing: 32 needs 123 of the H200's 143 GiB, which is
+  # no headroom at all. 16 is the same speed at half the memory.
+  # Note stage 3 runs ~4x slower than stage 2 (13.3 vs 54.1 samples/s): the whole
+  # autoencoder is in the autograd graph and the decoder runs twice. Budget for
+  # that before starting it.
+  batch_size: 16
+
+optimiser:
+  # Lower than stage 2: this is a fine-tune from a working model, and the point
+  # is to adapt the latent, not to relearn the denoiser.
+  lr: 5.0e-5
+  scheduler:
+    warmup_epochs: 2
+
+evaluation:
+  # The decoder is inside the autograd graph in this stage, so memory rises and
+  # the batch size may need re-benchmarking. Keep the metric identical to stage
+  # 2's or the comparison that gates this stage is meaningless.
+  forecast_eval_batches: 16
+  num_steps: 50
+  max_val_batches: 200

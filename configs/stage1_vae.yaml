@@ -1,0 +1,74 @@
+# -----------------------------------------------------------------------------
+# Stage 1 — train the VAE alone.
+#
+# Everything not named here is inherited from train_config.yaml, so the data
+# pipeline, geometry and HPC block cannot drift between stages.
+#
+# Why the VAE is pretrained rather than trained jointly from scratch: the
+# diffusion objective reduces to epsilon-MSE, and if the encoder is free to
+# shrink mu towards zero then x_t = sigma*z and the denoiser recovers z exactly.
+# Collapsing the latent is the global minimum of that loss, so a joint run from
+# random init walks straight into it — the first real run lost a factor of 10 in
+# latent std over 11 epochs while its diffusion loss fell 3x and forecast RMSE
+# rose 2.4x. Rombach et al. pretrain the autoencoder for exactly this reason.
+#
+# Run:
+#   python -m src.training.train --config configs/stage1_vae.yaml
+# then measure the latent scale for stage 2:
+#   python scripts/measure_latent_scale.py --checkpoint <best_model.pt>
+# -----------------------------------------------------------------------------
+
+extends: train_config.yaml
+
+model:
+  # The EMA is only a diagnostic here — nothing consumes it until stage 2 pins
+  # a measured value. 0.9 keeps it tracking a still-moving encoder closely; at
+  # 0.99 it ran 15-40% behind in the same test.
+  latent_scale: null
+  latent_scale_momentum: 0.9
+
+training:
+  # No diffusion at all: the context encoder and denoiser are skipped entirely,
+  # which is most of the step cost.
+  vae_loss_weight: 1.0
+  diffusion_loss_weight: 0.0
+  freeze_vae: false
+  detach_latents: true
+
+  # Was 0.01 (x0.1 outer weight = 1e-3 effective). The KL's only job here is to
+  # keep the latent scale bounded, and latent_scale handles normalisation, so a
+  # much weaker prior buys reconstruction detail — Rombach et al. use ~1e-6.
+  vae_beta: 1.0e-6
+  # Reconstruction fidelity is a first-class objective in this stage, not a
+  # side-effect, and it sets the error floor under every forecast that follows.
+  vae_ssim_weight: 0.5
+
+  # The VAE is a per-frame model, and a sample's 13 frames are 10 minutes apart
+  # -- near-duplicates that cost 13x the decoder memory for very little extra
+  # signal. MEASURED on an H200 at 256px: scoring all frames peaked at 113 GiB
+  # at batch 16 and went OOM at 32, forcing a batch far below what stage 2 uses.
+  # 3 frames per sample keeps a spread of lead times and lets the batch grow.
+  # MEASURED on 1x H200 (--benchmark), stage 1:
+  #    all 13 frames ... batch 16 = 113.4 GiB,  7.8 samples/s;  batch 32 = OOM
+  #    vae_max_frames 3 . batch 16 =  27.2 GiB, 34.3 samples/s
+  #                       batch 32 =  53.2 GiB, 35.3 samples/s
+  # 4.4x the throughput at a quarter of the memory, and it lifts the OOM that
+  # otherwise forced stage 1 to a much smaller batch than stage 2.
+  vae_max_frames: 3
+
+  max_epochs: 20
+  early_stopping:
+    enabled: true
+    patience: 5
+    monitor: recon_loss
+
+  checkpoint_dir: /scratch/er8/cd3022/CPDiT/stage1_checkpoints/
+
+optimiser:
+  lr: 1.0e-4                     # not the stage-2 rate; the VAE needs no boost
+
+evaluation:
+  # No denoiser in this stage, so there is no forecast to score. The
+  # early-stopping monitor is recon_loss instead.
+  forecast_eval_batches: 0
+  max_val_batches: 100
