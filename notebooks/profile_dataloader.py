@@ -1,8 +1,8 @@
 # scripts/profile_dataloader.py
 import time
 import torch
-from src.data import build_dataloader
-from src.training.config import load_config
+from src_testing.petdata import build_dataloader
+from src_testing.training.config import load_config
 
 config = load_config("configs/train_config.yaml")
 loader = build_dataloader("train", config, shuffle=False)
