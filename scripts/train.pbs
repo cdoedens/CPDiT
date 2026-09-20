@@ -1,31 +1,272 @@
-#!/bin/bash 
-#PBS -l walltime=12:00:00 
-#PBS -l mem=1024GB 
+#!/bin/bash
+#PBS -N cpdit_train
+#PBS -l walltime=48:00:00
+#PBS -l mem=1024GB
 #PBS -l ncpus=48
 #PBS -l ngpus=4
-#PBS -l jobfs=1024GB 
-#PBS -l storage=gdata/dk92+gdat/rv74+gdata/ob53+scratch/er8
-#PBS -l other=hyperthread 
+#PBS -l jobfs=256GB
+#PBS -l storage=gdata/dk92+gdata/rv74+gdata/ob53+scratch/er8
+#PBS -l other=hyperthread
 #PBS -q gpuhopper
 #PBS -P v46
-#PBS -o /home/548/cd3022/repos/CPDiT/outputs/logs/training.log
+#PBS -o /home/548/cd3022/repos/CPDiT/outputs/logs/
 #PBS -j oe
+#
+# -----------------------------------------------------------------------------
+# Runs the whole staged training pipeline unattended:
+#
+#   stage 1  VAE alone                  configs/stage1_vae.yaml
+#   (measure the latent std and pin it as model.latent_scale for stage 2)
+#   stage 2  diffusion, frozen VAE      configs/train_config.yaml
+#   stage 3  joint fine-tune            configs/stage3_joint.yaml
+#
+# Submit once:
+#     qsub scripts/train.pbs
+#
+# The three stages together are far longer than any single walltime (stage 2
+# alone is 100 epochs at ~37 min/epoch on one H200), so this script is built to
+# be run repeatedly rather than once:
+#
+#   * A finished stage drops a `.stage_complete` marker in its checkpoint dir
+#     and is skipped on every later run.
+#   * An unfinished stage is picked up from its newest `checkpoint_epoch_*.pt`
+#     with --resume, which restores the optimiser, scheduler and epoch.
+#   * Before doing any work the job queues its own successor with
+#     `-W depend=afterany`, so the chain survives being killed at walltime --
+#     which is the case an end-of-script resubmit cannot handle, because PBS
+#     kills the job rather than letting it reach the end. The successor is
+#     qdel'd if this job finishes everything or if a stage fails, so a broken
+#     run stops the chain instead of burning through the budget.
+#
+# Knobs (pass with `qsub -v NAME=value,...`):
+#     STAGES          stages to run, in order          default "1 2 3"
+#     AUTO_RESUBMIT   0 disables the self-chaining      default 1
+#     RESUBMITS_LEFT  remaining links in the chain      default 12
+#     NGPUS           ranks for torchrun                default: GPUs visible
+#
+# Re-running a stage from scratch means deleting its checkpoint directory (or
+# just its .stage_complete marker, to keep the weights and resume).
+# -----------------------------------------------------------------------------
 
+REPO=/home/548/cd3022/repos/CPDiT
+cd "$REPO" || exit 1
 
-
-# Set up directories
-cd /home/548/cd3022/repos/CPDiT
-
-# PBS Job Script for training CPDiT on HPC cluster
+# hpc_setup.sh sets -e, which would abort this script on the first non-zero
+# status rather than letting it handle stage failures itself.
 source hpc_setup.sh
+set +e
+set -uo pipefail
 
+# hpc_setup.sh's conda env provides `python`. Outside it, Gadi's bare `python`
+# is a shim that only prints a deprecation notice, so test that it actually
+# runs rather than that it exists.
+PY=${PY:-python}
+"$PY" -c 'import sys; sys.exit(sys.version_info[0] < 3)' >/dev/null 2>&1 || PY=python3
 
-# Run training
-echo "Starting CPDiT training on GPU..."
+STAGES=${STAGES:-"1 2 3"}
+AUTO_RESUBMIT=${AUTO_RESUBMIT:-1}
+RESUBMITS_LEFT=${RESUBMITS_LEFT:-1}
+NGPUS=${NGPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}
+NGPUS=${NGPUS:-1}
 
-# To resume, append:
-#   --resume /scratch/er8/cd3022/CPDiT/testing_checkpoints/best_model.pt
-torchrun --nproc_per_node=4 -m src.training.train \
-    --config configs/train_config.yaml
+STAGE1_CFG=configs/stage1_vae.yaml
+STAGE3_CFG=configs/stage3_joint.yaml
+# Stage 2 is train_config.yaml with the measured latent scale pinned over it.
+# Generated rather than hand-edited, so the number the diffusion model trains
+# against always comes from the stage-1 VAE it is actually initialised from.
+STAGE2_CFG=configs/generated/stage2_pinned.yaml
 
-echo "Training job completed!"
+log () { echo "[$(date '+%F %T')] $*"; }
+
+# The checkpoint directory is read from the config rather than repeated here:
+# these paths are how the stages hand off to each other, and a copy of them in
+# this file is a copy that can drift.
+ckpt_dir () {
+    "$PY" - "$1" <<'PY'
+import sys
+sys.path.insert(0, ".")
+from src.training.config import load_config
+print(load_config(sys.argv[1])["training"]["checkpoint_dir"].rstrip("/"))
+PY
+}
+
+stage_config () {
+    case "$1" in
+        1) echo "$STAGE1_CFG" ;;
+        2) echo "$STAGE2_CFG" ;;
+        3) echo "$STAGE3_CFG" ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Chain the successor up front (see the header for why it cannot wait until the
+# end). It is cancelled below unless this job is actually cut short.
+# ---------------------------------------------------------------------------
+NEXT_JOB=""
+queue_successor () {
+    [ "$AUTO_RESUBMIT" = "1" ] || return 0
+    [ "${RESUBMITS_LEFT}" -gt 0 ] 2>/dev/null || {
+        log "RESUBMITS_LEFT exhausted; not chaining another job."
+        return 0
+    }
+    [ -n "${PBS_JOBID:-}" ] || return 0     # running by hand, not under PBS
+
+    NEXT_JOB=$(qsub -W "depend=afterany:${PBS_JOBID}" \
+        -v "STAGES=${STAGES},AUTO_RESUBMIT=${AUTO_RESUBMIT},RESUBMITS_LEFT=$((RESUBMITS_LEFT - 1))" \
+        "$REPO/scripts/train.pbs" 2>&1)
+    if [ $? -eq 0 ]; then
+        log "Queued successor $NEXT_JOB (afterany:${PBS_JOBID}, ${RESUBMITS_LEFT} links left)."
+    else
+        log "WARNING: could not queue a successor: $NEXT_JOB"
+        NEXT_JOB=""
+    fi
+}
+
+drop_successor () {
+    [ -n "$NEXT_JOB" ] || return 0
+    log "$1 Cancelling successor $NEXT_JOB."
+    qdel "$NEXT_JOB" 2>&1 | sed 's/^/    /'
+    NEXT_JOB=""
+}
+
+# ---------------------------------------------------------------------------
+# Stage 2 needs the latent std of the stage-1 VAE pinned as model.latent_scale:
+# the sampler starts from N(0, I) and the frozen VAE gives the EMA nothing to
+# track, so the divisor has to be a measured constant. See the header of
+# scripts/measure_latent_scale.py.
+# ---------------------------------------------------------------------------
+write_stage2_config () {
+    local stage1_best="$1"
+
+    if [ -f "$STAGE2_CFG" ]; then
+        log "Reusing $STAGE2_CFG ($(grep -E 'latent_scale' "$STAGE2_CFG" | tr -d ' '))."
+        return 0
+    fi
+
+    log "Measuring the stage-1 latent scale from $stage1_best"
+    local out
+    out=$("$PY" scripts/measure_latent_scale.py --checkpoint "$stage1_best" 2>&1)
+    echo "$out" | sed 's/^/    /'
+
+    local scale
+    scale=$(echo "$out" | awk '/latent_scale:/ {print $2; exit}')
+    case "$scale" in
+        ''|*[!0-9.eE+-]*)
+            log "ERROR: could not parse a latent scale out of measure_latent_scale.py."
+            return 1 ;;
+    esac
+
+    mkdir -p "$(dirname "$STAGE2_CFG")"
+    cat > "$STAGE2_CFG" <<EOF
+# GENERATED by scripts/train.pbs -- do not edit; delete to re-measure.
+# Stage 2 (diffusion against the frozen stage-1 VAE), with the latent scale
+# measured from the checkpoint stage 2 is actually initialised from:
+#   $stage1_best
+# Written $(date '+%F %T') by job ${PBS_JOBID:-interactive}.
+extends: ../train_config.yaml
+
+model:
+  latent_scale: $scale
+EOF
+    log "Wrote $STAGE2_CFG with latent_scale: $scale"
+}
+
+# ---------------------------------------------------------------------------
+# One stage: skip if done, resume if partly done, otherwise start from the
+# previous stage's weights.
+# ---------------------------------------------------------------------------
+run_stage () {
+    local stage="$1" config="$2" init_from="$3"
+    local dir marker resume_from newest
+
+    dir=$(ckpt_dir "$config") || {
+        log "ERROR: could not read training.checkpoint_dir from $config"
+        return 1
+    }
+    marker="$dir/.stage_complete"
+
+    if [ -f "$marker" ]; then
+        log "=== stage $stage: already complete ($marker) -- skipping."
+        return 0
+    fi
+
+    mkdir -p "$dir"
+
+    # --resume restores optimiser, scheduler and epoch, so a walltime kill costs
+    # at most the epoch in flight. best_model.pt is not a resume point: it holds
+    # no optimiser state and is whichever epoch scored best, not the last one.
+    newest=$(ls -1 "$dir"/checkpoint_epoch_*.pt 2>/dev/null | sort | tail -1)
+
+    local -a launch=(torchrun --standalone --nproc_per_node="$NGPUS"
+                     -m src.training.train --config "$config")
+    if [ -n "$newest" ]; then
+        log "=== stage $stage: resuming from $newest"
+        launch+=(--resume "$newest")
+    elif [ -n "$init_from" ]; then
+        if [ ! -f "$init_from" ]; then
+            log "ERROR: stage $stage needs $init_from, which does not exist."
+            return 1
+        fi
+        log "=== stage $stage: starting from the weights in $init_from"
+        launch+=(--init-from "$init_from")
+    else
+        log "=== stage $stage: starting from scratch"
+    fi
+
+    log "    ${launch[*]}"
+    "${launch[@]}"
+    local status=$?
+
+    if [ $status -ne 0 ]; then
+        log "=== stage $stage FAILED (exit $status)."
+        return $status
+    fi
+
+    # Only a clean exit means the stage ran to max_epochs or early-stopped. A
+    # walltime kill never reaches this line, so the marker cannot lie.
+    touch "$marker"
+    log "=== stage $stage complete; marked $marker"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+
+log "CPDiT staged training | job ${PBS_JOBID:-interactive} | stages: $STAGES | ${NGPUS} GPU(s)"
+mkdir -p "$REPO/outputs/logs"
+
+queue_successor
+
+overall=0
+for stage in $STAGES; do
+    config=$(stage_config "$stage") || { log "Unknown stage '$stage'."; overall=1; break; }
+
+    init_from=""
+    case "$stage" in
+        2)
+            init_from="$(ckpt_dir "$STAGE1_CFG")/best_model.pt"
+            # Only needed when stage 2 has not already started: on a resume the
+            # scale is already pinned in the config it was started with.
+            write_stage2_config "$init_from" || { overall=1; break; }
+            ;;
+        3)
+            init_from="$(ckpt_dir "$STAGE2_CFG")/best_model.pt"
+            ;;
+    esac
+
+    run_stage "$stage" "$config" "$init_from"
+    status=$?
+    if [ $status -ne 0 ]; then
+        overall=$status
+        break
+    fi
+done
+
+if [ $overall -ne 0 ]; then
+    drop_successor "A stage failed, so the chain stops here."
+    log "Staged training stopped with status $overall."
+    exit $overall
+fi
+
+drop_successor "All requested stages are complete."
+log "Staged training finished: stages $STAGES all complete."
