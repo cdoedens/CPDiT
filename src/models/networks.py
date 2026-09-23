@@ -62,12 +62,17 @@ logger = logging.getLogger(__name__)
 # 1. Shared building blocks
 #
 #    Used by both networks below, so they live here rather than being defined
-#    twice (TimestepEmbedder previously was).
+#    multiple times.
 # =============================================================================
 
 def get_2d_sincos_pos_embed(embed_dim: int, grid_h: int, grid_w: int) -> torch.Tensor:
     """
     Standard 2-D sine-cosine positional embedding (as used by ViT / DiT / MAE).
+
+    PURPOSE: Positional embeddings are added to the patch embeddings to give the model
+             a sense of spatial location, because transformers do not inherently understand
+             spatial relationships. The embedding is constructed by applying sine and cosine
+             functions of different frequencies to the grid coordinates.
 
     Returns:
         (1, grid_h * grid_w, embed_dim)
@@ -98,6 +103,9 @@ class TimestepEmbedder(nn.Module):
     """
     Sinusoidal diffusion-timestep embedding followed by a two-layer MLP.
 
+    PURPOSE: informs the denoiser about the current diffusion step, allowing it to adapt
+             its predictions based on how much noise is present in the input.
+
     Uses the standard DDPM/DiT frequency scaling (``exp(-log(10000) * i / half)``).
     """
 
@@ -106,6 +114,8 @@ class TimestepEmbedder(nn.Module):
         if frequency_embedding_dim % 2 != 0:
             raise ValueError("frequency_embedding_dim must be even.")
         self.frequency_embedding_dim = frequency_embedding_dim
+        # The MLP is a simple feedforward network that processes the sinusoidal embeddings to produce a richer representation of the timestep.
+        # Converts shape (B, frequency_embedding_dim) -> (B, hidden_dim)
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_dim, hidden_dim),
             nn.SiLU(),
@@ -180,6 +190,13 @@ class ContextEncoderBlock(nn.Module):
     """
     Standard pre-norm transformer block with zero-initialised residual gates.
 
+    This is a typical transformer block:
+    - layer norm, multi-head attention,
+    - residual connection, layer norm,
+    - feedforward MLP,
+    - residual connection.
+    The only twist is that the two residuals are gated by learnable scalars that start at zero.
+
     The gates start at zero so the block begins as the identity, which is the
     stabilising property the previous adaLN-Zero formulation provided.
     """
@@ -211,11 +228,15 @@ class ContextEncoderBlock(nn.Module):
 
 class ContextEncoder(nn.Module):
     """
-    Temporal encoder over the context latent sequence.
+    Temporal encoder over the context latent sequence, using ContextEncoderBlock.
 
-    Attention is bidirectional: the context window is a fixed block of frames
-    that are all in the past relative to the forecast, so there is no future to
-    mask out and every frame may see every other.
+    PURPOSE: Summarises the recent past into a temporally-aware representation
+             that the denoiser can use to condition its predictions.
+
+
+    Each context frame is represented by a latent token, and the transformer
+    lets each token attend to every other, so the time varying patterns of the
+    recent past can be captured.
 
     Input:  (B, T_ctx, latent_dim) tokens, one per context frame
     Output: (B, T_ctx, latent_dim) temporally-encoded tokens
@@ -248,7 +269,7 @@ class ContextEncoder(nn.Module):
 
         self.blocks = nn.ModuleList([
             ContextEncoderBlock(latent_dim, num_heads, feedforward_dim, dropout)
-            for _ in range(num_layers)
+            for _ in range(num_layers) # repeat ContextEncoderBlock num_layers times to build the full ContextEncoder
         ])
 
         self.dropout = nn.Dropout(dropout)
@@ -284,7 +305,7 @@ class ContextEncoder(nn.Module):
         x = self.dropout(x)
 
         for block in self.blocks:
-            x = block(x)
+            x = block(x) # pass the input through each ContextEncoderBlock in the sequence
 
         return self.output_projection(self.output_norm(x))
 
@@ -360,7 +381,7 @@ class NeighbourhoodAttention2D(nn.Module):
         self.scale       = self.head_dim ** -0.5
         self.window_size = window_size
 
-        self.qkv  = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv  = nn.Linear(dim, dim * 3, bias=qkv_bias) # qkv = query, key, value
         self.proj = nn.Linear(dim, dim)
 
         self.use_natten = _NATTEN_AVAILABLE if use_natten is None else use_natten
@@ -407,9 +428,9 @@ class NeighbourhoodAttention2D(nn.Module):
 
         window = self.effective_window(grid_h, grid_w)
 
-        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim)
+        qkv = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim) # qkv = query, key, value
 
-        if self.use_natten:
+        if self.use_natten: # use NATTEN module if available
             # NATTEN expects (B, H, W, heads, head_dim).
             q, k, v = (
                 qkv[:, :, i].reshape(B, grid_h, grid_w, self.num_heads, self.head_dim)
@@ -417,7 +438,7 @@ class NeighbourhoodAttention2D(nn.Module):
             )
             out = _natten_na2d(q, k, v, kernel_size=window, dilation=1, scale=self.scale)
             out = out.reshape(B, L, D)
-        else:
+        else: # scaled dot product attention with neighbourhood mask
             # (B, heads, L, head_dim)
             q, k, v = (qkv[:, :, i].permute(0, 2, 1, 3) for i in range(3))
             mask = self._get_mask(grid_h, grid_w, window, x.device)
@@ -434,7 +455,9 @@ class NeighbourhoodAttention2D(nn.Module):
 # ---------------------------------------------------------------------------
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """adaLN modulation: scale/shift a normalised activation."""
+    """
+    Implement adaLN modulation
+    """
     return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
@@ -496,7 +519,7 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    """adaLN-modulated projection from tokens back to patch pixels."""
+    """adaLN-modulated projection from tokens back to latents."""
 
     def __init__(self, dim: int, patch_size: int, out_channels: int, cond_dim: int):
         super().__init__()
@@ -581,6 +604,8 @@ class DiTDenoiser(nn.Module):
         self.in_channels = in_channels
 
         # ---- Patch embedding: 4x4 strided convolution ---------------------
+        # ViT style patch embedding: a convolution with kernel size = stride = patch_size, which produces a grid of tokens
+        # 32 x 32 latent grid -> 8 x 8 token grid at patch size 4, with embed_dim channels per token
         self.x_embedder = nn.Conv2d(
             in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
         )
@@ -606,7 +631,7 @@ class DiTDenoiser(nn.Module):
                 embed_dim, num_heads, window_size, cond_dim,
                 mlp_ratio=mlp_ratio, use_natten=use_natten,
             )
-            for _ in range(depth)
+            for _ in range(depth) # repeat DiTBlock depth times to build the full DiTDenoiser
         ])
 
         self.final_layer = FinalLayer(embed_dim, patch_size, latent_channels, cond_dim)

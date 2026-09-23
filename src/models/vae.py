@@ -61,12 +61,17 @@ class ResBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    """Strided conv downsample + residual refinement."""
+    """
+    - Performs 2x downsampling of the spatial dimensions.
+    - Uses a strided convolution rather than pooling.
+    - The downsampled feature map is therefore a learned representation rather than a fixed summary of the input.
+    - A residual block then refines the representation with a few more convolutional layers.
+    """
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.down = nn.Conv2d(
-            in_channels, out_channels,
+            in_channels, out_channels, # can increase channels as we downsample to capture more features
             kernel_size=4, stride=2, padding=1
         )
         self.res = ResBlock(out_channels)
@@ -76,7 +81,10 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """Transposed conv upsample + residual refinement."""
+    """
+    - Upsamples the latent representation back to the original image size in the decoder
+    - Uses a transposed convolution for learned upsampling, followed by a residual block to refine the upsampled features.
+    """
 
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
@@ -147,6 +155,10 @@ class VariationalAutoencoder(nn.Module):
         )
 
         # Project to mu and logvar — both spatial maps
+        """
+        VAE learns the mean (mu) and log-variance (logvar) of the latent distribution for each spatial location.
+        After encoding to a feature map of shape (4D, H/8, W/8), perform 2d convolutions to produce mu and logvar maps of shape (latent_channels, H/8, W/8).
+        """
         self.conv_mu     = nn.Conv2d(D * 4, latent_channels, kernel_size=1)
         self.conv_logvar = nn.Conv2d(D * 4, latent_channels, kernel_size=1)
 
@@ -181,9 +193,9 @@ class VariationalAutoencoder(nn.Module):
             mu:     (B, latent_channels, H/8, W/8)
             logvar: (B, latent_channels, H/8, W/8)
         """
-        h      = self.encoder(x)
-        mu     = self.conv_mu(h)
-        logvar = self.conv_logvar(h)
+        h      = self.encoder(x) # downsample spatially and increase channels to shape: (B, 4D, H/8, W/8)
+        mu     = self.conv_mu(h) # reduce channels from 4D to latent_channels for mean of latent distribution
+        logvar = self.conv_logvar(h) # reduce channels from 4D to latent_channels for log-variance of latent distribution
         return mu, logvar
 
     # ------------------------------------------------------------------ #
@@ -193,6 +205,10 @@ class VariationalAutoencoder(nn.Module):
     def reparameterize(
         self, mu: torch.Tensor, logvar: torch.Tensor
     ) -> torch.Tensor:
+        """
+        Use the reparameterization trick to sample from the latent distribution.
+        i.e. z = mu + std * eps, where eps ~ N(0, I) and std = exp(0.5 * logvar).
+        """
         logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         std    = torch.exp(0.5 * logvar)
         eps    = torch.randn_like(std)
@@ -204,6 +220,8 @@ class VariationalAutoencoder(nn.Module):
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """
+        Decode the reparameterized latent representation back to pixel space.
+
         Args:
             z: (B, latent_channels, H/8, W/8)
         Returns:
@@ -240,6 +258,8 @@ class VariationalAutoencoder(nn.Module):
         """
         Reconstruction (MSE + SSIM) + beta-weighted KL divergence.
 
+        MSE and SSIM are computed over pixel space to measure the quality of the reconstruction. KL is computed over the latent space to regularise the latent distribution.
+
         KL is computed over the full spatial latent map and normalised
         by the number of latent elements so it stays on the same scale
         as the reconstruction loss regardless of latent_channels or
@@ -273,6 +293,9 @@ class VariationalAutoencoder(nn.Module):
         return total, recon_loss, kl_loss
 
     def extra_repr(self) -> str:
+        """
+        Return a string representation of the VAE's hyperparameters.
+        """
         return (
             f"image_channels={self.image_channels}, "
             f"image_size={self.image_size}, "
