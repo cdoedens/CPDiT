@@ -4,7 +4,7 @@
 #PBS -l ncpus=48
 #PBS -l ngpus=4
 #PBS -l jobfs=1024GB 
-#PBS -l storage=gdata/dk92+gdat/rv74+gdata/ob53+scratch/er8
+#PBS -l storage=gdata/dk92+gdata/rv74+gdata/ob53+scratch/er8
 #PBS -l other=hyperthread 
 #PBS -q gpuhopper
 #PBS -P v46
