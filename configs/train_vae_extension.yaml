@@ -1,16 +1,7 @@
 # -----------------------------------------------------------------------------
 # Stage 1 — train the VAE alone.
 #
-# Everything not named here is inherited from train_config.yaml, so the data
-# pipeline, geometry and HPC block cannot drift between stages.
-#
-# Why the VAE is pretrained rather than trained jointly from scratch: the
-# diffusion objective reduces to epsilon-MSE, and if the encoder is free to
-# shrink mu towards zero then x_t = sigma*z and the denoiser recovers z exactly.
-# Collapsing the latent is the global minimum of that loss, so a joint run from
-# random init walks straight into it — the first real run lost a factor of 10 in
-# latent std over 11 epochs while its diffusion loss fell 3x and forecast RMSE
-# rose 2.4x. Rombach et al. pretrain the autoencoder for exactly this reason.
+# Everything not named here is inherited from train_config.yaml
 #
 # Run:
 #   python -m src.training.train --config configs/stage1_vae.yaml
@@ -18,26 +9,20 @@
 #   python scripts/measure_latent_scale.py --checkpoint <best_model.pt>
 # -----------------------------------------------------------------------------
 
-extends: train_config.yaml
+extends: train_base.yaml
 
 model:
-  # The EMA is only a diagnostic here — nothing consumes it until stage 2 pins
-  # a measured value. 0.9 keeps it tracking a still-moving encoder closely; at
-  # 0.99 it ran 15-40% behind in the same test.
   latent_scale: null
   latent_scale_momentum: 0.9
 
 training:
-  # No diffusion at all: the context encoder and denoiser are skipped entirely,
-  # which is most of the step cost.
   vae_loss_weight: 1.0
   diffusion_loss_weight: 0.0
   freeze_vae: false
   detach_latents: true
 
-  # Was 0.01 (x0.1 outer weight = 1e-3 effective). The KL's only job here is to
-  # keep the latent scale bounded, and latent_scale handles normalisation, so a
-  # much weaker prior buys reconstruction detail — Rombach et al. use ~1e-6.
+  # The KL's only job here is to keep the latent scale bounded, and latent_scale
+  # handles normalisation, so a much weaker prior buys reconstruction detail
   vae_beta: 1.0e-6
   # Reconstruction fidelity is a first-class objective in this stage, not a
   # side-effect, and it sets the error floor under every forecast that follows.
@@ -56,7 +41,7 @@ training:
   # otherwise forced stage 1 to a much smaller batch than stage 2.
   vae_max_frames: 3
 
-  max_epochs: 20
+  max_epochs: 50
   early_stopping:
     enabled: true
     patience: 5
@@ -65,7 +50,7 @@ training:
   checkpoint_dir: /scratch/er8/cd3022/CPDiT/stage1_checkpoints/
 
 optimiser:
-  lr: 1.0e-4                     # not the stage-2 rate; the VAE needs no boost
+  lr: 1.0e-3
 
 evaluation:
   # No denoiser in this stage, so there is no forecast to score. The
