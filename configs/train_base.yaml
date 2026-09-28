@@ -23,7 +23,7 @@ model:
   # track anyway. Pinning it is what Stable Diffusion's fixed 0.18215 does.
   # Both --resume and --init-from re-apply this value after loading, so a
   # checkpoint's own drifted buffer cannot silently override it.
-  latent_scale: 2.06237
+  latent_scale: 2.06876
   # MEASURED: while the VAE is still moving, 0.99 leaves the EMA 15-40% behind
   # the true latent std, which puts the sampler's N(0, I) prior out of step with
   # the data. 0.9 tracked to within 1% in the same test. Use 0.9 whenever the
@@ -154,11 +154,7 @@ data:
   # accessor cannot see it and every request before 2019-04-01 raises
   # DataNotFoundError.
   #
-  # MEASURED: a start of 2016-01-01 spent 3.2 of a 3.4-minute priming run
-  # writing 26,232 "known bad" markers for dates that cannot exist, yielding
-  # nothing and showing zero batches on the progress bar the whole time. Do not
-  # set train.start earlier than 2019-04-01 without checking that `latest` has
-  # moved.
+  # PET dataloader uses "latest" dir in rv74, so limited to 2019-04-01 onward
   splits:
     train:
       start: "20190401T0000"
@@ -321,7 +317,7 @@ training:
     # Needs evaluation.forecast_eval_batches > 0.
     monitor: forecast_rmse
 
-  checkpoint_dir: /scratch/er8/cd3022/CPDiT/testing_checkpoints/
+  checkpoint_dir: /scratch/er8/cd3022/CPDiT/stage2_checkpoints/
   save_every_n_epochs: 5
   keep_last_n_checkpoints: 3     # best_model.pt is never rotated away
   log_dir: /scratch/er8/cd3022/CPDiT/logs/
@@ -373,12 +369,12 @@ logging:
 # HPC / Gadi job settings (used by scripts/train.pbs)
 # -----------------------------------------------------------------------------
 hpc:
-  ncpus: 48                      # Matches scripts/train.pbs; 10 workers x 4 ranks
+  ncpus: 48
   ngpus: 4
   mem_gb: 382
   walltime: "48:00:00"
   queue: gpuvolta
-  project: er8
+  project: v46
   modules:
     - cuda/12.2
     - python3/3.11
