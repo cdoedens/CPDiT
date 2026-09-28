@@ -25,7 +25,8 @@ free of sampling noise that inference never sees.
 
 Usage:
     # a stage-1 checkpoint -- the real measurement
-    python scripts/plot_vae_reconstruction.py --checkpoint /scratch/.../best_model.pt
+    python scripts/plot_vae_reconstruction.py --checkpoint /scratch/er8/cd3022/CPDiT/stage1_checkpoints/best_model.pt \
+        --sample-index 180 --output outputs/vae/vae_v0.1.1.png
 
     # untrained VAE straight from a config, as a shapes/scale sanity check
     python scripts/plot_vae_reconstruction.py --config configs/stage1_vae.yaml
