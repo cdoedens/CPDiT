@@ -400,7 +400,11 @@ class LatentDiffusionTransformer(nn.Module):
         Returns:
             (B, T_ctx, transformer_dim)
         """
+
+        # Flatten spatial dimension and keep temporal, to indicate temporal context
         B, T = context_latents.shape[:2]
+
+        # Use a FFN to project flattened latent maps (B, T, LC*Hl*Wl) to transformer tokens (B, T, transformer_dim)
         tokens = self.latent_to_token(context_latents.reshape(B, T, -1))
         # No diffusion time is passed: the context is always clean, so there is
         # no noise level to condition on. Only the forecast latents are noisy,
@@ -421,7 +425,11 @@ class LatentDiffusionTransformer(nn.Module):
         t:     torch.Tensor,   # (B,) continuous time in [t_eps, T]
         noise: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample x_t ~ p(x_t | x_0). Returns (x_t, noise, sigma)."""
+        """
+        Take a clean latent x_0 and a time t, and return a perturbed latent x_t, according to the diffusion process.
+
+        Sample x_t ~ p(x_t | x_0). Returns (x_t, noise, sigma).
+        """
         return self.sde.perturb(x, t, noise)
 
     def score(
@@ -432,7 +440,17 @@ class LatentDiffusionTransformer(nn.Module):
         context_latents: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Estimate ``grad_x log p_t(x)``.
+        VERY IMPORTANT COMPONENT
+        
+        The score function:
+            s(x,t) = grad_x log p_t(x)
+        is estimated as:
+            s(x,t) = -out / sigma(t),
+        
+        where out is the denoiser's estimate of the noise and sigma is the
+        standard deviation of the perturbation kernel. The denoiser
+        is trained to predict the noise added to x_0 to get x_t, and
+        the score is derived from this prediction.
 
         The network emits an epsilon-scaled residual and the score is
         ``-out / sigma(t)``; see the module docstring for why the model is
@@ -445,8 +463,9 @@ class LatentDiffusionTransformer(nn.Module):
     def score_fn(
         self, context_tokens: torch.Tensor, context_latents: torch.Tensor
     ):
-        """Bind the conditioning, yielding the ``(x, t) -> score`` closure the
-        samplers expect."""
+        """
+        So the samplers can call it as a plain s(x,t) without passing the context every time.
+        """
         def fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             return self.score(x, t, context_tokens, context_latents)
         return fn
@@ -459,17 +478,12 @@ class LatentDiffusionTransformer(nn.Module):
         clamp: Optional[float] = None,
     ) -> torch.Tensor:
         """
+        Uses Tweedie's formula to compute the expected clean latent
+        x_0 given a noisy latent x_t and the score function. The
+        score function is estimated by the denoiser, and this method
+        computes the expected value of x_0 based on that estimate.
+
         Tweedie's formula: E[x_0 | x_t] = (x_t + sigma^2 * score) / alpha.
-
-        The score-based counterpart of DDPM eq. 15, and the reason a score model
-        needs no separate x0-prediction head.
-
-        The 1/alpha factor is inherently ill-conditioned as t -> T: for the
-        cosine VP SDE alpha(1) ~ 1e-5, so any error in the score is amplified
-        a hundred-thousand-fold — which is unavoidable, since x_T carries no
-        information about x_0. Pass ``clamp`` to bound the estimate (latents are
-        unit-scaled, so a few standard deviations is far outside the data) when
-        the result feeds a metric that must stay finite and comparable.
         """
         alpha, sigma = self.sde.alpha_sigma(t)
         x0 = (
@@ -480,6 +494,8 @@ class LatentDiffusionTransformer(nn.Module):
     def sample_times(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """
         Draw training times ~ U(t_eps, T).
+
+        Ensures each batch element gets a different time, so the denoiser sees a range of noise levels.
 
         Stratified over the batch rather than i.i.d.: with the small batch sizes
         used here, i.i.d. draws leave large parts of the time axis unvisited in
@@ -550,6 +566,10 @@ class LatentDiffusionTransformer(nn.Module):
                 early stopping is mostly noise.
             return_pixel_metrics: additionally decode the Tweedie x0 estimate
                 and score it against the target in pixel space.
+
+        Inputs:
+            context_images: (B, T_ctx, C, H, W) recent frames to condition on
+            target_images:  (B, T_fcast, C, H, W) future frames to predict
 
         Returns a dict with: loss, diffusion_loss, vae_loss, recon_loss,
         kl_loss, latent_scale_ratio, and — when the diffusion branch runs and
@@ -645,9 +665,11 @@ class LatentDiffusionTransformer(nn.Module):
             ).detach(),
         }
 
+        # once VAE is done, split the latents back into context and target for the diffusion loss
         context_latents = latents[:, :T_ctx]
         target_latents  = latents[:, T_ctx:]
 
+        # --- Encode the temporal context sequence to transformer tokens ----------------
         encoded_context = self._encode_context(context_latents)
 
         noise = None
@@ -676,6 +698,7 @@ class LatentDiffusionTransformer(nn.Module):
 
         if self.loss_weighting == "sigma2":
             # lambda(t) = sigma^2: the standard variance-reduced weighting.
+            # for VP SDEs this is equivalent to epsilon-MSE
             per_sample = residual.flatten(1).pow(2).mean(dim=1)
         else:
             # lambda(t) = g(t)^2: likelihood weighting, which makes the loss an
@@ -803,6 +826,11 @@ class LatentDiffusionTransformer(nn.Module):
         Thin wrapper over `forward` with fixed timesteps, a fixed noise draw
         and pixel metrics enabled. Kept as a separate entry point for scripts
         that only want evaluation numbers.
+
+        Important for:
+            - early stopping
+            - best-model selection
+            - validation comparisons
         """
         out = self.forward(
             context_images, target_images,

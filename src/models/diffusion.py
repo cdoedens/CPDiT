@@ -74,7 +74,17 @@ def broadcast_to(v: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
 
 
 class SDE(abc.ABC):
-    """Base class for a forward SDE with a Gaussian perturbation kernel."""
+    """
+    Base class for a forward SDE with a Gaussian perturbation kernel.
+
+    All subclasses must implement:
+        - sde(x, t) -> f, g
+        - alpha_sigma(t) -> alpha, sigma
+    ...and the will contain derived methods:
+        - marginal_prob(x, t) -> mean, std
+        - perturb(x0, t) -> x_t, noise, sigma
+    
+    """
 
     def __init__(self, T: float = 1.0, t_eps: float = 1e-3):
         # Sampling and training both stop short of t=0: sigma(0) = 0 makes the
@@ -87,16 +97,30 @@ class SDE(abc.ABC):
 
     @abc.abstractmethod
     def sde(self, x: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Drift f(x, t) shaped like x, and diffusion g(t) shaped (B,)."""
+        """
+        returns:
+        - Drift f(x, t) shaped like x
+        - diffusion g(t) shaped (B,)
+        where dx = f(x,t)dt + g(t)dw, i.e. the forward SDE
+        """
 
     @abc.abstractmethod
     def alpha_sigma(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Perturbation-kernel coefficients: p(x_t|x_0) = N(alpha*x_0, sigma^2 I)."""
+        """
+        returns the Perturbation-kernel coefficients:
+        p(x_t|x_0) = N(alpha*x_0, sigma^2 I)
+        
+        i.e. alpha(t) and sigma(t)
+        """
 
     def marginal_prob(
         self, x: torch.Tensor, t: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mean and (broadcast) std of p(x_t | x_0 = x)."""
+        """
+        Mean and (broadcast) std of p(x_t | x_0 = x).
+
+        Turns alpha(t) and sigma(t) into the actual mean and std of the pertubation distribution
+        """
         alpha, sigma = self.alpha_sigma(t)
         return broadcast_to(alpha, x) * x, broadcast_to(sigma, x)
 
@@ -104,10 +128,19 @@ class SDE(abc.ABC):
         self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Draw x_t ~ p(x_t | x_0).
+        Perturb a clean latent x_0 at time t, i.e. the "perturbation-kernel", using marginal_prob.
+        Instead of simulating the SDE (x0 -> x1 -> ... -> x_t), we can sample directly from the known Gaussian kernel
+        x_t = alpha(t) * x_0, sigma(t) * z
 
-        Returns (x_t, noise, sigma_broadcast). The score of the perturbation
-        kernel is -noise / sigma, which is the DSM regression target.
+        Inputs:
+            x0:    clean latent (B, C, H, W)
+            t:     time (B,)
+            noise: optional noise to use instead of sampling it
+        Returns:
+            x_t: perturbed latent (B, C, H, W)
+            noise: sampled noise (B, C, H, W)
+            sigma_broadcast: broadcast sigma (B, 1, 1, 1)
+        The score of the perturbation kernel is -noise / sigma, which is the Denoising Score Matching regression target.
         """
         if noise is None:
             noise = torch.randn_like(x0)
@@ -122,6 +155,11 @@ class SDE(abc.ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Drift and diffusion of the reverse-time SDE (Anderson 1982).
+
+        Forward SDE is:
+            dx = f*dt + g*dw, where f is drift
+        Anderson (1982) reverse SDE is:
+            dx = [f-(g**2)*s(x,t)]*dt + gdw, where s(x,t) the score function approximated by -noise / sigma
 
         With ``probability_flow=True`` the diffusion term is dropped and the
         drift halved, giving the deterministic probability-flow ODE that shares
@@ -182,9 +220,7 @@ class CosineVPSDE(SDE):
         alpha_bar(t) = cos^2(u(t)) / cos^2(u(0)),  u(t) = (t + s)/(1 + s) * pi/2
         alpha(t)     = sqrt(alpha_bar(t)),  sigma(t) = sqrt(1 - alpha_bar(t))
 
-    The drift follows from beta(t) = -d/dt log alpha_bar(t) = pi/(1+s) * tan(u),
-    so this is the exact continuous-time counterpart of the cosine DDPM schedule
-    the model used previously. beta is clamped near t=T where tan diverges.
+    The drift follows from beta(t) = -d/dt log alpha_bar(t) = pi/(1+s) * tan(u)
     """
 
     def __init__(self, s: float = 0.008, beta_max: float = 999.0,
@@ -267,6 +303,7 @@ def build_sde(name: str = "vp_cosine", **kwargs) -> SDE:
 #
 #    Both integrate from t = T down to t = t_eps using only score_fn(x, t).
 #    Neither knows anything about the model that produced the score.
+#    ONLY USED IN SAMPLING, NOT TRAINING.
 # =============================================================================
 
 ScoreFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -280,7 +317,7 @@ def _timesteps(sde: SDE, num_steps: int, device) -> torch.Tensor:
 @torch.no_grad()
 def pc_sampler(
     sde:              SDE,
-    score_fn:         ScoreFn,
+    score_fn:         ScoreFn, # supplied by learned DiT
     shape:            tuple,
     device:           torch.device,
     num_steps:        int   = 100,
@@ -293,7 +330,11 @@ def pc_sampler(
     x_T:              Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Predictor-Corrector sampler.
+    Predictor-Corrector sampler. Combines a reverse-SDE step (predictor) to
+    move toward clearner sample, with an annealed Langevin step (corrector)
+    to improve sample quality by moving along the score function:
+
+    xT -> corrector -> predictor -> corrector -> predictor -> ... -> x0
 
     Args:
         num_steps:       reverse-SDE (predictor) steps.
@@ -328,6 +369,7 @@ def pc_sampler(
                 x = x.clamp(-clamp_value, clamp_value)
 
         # ---- Predictor: one reverse-SDE / PF-ODE step -------------------- #
+        # Uses Euler-Maruyama when probability_flow=False, and Euler when probability_flow=True.
         score = score_fn(x, t)
         drift, g = sde.reverse_sde(x, t, score, probability_flow=probability_flow)
         x = x + drift * dt
