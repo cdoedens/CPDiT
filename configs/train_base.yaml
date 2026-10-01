@@ -8,7 +8,7 @@
 model:
   # surface_global_irradiance + solar_elevation (Himawari) + RH24mean (BARRA)
   image_channels: 3
-  image_size: 256                # Spatial size of input patches (H = W)
+  image_size: 512                # Spatial size of input patches (H = W)
   latent_channels: 4
   hidden_dim: 128                # VAE conv base channel width (D -> 2D -> 4D)
   max_forecast_steps: 32         # Upper bound for the lead-time embedding table
@@ -112,7 +112,7 @@ model:
 data:
   sat_timestep: "10 minutes"     # Iterator stride between sample windows
   n_prior_sat: 12                # Context frames (t-120min .. t-10min)
-  n_post: 1                      # Forecast frames, starting at t
+  n_post: 6                      # Forecast frames, starting at t
 
   # Windows overlap heavily at a 10-minute cadence; take every Nth window to
   # decorrelate consecutive samples. Works together with shuffle_buffer below.
@@ -122,14 +122,14 @@ data:
   # null keeps every hour. A sample needs its whole context window in daylight,
   # and outside that the irradiance field is absent or NaN, so these dates cost
   # a full archive fetch and yield nothing. MEASURED over this domain
-  # (145-151.5E, UTC+10): UTC 09-21 gave 0 usable samples out of 26 attempts;
+  # (138.5-151.5E, UTC+10): UTC 09-21 gave 0 usable samples out of 26 attempts;
   # UTC 22-08 (local 08:00-18:00) gave all of them.
   # This is a fixed clock window, not a solar calculation — it sits inside
   # daylight year-round, so in summer it discards some genuinely usable
   # early-morning and late-evening samples. Widen it if you want those.
   skip_utc_hours: [9, 21]
 
-  bounds:       [-35, -28.5, 145, 151.5]
+  bounds:       [-35, -22, 138.5, 151.5]
   crop_offset:  10               # Pixels trimmed from the bounded region edge
   irradiance_channel: 0          # Channel scored by the pixel-space metrics
 
@@ -187,7 +187,7 @@ dataloader:
   # samples/s, so this is an 8x throughput change on the same hardware.
   # Re-measure after any architecture change:
   #    python -m src.training.train --config <cfg> --benchmark 8,16,32,64
-  batch_size: 32
+  batch_size: 16
   # MEASURED on 1x H200 (12 CPUs), September 2026:
   #   archive read, 10 workers ......... 1.04 samples/s
   #   warm cache read, 0 workers ....... 304   samples/s  (3.3 ms/sample)
@@ -360,21 +360,25 @@ optimiser:
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-logging:
-  project_name: CPDiT
-  experiment_name: 256px_12ctx_1fcast_dit
-  log_dir: /scratch/er8/cd3022/CPDiT/logs/
+# don't think this is used anymore, delete after check
+# logging:
+#   project_name: CPDiT
+#   experiment_name: 256px_12ctx_1fcast_dit
+#   log_dir: /scratch/er8/cd3022/CPDiT/logs/
 
 # -----------------------------------------------------------------------------
 # HPC / Gadi job settings (used by scripts/train.pbs)
 # -----------------------------------------------------------------------------
-hpc:
-  ncpus: 48
-  ngpus: 4
-  mem_gb: 382
-  walltime: "48:00:00"
-  queue: gpuvolta
-  project: v46
-  modules:
-    - cuda/12.2
-    - python3/3.11
+# another section I don't think is being used,
+# delete if the model runs without it
+
+# hpc:
+#   ncpus: 48
+#   ngpus: 4
+#   mem_gb: 382
+#   walltime: "48:00:00"
+#   queue: gpuvolta
+#   project: v46
+#   modules:
+#     - cuda/12.2
+#     - python3/3.11
