@@ -8,7 +8,7 @@
 #PBS -l other=hyperthread 
 #PBS -q gpuhopper
 #PBS -P v46
-#PBS -o /home/548/cd3022/repos/CPDiT/outputs/logs/training.log
+#PBS -o /home/548/cd3022/repos/CPDiT/outputs/logs/train_dit.log
 #PBS -j oe
 
 
