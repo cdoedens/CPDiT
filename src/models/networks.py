@@ -711,6 +711,11 @@ class DiTDenoiser(nn.Module):
             )
 
         # ---- Build per-frame input: noisy frame + all context frames ------
+
+        # Each noisy forecast frame is concatenated with the entire context sequence
+        # along the channel axis. So for each forecast frame, the denoiser sees both
+        # the current noisy frame and the context.
+
         ctx = context_latents.reshape(B, T_ctx * C, Hl, Wl)
         ctx = ctx.unsqueeze(1).expand(B, T_fcast, T_ctx * C, Hl, Wl)
         inp = torch.cat([x, ctx], dim=2).reshape(B * T_fcast, self.in_channels, Hl, Wl)

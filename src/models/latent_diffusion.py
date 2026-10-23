@@ -689,6 +689,7 @@ class LatentDiffusionTransformer(nn.Module):
         # intractable score-matching objective reduces to a regression onto it.
         x_t, noise, sigma = self.perturb(target_latents, times, noise=noise)
         eps_pred = self.denoiser(x_t, times, encoded_context, context_latents)
+        # Used in Tweedie's formula below
         score = -eps_pred / sigma.clamp(min=1e-8)
 
         # Residual of  s_theta(x_t, t) - grad log p(x_t|x_0)  scaled by sigma,
