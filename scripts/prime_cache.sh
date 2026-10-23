@@ -37,7 +37,7 @@
 echo "Running prime_cache, make sure environment is set up beforehand"
 
 WORKERS="${WORKERS:-10}"
-CONFIG="${CONFIG:-configs/train_config.yaml}"
+CONFIG="${CONFIG:-configs/train_base.yaml}"
 
 echo "Priming $CONFIG with $WORKERS workers..."
 
