@@ -1,0 +1,30 @@
+#!/bin/bash 
+#PBS -l walltime=24:00:00 
+#PBS -l mem=96GB 
+#PBS -l ncpus=12
+#PBS -l ngpus=1
+#PBS -l jobfs=256GB 
+#PBS -l storage=gdata/dk92+gdata/rv74+gdata/ob53+scratch/er8
+#PBS -l other=hyperthread 
+#PBS -q gpuhopper
+#PBS -P er8
+#PBS -o /home/548/cd3022/repos/CPDiT/outputs/logs/inference.log
+#PBS -j oe
+
+
+
+# Set up directories
+cd /home/548/cd3022/repos/CPDiT
+
+# PBS Job Script for training CPDiT on HPC cluster
+source hpc_setup.sh
+
+
+echo "Starting CPDiT DiT inference..."
+
+
+
+python scripts/run_inference.py \
+    --batch-size 4
+
+echo "Inference job completed!"
