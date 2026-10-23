@@ -792,7 +792,7 @@ class Trainer:
     # Cache priming                                                        #
     # ------------------------------------------------------------------ #
 
-    def prime_cache(self, splits: tuple[str, ...] = ("train", "val")) -> None:
+    def prime_cache(self, splits: tuple[str, ...] = ("train", "val", "test")) -> None:
         """Deprecated shim: priming needs no model, so it is a free function."""
         prime_cache(self.config, splits=splits, is_primary=self.is_primary)
 
@@ -1105,7 +1105,7 @@ PRIME_BATCH_SIZE = 2
 
 def prime_cache(
     config:     dict,
-    splits:     tuple[str, ...] = ("train", "val"),
+    splits:     tuple[str, ...] = ("train", "val", "test"),
     is_primary: bool = True,
 ) -> None:
     """
