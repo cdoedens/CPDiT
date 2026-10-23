@@ -23,7 +23,7 @@ model:
   # track anyway. Pinning it is what Stable Diffusion's fixed 0.18215 does.
   # Both --resume and --init-from re-apply this value after loading, so a
   # checkpoint's own drifted buffer cannot silently override it.
-  latent_scale: 2.06876
+  latent_scale: 3.37158
   # MEASURED: while the VAE is still moving, 0.99 leaves the EMA 15-40% behind
   # the true latent std, which puts the sampler's N(0, I) prior out of step with
   # the data. 0.9 tracked to within 1% in the same test. Use 0.9 whenever the
@@ -187,8 +187,8 @@ dataloader:
   # samples/s, so this is an 8x throughput change on the same hardware.
   # Re-measure after any architecture change:
   #    python -m src.training.train --config <cfg> --benchmark 8,16,32,64
-  batch_size: 16
-  # MEASURED on 1x H200 (12 CPUs), September 2026:
+  batch_size: 8
+  # MEASURED on 1x H200 (12 CPUs), with spatial_dim=256, September 2026:
   #   archive read, 10 workers ......... 1.04 samples/s
   #   warm cache read, 0 workers ....... 304   samples/s  (3.3 ms/sample)
   #   GPU capability, batch 2 .......... 6.96 samples/s   (7.81 at batch 16)
@@ -360,25 +360,22 @@ optimiser:
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-# don't think this is used anymore, delete after check
-# logging:
-#   project_name: CPDiT
-#   experiment_name: 256px_12ctx_1fcast_dit
-#   log_dir: /scratch/er8/cd3022/CPDiT/logs/
+logging:
+  project_name: CPDiT
+  experiment_name: 256px_12ctx_1fcast_dit
+  log_dir: /scratch/er8/cd3022/CPDiT/logs/
 
 # -----------------------------------------------------------------------------
 # HPC / Gadi job settings (used by scripts/train.pbs)
 # -----------------------------------------------------------------------------
-# another section I don't think is being used,
-# delete if the model runs without it
 
-# hpc:
-#   ncpus: 48
-#   ngpus: 4
-#   mem_gb: 382
-#   walltime: "48:00:00"
-#   queue: gpuvolta
-#   project: v46
-#   modules:
-#     - cuda/12.2
-#     - python3/3.11
+hpc:
+  ncpus: 48
+  ngpus: 4
+  mem_gb: 382
+  walltime: "48:00:00"
+  queue: gpuvolta
+  project: v46
+  modules:
+    - cuda/12.2
+    - python3/3.11

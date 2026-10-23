@@ -1,22 +1,27 @@
 """
 Plot a 3x6 forecast panel: prior context, truth, and model prediction.
 
-Row 1 (top)    the six irradiance frames t-50min .. t0 (the anchor is context)
-Row 2 (middle) the irradiance truth at t+10, +20, +30, +60, +120, +180 min
+Row 1 (top)    the six irradiance frames t-60min .. t-10min (the last context frames)
+Row 2 (middle) the irradiance truth at t+0, +10, +20, +50, +110, +170 min
 Row 3 (bottom) the model's forecast at those same lead times
 
 Usage:
     python scripts/plot_forecast.py --checkpoint /path/to/ckpt.pt \
         --split val --sample-index 0 --output outputs/forecast.png
 
-The config (data pipeline, image geometry, ...) is read straight out of the
-checkpoint, matching how `load_model_from_checkpoint` reconstructs the model
-elsewhere in this repo -- nothing here can drift out of sync with what the
+    # or a specific forecast time (UTC): context ends t0-10min, forecast starts at t0
+    python scripts/plot_forecast.py --checkpoint /path/to/ckpt.pt \
+        --datetime "2024-03-05 02:30" --output outputs/forecast.png
+
+The config (data pipeline, image geometry, forecast horizon, ...) is read straight
+out of the checkpoint, matching how `load_model_from_checkpoint` reconstructs the
+model elsewhere in this repo -- nothing here can drift out of sync with what the
 checkpoint was actually trained with.
 
-Lead times past the checkpoint's trained horizon (`data.n_post`) are reached by
-rolling the model forward autoregressively -- see `rollout` for why they cannot
-simply be asked for in one call.
+The model forecasts `data.n_post` frames per call (t+0 .. t+(n_post-1)*step).
+Lead times past that horizon are reached by rolling the model forward
+autoregressively -- see `rollout`. Three 6-frame calls cover t+0 .. t+170, and the
+last plotted frame is the last frame of the third call.
 """
 
 from __future__ import annotations
@@ -28,20 +33,24 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 
 from src.inference import Forecaster, build_model_from_config, resolve_device
-from src.petdata import _parse_timestep, build_dataloader, channel_names
+from src.petdata import (
+    PipelineDataset, _parse_timestep, blocked_utc_hours, build_dataloader, channel_names,
+    frame_times,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # Lead times plotted in each row, in minutes relative to the forecast anchor.
-# The anchor frame itself (t+0) is drawn on the context row, but it lives in the
-# *target* tensor: `frame_times` puts the first forecast frame AT the anchor, so
-# the context tensor only ever holds strictly-earlier frames.
-CONTEXT_OFFSETS_MIN  = [-50, -40, -30, -20, -10, 0]
-FORECAST_OFFSETS_MIN = [10, 20, 30, 60, 120, 180]
+# The context tensor holds strictly-earlier frames (last one is t-10) and
+# `frame_times` puts the first forecast frame AT the anchor (t+0), so the forecast
+# row starts at t+0 and three 6-frame calls end exactly on t+170.
+CONTEXT_OFFSETS_MIN  = [-60, -50, -40, -30, -20, -10]
+FORECAST_OFFSETS_MIN = [0, 10, 20, 50, 110, 170]
 
 N_PANELS = len(FORECAST_OFFSETS_MIN)   # frames per row
 
@@ -49,10 +58,17 @@ N_PANELS = len(FORECAST_OFFSETS_MIN)   # frames per row
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", required=True, help="Path to a training checkpoint (.pt)")
-    p.add_argument("--split", default="val", choices=["train", "val"],
-                   help="Which data split to draw the sample from")
-    p.add_argument("--sample-index", type=int, default=0,
-                   help="Index of the sample within the split to plot")
+    p.add_argument("--split", default="val", choices=["train", "val", "test"],
+                   help="Which data split to draw the sample from. With --datetime it only "
+                        "selects which frame cache is used, so pass the split the date falls in")
+    p.add_argument("--datetime", nargs="+", default=None, metavar="DATETIME",
+                   help="Forecast anchor time t0 (UTC), e.g. 2024-03-05 02:30 or 20240305T0230 "
+                        "(quotes optional). "
+                        "The context ends at t0-10min and the first forecast frame is t0. "
+                        "Must fall on the frame grid. Mutually exclusive with --sample-index.")
+    p.add_argument("--sample-index", type=int, default=None,
+                   help="Index of the sample within the split to plot (default 0 when "
+                        "--datetime is not given)")
     p.add_argument("--irradiance-channel", type=int, default=None,
                    help="Channel to plot (default: data.irradiance_channel from the config, else 0)")
     p.add_argument("--sampler", default=None, choices=["pc", "ode"],
@@ -65,7 +81,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda")
     p.add_argument("--output", default="outputs/forecast.png")
     p.add_argument("--cmap", default="inferno")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.datetime is not None:
+        args.datetime = " ".join(args.datetime)
+    if args.datetime is not None and args.sample_index is not None:
+        p.error("--datetime and --sample-index are mutually exclusive")
+    return args
 
 
 def load_model_and_forecaster(checkpoint_path: str, device: str, num_steps, sampler):
@@ -115,13 +136,14 @@ def plotting_config(config: dict, step_minutes: int) -> dict:
     `data.n_post` is forced to cover the longest lead time in
     `FORECAST_OFFSETS_MIN`, regardless of what the checkpoint trained with --
     the dataloader reads frames straight off the archive/cache, so this is a
-    query-time choice, not a retraining one. Note that the truth row is then
+    query-time choice, not a retraining one. It only widens the *truth* window;
+    the model is still asked for its trained horizon per call. The truth row is
     a sparse selection out of that window, not every frame in it.
 
     The loader is also pinned to batch_size 1 and num_workers 0. Both matter
     for `--sample-index`: the training batch size would make the index count
-    batches of 32, and with workers > 0 the split is sharded across them and
-    the batches arrive interleaved, so "sample 3" would depend on the worker
+    batches, and with workers > 0 the split is sharded across them and the
+    batches arrive interleaved, so "sample 3" would depend on the worker
     count. At batch 1 with no workers the stream is exactly the split's own
     date order.
     """
@@ -145,7 +167,7 @@ def rollout(forecaster, context: torch.Tensor, n_frames: int, chunk: int) -> tor
     longer window in one call returns frames conditioned on random init. Only
     lead times the model was trained on are requested here; everything beyond
     them is reached by sliding the context window forward over the model's own
-    output, which is the trained one-step map applied repeatedly.
+    output, which is the trained map applied repeatedly.
 
     Errors compound across the rollout -- that is inherent to the trained
     horizon, not to this implementation.
@@ -172,14 +194,47 @@ def rollout(forecaster, context: torch.Tensor, n_frames: int, chunk: int) -> tor
 
 
 def fetch_sample(config: dict, split: str, sample_index: int):
-    """Pull one (context, target) pair from the pipeline."""
+    """Pull one (context, target) pair from the pipeline, and its anchor time."""
     loader = build_dataloader(split, config, shuffle=False, drop_last=False)
     for i, (context, target) in enumerate(loader):
         if i == sample_index:
-            return context, target
+            return context, target, loader.dataset.last_anchor
     raise IndexError(
         f"Split '{split}' yielded fewer than {sample_index + 1} usable samples."
     )
+
+
+def fetch_sample_at(config: dict, split: str, when: str, step_minutes: int):
+    """Pull the (context, target) pair anchored at a specific time."""
+    anchor = pd.Timestamp(when)
+    if anchor.tzinfo is not None:
+        anchor = anchor.tz_convert("UTC").tz_localize(None)
+    if anchor.minute % step_minutes or anchor.second or anchor.microsecond:
+        raise ValueError(
+            f"--datetime {when!r} is not on the {step_minutes}min frame grid "
+            f"(minute must be a multiple of {step_minutes})."
+        )
+    blocked = blocked_utc_hours(config["data"])
+    if anchor.hour in blocked:
+        raise ValueError(
+            f"{anchor:%Y-%m-%d %H:%M} UTC falls in data.skip_utc_hours (local night), "
+            f"where the irradiance field is absent."
+        )
+
+    stamp   = anchor.strftime("%Y%m%dT%H%M")
+    dataset = PipelineDataset(split, config)
+    pair    = dataset.sample_at(stamp, allow_missing_target=True)
+    if pair is None:
+        window = frame_times(stamp, dataset.context_length, 0, step_minutes)
+        bad    = [t for t in window if dataset.cache.exists(t)[1]]
+        detail = (f" Known-bad frames: {', '.join(bad)}." if bad else "")
+        raise ValueError(
+            f"Cannot forecast from {anchor:%Y-%m-%d %H:%M} UTC: a context frame "
+            f"({window[0]} .. {window[-1]}) is missing or NaN (e.g. before the archive "
+            f"starts, or a gap).{detail}"
+        )
+    context, target = pair
+    return context[None], target[None], stamp     # add the batch dimension
 
 
 def irradiance_stats(config: dict, channel: int) -> tuple[str, float, float]:
@@ -202,6 +257,7 @@ def plot_forecast(
     truth:   np.ndarray,   # (N_PANELS, H, W)
     pred:    np.ndarray,   # (N_PANELS, H, W)
     var_name: str,
+    anchor_label: str,
     cmap: str,
     output_path: str,
 ) -> None:
@@ -210,8 +266,9 @@ def plot_forecast(
     # colour, which hides exactly what the figure is for. The forecast is then
     # drawn on the same scale as the truth it is compared against, and anything
     # outside it saturates (visibly) rather than rescaling the panel.
+    # nan-aware: a truth frame the archive lacks is all-NaN and drawn blank.
     observed = np.concatenate([context, truth])
-    vmin, vmax = float(observed.min()), float(observed.max())
+    vmin, vmax = float(np.nanmin(observed)), float(np.nanmax(observed))
 
     fig, axes = plt.subplots(3, N_PANELS, figsize=(2.4 * N_PANELS, 7.5), constrained_layout=True)
 
@@ -229,12 +286,16 @@ def plot_forecast(
             ax.set_xticks([])
             ax.set_yticks([])
             sign = "+" if offsets[col] >= 0 else ""
-            ax.set_title(f"t{sign}{offsets[col]}min", fontsize=9)
+            no_data = np.isnan(frames[col]).all()
+            ax.set_title(f"t{sign}{offsets[col]}min" + ("\n(no data)" if no_data else ""),
+                         fontsize=9)
             if col == 0:
                 ax.set_ylabel(label, fontsize=12)
 
     fig.colorbar(im, ax=axes, shrink=0.8, label=var_name)
-    fig.suptitle("Irradiance forecast: context / truth / prediction", fontsize=14)
+    fig.suptitle(
+        f"Irradiance forecast: context / truth / prediction\nt0 = {anchor_label}", fontsize=14
+    )
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=150)
@@ -263,8 +324,15 @@ def main() -> None:
 
     plot_cfg = plotting_config(config, step_minutes)
 
-    logger.info("Fetching sample %d from split '%s'", args.sample_index, args.split)
-    context, target = fetch_sample(plot_cfg, args.split, args.sample_index)
+    if args.datetime is not None:
+        logger.info("Fetching sample anchored at %s", args.datetime)
+        context, target, anchor = fetch_sample_at(plot_cfg, args.split, args.datetime, step_minutes)
+    else:
+        index = args.sample_index or 0
+        logger.info("Fetching sample %d from split '%s'", index, args.split)
+        context, target, anchor = fetch_sample(plot_cfg, args.split, index)
+    anchor_label = f"{pd.Timestamp(anchor):%Y-%m-%d %H:%M} UTC"
+    logger.info("Forecast anchor t0 = %s", anchor_label)
 
     context_length = context.shape[1]
     if context_length < n_prior:
@@ -277,7 +345,7 @@ def main() -> None:
     chunk = args.forecast_chunk or int(config["data"].get("n_post", 1))
     n_calls = -(-n_forecast // chunk)     # ceil
     logger.info(
-        "Forecasting %d frames as %d call(s) of %d frame(s), %d integration steps each",
+        "Forecasting %d frames as %d call(s) of up to %d frame(s), %d integration steps each",
         n_forecast, n_calls, chunk, forecaster.num_steps,
     )
     if n_calls > 1:
@@ -302,7 +370,7 @@ def main() -> None:
 
     plot_forecast(
         context_np, truth_np, pred_np,
-        var_name=var_name, cmap=args.cmap, output_path=args.output,
+        var_name=var_name, anchor_label=anchor_label, cmap=args.cmap, output_path=args.output,
     )
 
 

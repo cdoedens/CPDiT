@@ -41,7 +41,7 @@ training:
   # otherwise forced stage 1 to a much smaller batch than stage 2.
   vae_max_frames: 3
 
-  max_epochs: 50
+  max_epochs: 20
   early_stopping:
     enabled: true
     patience: 5

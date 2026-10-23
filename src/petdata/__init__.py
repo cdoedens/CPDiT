@@ -498,6 +498,7 @@ class PipelineDataset(IterableDataset):
         )
 
         self.epoch = 0
+        self.last_anchor: Optional[str] = None   # anchor of the most recent yielded sample
 
         # Transparent cache. The namespace hashes the recipe, so a config change
         # lands in a fresh directory rather than serving stale tensors.
@@ -740,7 +741,40 @@ class PipelineDataset(IterableDataset):
             self.first_failed_anchor = None
             self._fail_warn_at = self.CONSECUTIVE_FAIL_WARN
             self.n_yielded += 1
+            self.last_anchor = stamp
             yield tensor[:self.context_length], tensor[self.context_length:]
+
+    def sample_at(
+        self, anchor: str, allow_missing_target: bool = False
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Build the (context, forecast) pair for one specific anchor date.
+
+        Bypasses the split's date range, sharding and stride -- it is for
+        inspecting a chosen time, not for training. Returns None when a context
+        frame is unusable (missing or NaN, e.g. at night).
+
+        With ``allow_missing_target`` an unusable *forecast* frame no longer
+        invalidates the sample: it comes back as an all-NaN frame. A forecast
+        needs only its context, so a gap in the truth should not stop one being
+        made -- the missing frame just has nothing to be compared against.
+        """
+        self._sat_pipe, self._bar_pipe = _build_frame_pipelines(self.config)
+        self._bar_memo = {}
+        if not allow_missing_target:
+            tensor = self._sample(anchor)
+            if tensor is None:
+                return None
+            return tensor[:self.context_length], tensor[self.context_length:]
+
+        stamps  = frame_times(anchor, self.context_length, self.forecast_length)
+        context = [self._frame(stamp) for stamp in stamps[:self.context_length]]
+        if any(frame is None for frame in context):
+            return None
+        target = [self._frame(stamp) for stamp in stamps[self.context_length:]]
+        target = [torch.full_like(context[0], float("nan")) if frame is None else frame
+                  for frame in target]
+        return torch.stack(context), torch.stack(target)
 
     def __iter__(self):
         stream = self._raw_stream()
