@@ -371,26 +371,44 @@ class LatentDiffusionTransformer(nn.Module):
         images:        torch.Tensor,   # (B, T, C, H, W)
         deterministic: bool = True,
         scaled:        bool = True,
+        vae_chunk:     Optional[int] = None,
     ) -> torch.Tensor:
-        """Encode a frame sequence to spatial latent maps: (B, T, LC, Hl, Wl)."""
+        """
+        Encode a frame sequence to spatial latent maps: (B, T, LC, Hl, Wl).
+
+        ``vae_chunk`` caps how many frames pass through the encoder at once.
+        Full-resolution activations dominate memory, so encoding every frame of
+        a large inference batch in one call can exhaust the GPU; the result is
+        identical either way. None encodes everything in one call.
+        """
         assert images.ndim == 5, f"Expected (B, T, C, H, W), got {images.shape}"
         B, T = images.shape[:2]
         flat = images.reshape(B * T, *images.shape[2:])
 
-        mu, logvar = self.vae.encode(flat)
+        if vae_chunk is None or vae_chunk >= flat.shape[0]:
+            mu, logvar = self.vae.encode(flat)
+        else:
+            parts = [self.vae.encode(c) for c in flat.split(vae_chunk)]
+            mu     = torch.cat([m for m, _ in parts])
+            logvar = torch.cat([lv for _, lv in parts])
         z = mu if deterministic else self.vae.reparameterize(mu, logvar)
 
         z = z.view(B, T, self.latent_channels, *z.shape[-2:])
         return self.scale_latents(z) if scaled else z
 
-    def decode_latents(self, latents: torch.Tensor, scaled: bool = True) -> torch.Tensor:
-        """Decode spatial latent maps to image frames: (B, T, C, H, W)."""
+    def decode_latents(self, latents: torch.Tensor, scaled: bool = True,
+                       vae_chunk: Optional[int] = None) -> torch.Tensor:
+        """Decode spatial latent maps to image frames: (B, T, C, H, W).
+        ``vae_chunk`` as in `encode_images`."""
         assert latents.ndim == 5, f"Expected (B, T, LC, Hl, Wl), got {latents.shape}"
         if scaled:
             latents = self.unscale_latents(latents)
         B, T    = latents.shape[:2]
         flat    = latents.reshape(B * T, *latents.shape[2:])
-        decoded = self.vae.decode(flat)
+        if vae_chunk is None or vae_chunk >= flat.shape[0]:
+            decoded = self.vae.decode(flat)
+        else:
+            decoded = torch.cat([self.vae.decode(c) for c in flat.split(vae_chunk)])
         return decoded.view(B, T, *decoded.shape[1:])
 
     def _encode_context(self, context_latents: torch.Tensor) -> torch.Tensor:
@@ -913,6 +931,7 @@ class LatentDiffusionTransformer(nn.Module):
         ode_method:         str   = "heun",
         clamp_value:        Optional[float] = 8.0,
         generator:          Optional[torch.Generator] = None,
+        vae_chunk:          Optional[int] = None,
     ) -> torch.Tensor:
         """
         Generate forecast frames by integrating the reverse process.
@@ -932,6 +951,8 @@ class LatentDiffusionTransformer(nn.Module):
             clamp_value: divergence guard on the latent iterate. Latents are
                 unit-scaled, so this sits far outside the data distribution and
                 only catches blow-ups.
+            vae_chunk: frames per VAE encoder/decoder call (see
+                `encode_images`). Set it for large inference batches.
 
         Returns:
             (B * num_samples, T_fcast, C, H, W)
@@ -945,7 +966,8 @@ class LatentDiffusionTransformer(nn.Module):
             context_images = context_images.repeat_interleave(num_samples, dim=0)
         B = context_images.shape[0]
 
-        context_latents = self.encode_images(context_images, deterministic=True)
+        context_latents = self.encode_images(context_images, deterministic=True,
+                                             vae_chunk=vae_chunk)
         encoded_context = self._encode_context(context_latents)
 
         shape = (
@@ -967,7 +989,7 @@ class LatentDiffusionTransformer(nn.Module):
                 clamp_value=clamp_value, generator=generator,
             )
 
-        return self.decode_latents(x)
+        return self.decode_latents(x, vae_chunk=vae_chunk)
 
     @torch.no_grad()
     def forecast_deterministic(

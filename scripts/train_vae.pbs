@@ -20,12 +20,17 @@ cd /home/548/cd3022/repos/CPDiT
 source hpc_setup.sh
 
 
-# Run training
-echo "Starting CPDiT VAE training..."
+# The model variant to train, e.g.
+#   qsub -v INPUTS=configs/inputs/bands_b03_b07_b13.yaml scripts/train_vae.pbs
+# Writes to <runs_root>/<variant>/stage1_vae/<run_id>/
+INPUTS="${INPUTS:?pass the variant: qsub -v INPUTS=configs/inputs/<variant>.yaml}"
 
-# To resume, append:
-#   --resume /scratch/er8/cd3022/CPDiT/testing_checkpoints/best_model.pt
+echo "Starting CPDiT VAE training for $INPUTS..."
+
+# To resume a run in its own directory, append:
+#   --resume <runs_root>/<variant>/stage1_vae/<run_id>/checkpoint_epoch_NNN.pt
 torchrun --nproc_per_node=4 -m src.training.train \
-    --config configs/train_vae_extension.yaml
+    --config configs/train_vae_extension.yaml \
+    --inputs "$INPUTS"
 
 echo "Training job completed!"

@@ -64,8 +64,7 @@ def main():
 
     old = old_sample(cfg, anchor)
     ds = P.PipelineDataset("train", cfg, shuffle=False)
-    ds._sat_pipe, ds._bar_pipe = P._build_frame_pipelines(cfg)
-    ds._bar_memo = {}
+    ds._open_pipelines()
     new = ds._sample(anchor)
 
     print(f"old {tuple(old.shape)}  new {None if new is None else tuple(new.shape)}", flush=True)

@@ -20,13 +20,18 @@ cd /home/548/cd3022/repos/CPDiT
 source hpc_setup.sh
 
 
-# Run training
-echo "Starting CPDiT DiT training..."
+# The model variant to train, e.g.
+#   qsub -v INPUTS=configs/inputs/bands_b03_b07_b13.yaml scripts/train_dit.pbs
+# Starts from that variant's latest stage-1 VAE and writes to
+#   <runs_root>/<variant>/stage2_dit/<run_id>/
+INPUTS="${INPUTS:?pass the variant: qsub -v INPUTS=configs/inputs/<variant>.yaml}"
+INIT_FROM="${INIT_FROM:-stage1_vae}"
 
-
+echo "Starting CPDiT DiT training for $INPUTS..."
 
 torchrun --nproc_per_node=1 -m src.training.train \
     --config configs/train_base.yaml \
-    --init-from /scratch/er8/cd3022/CPDiT/stage1_checkpoints/best_model.pt
+    --inputs "$INPUTS" \
+    --init-from "$INIT_FROM"
 
 echo "Training job completed!"

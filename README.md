@@ -146,7 +146,8 @@ and already has statistics in `combined_stats.json`.
 > no GPU:
 >
 > ```bash
-> python -m src.training.train --config configs/train_config.yaml --prime-cache
+> python -m src.training.train --config configs/train_base.yaml \
+>     --inputs configs/inputs/<variant>.yaml --prime-cache
 > ```
 >
 > Watch the summary line for a jump in `skipped: nan`. `solar_elevation` is
@@ -172,22 +173,52 @@ source hpc_setup.sh        # loads the pet/0.6.2 module on NCI Gadi
 
 ## Training
 
-Single GPU or CPU:
+### Model variants
+
+Models differ only in their input variables. Each variant is a small file in
+[configs/inputs/](configs/inputs/README.md) listing `himawari_vars`,
+`himawari_bands` and `barra_vars`, and nothing else. It is combined with a
+stage config at launch, so every variant shares the same geometry, data
+pipeline and training settings:
 
 ```bash
-python -m src.training.train --config configs/train_config.yaml
+python -m src.training.train --config configs/train_vae_extension.yaml \
+    --inputs configs/inputs/bands_b03_b07_b13.yaml
 ```
 
-Multi-GPU:
+The file stem is the variant name. `model.image_channels` is derived from the
+inputs, and a config whose channels have no statistics in `data.stats_path` is
+refused at load.
 
-```bash
-torchrun --nproc_per_node=4 -m src.training.train --config configs/train_config.yaml
+Every run writes to its own directory, so retraining never overwrites an
+earlier model's weights:
+
+```
+<training.runs_root>/<variant>/<stage_name>/<run_id>/
+    best_model.pt, checkpoint_epoch_*.pt
+    config.yaml       the fully resolved config
+    run_info.json     channels, git commit, command, job id, init_from,
+                      latent_scale, best metric, status
+    train.log
+<training.runs_root>/<variant>/<stage_name>/latest -> <run_id>
 ```
 
-Resume (restores optimiser, scheduler and epoch):
+`python scripts/list_runs.py [--variant V] [--stage S]` tabulates them.
+
+On PBS, the variant is passed with `-v`:
 
 ```bash
-python -m src.training.train --resume /path/to/checkpoint_epoch_050.pt
+qsub -v INPUTS=configs/inputs/bands_b03_b07_b13.yaml scripts/prime_cache.pbs
+qsub -v INPUTS=configs/inputs/bands_b03_b07_b13.yaml scripts/train_vae.pbs
+qsub -v INPUTS=configs/inputs/bands_b03_b07_b13.yaml scripts/train_dit.pbs
+```
+
+Multi-GPU is the same command under `torchrun --nproc_per_node=4`. To resume
+(restores optimiser, scheduler and epoch, in the same run directory):
+
+```bash
+python -m src.training.train --config <stage config> --inputs <inputs> \
+    --resume <run dir>/checkpoint_epoch_050.pt
 ```
 
 ### Training is staged, and the staging is not optional
@@ -197,28 +228,29 @@ the previous one's weights via `--init-from`, which takes **weights only** and
 begins a fresh run at epoch 0 — unlike `--resume`, which also restores optimiser
 moments and the LR schedule belonging to the run that produced the checkpoint.
 
+`--init-from <stage_name>` resolves to that stage's `latest/best_model.pt` for
+the **same variant**, so a stage can never pick up another variant's VAE (whose
+input layer has a different channel count). A checkpoint path also works.
+
 ```bash
-# 0. Is a latent model viable on this data at all? (see below)
-python scripts/check_vae_floor.py --config configs/train_config.yaml
+IN=configs/inputs/<variant>.yaml
 
 # 1. Train the VAE alone.
-python -m src.training.train --config configs/stage1_vae.yaml
-
-# ...then measure the latent scale and pin it in train_config.yaml.
-python scripts/measure_latent_scale.py --checkpoint .../stage1_checkpoints/best_model.pt
+python -m src.training.train --config configs/train_vae_extension.yaml --inputs $IN
 
 # 2. Train the diffusion model against the frozen VAE. This is the deliverable.
-python -m src.training.train --config configs/train_config.yaml \
-    --init-from .../stage1_checkpoints/best_model.pt
+#    model.latent_scale: auto measures this VAE's latent scale and pins it.
+python -m src.training.train --config configs/train_base.yaml --inputs $IN \
+    --init-from stage1_vae
 
 # 3. OPTIONAL: fine-tune the VAE jointly with the nowcast. Ships only if it
 #    beats stage 2's forecast_rmse under an identical sampler and val subset.
-python -m src.training.train --config configs/stage3_joint.yaml \
-    --init-from .../testing_checkpoints/best_model.pt
+python -m src.training.train --config configs/train_joint_extension.yaml --inputs $IN \
+    --init-from stage2_dit
 ```
 
 Stage configs use `extends:` to overlay a handful of keys onto
-`train_config.yaml`, so the data pipeline, geometry and HPC block cannot drift
+`train_base.yaml`, so the data pipeline, geometry and HPC block cannot drift
 between stages.
 
 ### Why the VAE is pretrained rather than trained jointly
@@ -265,10 +297,16 @@ it — the running-statistics analogue of Stable Diffusion's fixed `0.18215`. Th
 value is logged each epoch as `Latent scale (EMA std)`, alongside the
 `true/assumed std ratio` that says whether it is actually keeping up.
 
-For stage 2 this must be **pinned, not tracked**: run
-`scripts/measure_latent_scale.py` on the stage-1 checkpoint and put the result in
-`model.latent_scale`. An EMA is a moving target, and while the VAE is frozen
-there is nothing left to track anyway.
+For stage 2 this must be **pinned, not tracked**: an EMA is a moving target, and
+while the VAE is frozen there is nothing left to track anyway. With
+`model.latent_scale: auto` (the default in `train_base.yaml`) stage 2 measures
+the latent std of the VAE it is initialised from, over
+`training.latent_scale_batches` batches per rank, and pins it. Every variant
+has its own VAE and therefore its own scale, so a single number in a shared
+config would be right for at most one of them. The measured value is logged,
+recorded in `run_info.json`, and embedded in checkpoints in place of `auto`.
+A number pins a value by hand; `scripts/measure_latent_scale.py` makes the same
+measurement standalone.
 
 `latent_scale_momentum` matters whenever the encoder is trainable. Measured on a
 moving encoder: **0.99 left the buffer 15-40% behind the true std, while 0.9
@@ -342,14 +380,17 @@ and early stopping would silently never fire.
 
 ## Configuration
 
-[configs/train_config.yaml](configs/train_config.yaml) is the single source of
-truth, and every key in it is read by the code. The stage configs overlay it:
+[configs/train_base.yaml](configs/train_base.yaml) is the single source of
+truth, and every key in it is read by the code. The stage configs overlay it,
+and an inputs file from [configs/inputs/](configs/inputs/README.md) supplies the
+input variables:
 
 | Config | Stage | Overrides |
 |---|---|---|
-| [train_config.yaml](configs/train_config.yaml) | 2 — diffusion, frozen VAE | the base; everything else `extends:` it |
-| [stage1_vae.yaml](configs/stage1_vae.yaml) | 1 — VAE alone | `diffusion_loss_weight: 0`, weaker KL, `monitor: recon_loss` |
-| [stage3_joint.yaml](configs/stage3_joint.yaml) | 3 — joint fine-tune | `detach_latents: false` + both guards, `vae_lr_mult: 0.1` |
+| [train_base.yaml](configs/train_base.yaml) | 2 — diffusion, frozen VAE | the base; everything else `extends:` it |
+| [train_vae_extension.yaml](configs/train_vae_extension.yaml) | 1 — VAE alone | `diffusion_loss_weight: 0`, weaker KL, `monitor: recon_loss` |
+| [train_joint_extension.yaml](configs/train_joint_extension.yaml) | 3 — joint fine-tune | `detach_latents: false` + both guards, `vae_lr_mult: 0.1` |
+| [inputs/*.yaml](configs/inputs/README.md) | — | the model variant: input variables only |
 | [smoke.yaml](configs/smoke.yaml) / [smoke2.yaml](configs/smoke2.yaml) / [smoke3.yaml](configs/smoke3.yaml) | — | the same three stages over ~19 cached days, for exercising the whole loop in minutes |
 
 The smoke chain is the fastest way to confirm a change has not broken anything
@@ -402,7 +443,7 @@ evaluation:
   max_val_batches: 200            # the val split is otherwise as large as train
 ```
 
-Values above track [configs/train_config.yaml](configs/train_config.yaml); it is
+Values above track [configs/train_base.yaml](configs/train_base.yaml); it is
 the source of truth if they ever drift.
 
 ## Testing

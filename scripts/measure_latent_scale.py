@@ -3,9 +3,13 @@ Measure the VAE latent standard deviation, for pinning `model.latent_scale`.
 
 Where this sits in the workflow
 -------------------------------
-    stage 1  train the VAE alone          configs/stage1_vae.yaml
+    stage 1  train the VAE alone          configs/train_vae_extension.yaml
     THIS     measure the latent std  -->  paste into model.latent_scale
-    stage 2  train the diffusion model    configs/train_config.yaml
+    stage 2  train the diffusion model    configs/train_base.yaml
+
+With `model.latent_scale: auto` (the default in train_base.yaml) stage 2 makes
+this same measurement itself, on the VAE it is initialised from, so this
+script is only needed to inspect a VAE or to pin a value by hand.
 
 Why it has to be pinned rather than tracked
 -------------------------------------------
@@ -101,7 +105,7 @@ def main() -> None:
     logger.info("Latent std:  %.6f", std)
     logger.info("EMA value carried in the checkpoint: %.6f",
                 float(model.latent_std))
-    print("\nSet this in configs/train_config.yaml for stage 2:\n")
+    print("\nTo pin it by hand instead of model.latent_scale: auto:\n")
     print(f"model:\n  latent_scale: {std:.6g}\n")
 
     if abs(mean) > 0.5 * std:

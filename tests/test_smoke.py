@@ -757,7 +757,8 @@ class ConfigStageTests(unittest.TestCase):
         self.root = Path(self._dir.name)
         # A real stats file has to exist; _validate checks the path.
         stats = self.root / "stats.json"
-        stats.write_text(json.dumps({"surface_global_irradiance": {"mean": 0.0, "std": 1.0}}))
+        stats.write_text(json.dumps({v: {"mean": 0.0, "std": 1.0} for v in (
+            "surface_global_irradiance", "solar_elevation", "RH24mean", "OBS_B13")}))
         self.base = {
             "model": {
                 "image_channels": 3, "image_size": 256, "latent_channels": 4,
@@ -766,7 +767,9 @@ class ConfigStageTests(unittest.TestCase):
                               "num_heads": 12, "window_size": 15},
             },
             "data": {"n_prior_sat": 12, "n_post": 1,
-                     "stats_path": str(stats), "splits": {}},
+                     "stats_path": str(stats), "splits": {},
+                     "himawari_vars": ["surface_global_irradiance", "solar_elevation"],
+                     "barra_vars": ["RH24mean"]},
             "training": {"checkpoint_dir": str(self.root / "ckpt"),
                          "log_dir": str(self.root / "logs")},
             "optimiser": {"lr": 1e-4},
@@ -909,31 +912,54 @@ class ShippedConfigTests(unittest.TestCase):
     """The three stage configs in configs/ must load and mean what they say."""
 
     CONFIGS = Path(__file__).resolve().parent.parent / "configs"
+    INPUTS = CONFIGS / "inputs"
 
-    def _load(self, name):
+    def _load(self, name, inputs="baseline.yaml"):
         from src.training.config import load_config
         path = self.CONFIGS / name
         if not path.exists():
             self.skipTest(f"{path} not present")
         try:
-            return load_config(path)
+            return load_config(path, inputs=self.INPUTS / inputs)
         except FileNotFoundError as exc:      # data.stats_path lives on /scratch
             self.skipTest(f"config references a path unavailable here: {exc}")
 
     def test_all_three_stage_configs_load(self):
-        for name in ("train_config.yaml", "stage1_vae.yaml", "stage3_joint.yaml",
-                     "smoke.yaml", "smoke2.yaml"):
+        for name in ("train_base.yaml", "train_vae_extension.yaml",
+                     "train_joint_extension.yaml"):
             with self.subTest(config=name):
-                self.assertIn("model", self._load(name))
+                cfg = self._load(name)
+                self.assertEqual(cfg["model"]["image_channels"], 3)
+                self.assertEqual(cfg["run"]["variant"], "baseline")
+
+    def test_every_inputs_file_is_a_valid_variant(self):
+        from src.training.config import load_config, channel_names
+        for path in sorted(self.INPUTS.glob("*.yaml")):
+            with self.subTest(inputs=path.name):
+                try:
+                    # Statistics are checked separately: a new variant's are
+                    # computed after its inputs file is written.
+                    cfg = load_config(self.CONFIGS / "train_base.yaml", inputs=path,
+                                      require_stats=False)
+                except FileNotFoundError as exc:
+                    self.skipTest(f"config references a path unavailable here: {exc}")
+                self.assertEqual(cfg["model"]["image_channels"], len(channel_names(cfg)))
+                self.assertEqual(channel_names(cfg)[cfg["data"].get("irradiance_channel", 0)],
+                                 "surface_global_irradiance")
+
+    def test_each_stage_writes_to_its_own_stage_directory(self):
+        stages = {self._load(n)["training"]["stage_name"] for n in (
+            "train_base.yaml", "train_vae_extension.yaml", "train_joint_extension.yaml")}
+        self.assertEqual(stages, {"stage1_vae", "stage2_dit", "stage3_joint"})
 
     def test_stage1_trains_the_vae_alone(self):
-        t = self._load("stage1_vae.yaml")["training"]
+        t = self._load("train_vae_extension.yaml")["training"]
         self.assertGreater(t["vae_loss_weight"], 0.0)
         self.assertEqual(t["diffusion_loss_weight"], 0.0)
         self.assertFalse(t["freeze_vae"])
 
     def test_stage2_freezes_the_vae_and_detaches(self):
-        cfg = self._load("train_config.yaml")
+        cfg = self._load("train_base.yaml")
         t = cfg["training"]
         self.assertEqual(t["vae_loss_weight"], 0.0)
         self.assertGreater(t["diffusion_loss_weight"], 0.0)
@@ -941,9 +967,11 @@ class ShippedConfigTests(unittest.TestCase):
         self.assertTrue(t["detach_latents"])
         # The metric that actually reflects forecast skill.
         self.assertEqual(t["early_stopping"]["monitor"], "forecast_rmse")
+        # Measured per variant, never inherited from another variant's VAE.
+        self.assertEqual(cfg["model"]["latent_scale"], "auto")
 
     def test_stage3_pairs_the_joint_gradient_with_both_safeguards(self):
-        cfg = self._load("stage3_joint.yaml")
+        cfg = self._load("train_joint_extension.yaml")
         self.assertFalse(cfg["training"]["detach_latents"])
         # Neither guard is optional when the diffusion gradient reaches the encoder.
         self.assertEqual(cfg["model"]["latent_norm"], "batch")
@@ -1222,7 +1250,8 @@ class CompileSettingsTests(unittest.TestCase):
         root = Path(self._dir.name)
         stats = root / "stats.json"
         stats.write_text(json.dumps(
-            {"surface_global_irradiance": {"mean": 0.0, "std": 1.0}}
+            {"surface_global_irradiance": {"mean": 0.0, "std": 1.0},
+             "RH24mean": {"mean": 0.0, "std": 1.0}}
         ))
         # Small enough to build in a second; the geometry is irrelevant here,
         # only the compile call is under test.
@@ -1237,7 +1266,9 @@ class CompileSettingsTests(unittest.TestCase):
                               "use_natten": False},
             },
             "data": {"n_prior_sat": 3, "n_post": 1,
-                     "stats_path": str(stats), "splits": {}},
+                     "stats_path": str(stats), "splits": {},
+                     "himawari_vars": ["surface_global_irradiance"],
+                     "barra_vars": ["RH24mean"]},
             "training": {"checkpoint_dir": str(root / "ckpt"),
                          "log_dir": str(root / "logs"),
                          "compile_model": True},
@@ -1806,6 +1837,40 @@ class TrainerStageWiringTests(unittest.TestCase):
         t.init_from(path)
         self.assertAlmostEqual(float(t._get_inner_model().latent_std), 0.42, places=6)
 
+    def test_auto_latent_scale_is_measured_from_the_loaded_vae_and_pinned(self):
+        """
+        `latent_scale: auto` measures the VAE stage 2 is initialised from, pins
+        it for the whole run, and writes the number -- not "auto" -- into the
+        config that checkpoints embed and inference rebuilds the model from.
+        """
+        import tempfile
+        from pathlib import Path
+
+        donor = self._trainer(training={"vae_loss_weight": 1.0,
+                                        "diffusion_loss_weight": 0.0})
+        path = Path(tempfile.mkdtemp()) / "stage1.pt"
+        torch.save({"epoch": 3,
+                    "model_state_dict": donor._get_inner_model().state_dict()}, path)
+
+        t = self._trainer(model={"latent_scale": "auto"},
+                          training={"freeze_vae": True, "diffusion_loss_weight": 1.0,
+                                    "latent_scale_batches": 2})
+        inner = t._get_inner_model()
+        self.assertTrue(inner.latent_scale_fixed)
+        t.train(init_from=str(path))
+
+        scale = t.config["model"]["latent_scale"]
+        self.assertIsInstance(scale, float)
+        self.assertGreater(scale, 0.0)
+        # Pinned: a training epoch must not have moved it.
+        self.assertAlmostEqual(float(inner.latent_std), scale, places=5)
+
+    def test_auto_latent_scale_without_a_vae_to_measure_is_refused(self):
+        t = self._trainer(model={"latent_scale": "auto"},
+                          training={"freeze_vae": True, "diffusion_loss_weight": 1.0})
+        with self.assertRaisesRegex(ValueError, "init-from"):
+            t.train()
+
 
 class EmptyValidationTests(unittest.TestCase):
     """
@@ -2215,3 +2280,312 @@ class FrameCacheKeyTests(unittest.TestCase):
         self.assertNotEqual(base, _petdata._cache_namespace(self._cfg(crop_offset=0)))
         self.assertNotEqual(base, _petdata._cache_namespace(
             self._cfg(bounds=[-34, -29, 146, 151])))
+
+
+@unittest.skipIf(
+    _petdata is None,
+    f"src.petdata needs pyearthtools ({_PETDATA_IMPORT_ERROR})",
+)
+class HimawariBandTests(unittest.TestCase):
+    """Raw AHI bands: channel layout, cache keying, and the native-grid regrid."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.stats = os.path.join(self.tmp.name, "stats.json")
+        self._write_stats({"surface_global_irradiance": {"mean": 1.0, "std": 2.0}})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_stats(self, stats):
+        with open(self.stats, "w") as f:
+            json.dump(stats, f)
+
+    def _cfg(self, **data):
+        cfg = {
+            "model": {"image_size": 256},
+            "data": {"himawari_vars": ["surface_global_irradiance"],
+                     "barra_vars": ["RH24mean"], "bounds": [-35, -28.5, 145, 151.5],
+                     "crop_offset": 10, "n_prior_sat": 3, "n_post": 1,
+                     "sat_timestep": "10 minutes", "stats_path": self.stats},
+            "dataloader": {},
+        }
+        cfg["data"].update(data)
+        return cfg
+
+    def test_bands_sit_between_satellite_and_barra_channels(self):
+        names = _petdata.channel_names(self._cfg(himawari_bands=["OBS_B13", "OBS_B03"]))
+        self.assertEqual(names, ["surface_global_irradiance", "OBS_B13", "OBS_B03", "RH24mean"])
+
+    def test_groups_split_by_resolution_and_product(self):
+        groups = _petdata.band_groups(["OBS_B13", "OBS_B03", "OBS_B07", "BRF_B03", "OBS_B01"])
+        self.assertEqual(groups, [["OBS_B13", "OBS_B07"], ["OBS_B03"], ["BRF_B03"], ["OBS_B01"]])
+
+    def test_no_bands_keeps_the_existing_cache(self):
+        # Neither an empty band list nor band statistics added to the shared
+        # stats file may move a band-free config into a new namespace.
+        base = _petdata._cache_namespace(self._cfg())
+        self.assertEqual(base, _petdata._cache_namespace(self._cfg(himawari_bands=[])))
+        self._write_stats({"surface_global_irradiance": {"mean": 1.0, "std": 2.0},
+                           "OBS_B13": {"mean": 260.0, "std": 20.0}})
+        self.assertEqual(base, _petdata._cache_namespace(self._cfg()))
+
+    def test_bands_and_their_stats_are_part_of_the_key(self):
+        self._write_stats({"surface_global_irradiance": {"mean": 1.0, "std": 2.0},
+                           "OBS_B13": {"mean": 260.0, "std": 20.0}})
+        base = _petdata._cache_namespace(self._cfg())
+        with_band = _petdata._cache_namespace(self._cfg(himawari_bands=["OBS_B13"]))
+        self.assertNotEqual(base, with_band)
+        self._write_stats({"surface_global_irradiance": {"mean": 1.0, "std": 2.0},
+                           "OBS_B13": {"mean": 250.0, "std": 20.0}})
+        self.assertNotEqual(with_band, _petdata._cache_namespace(
+            self._cfg(himawari_bands=["OBS_B13"])))
+
+    def test_channel_count_mismatch_fails_at_construction(self):
+        cfg = self._cfg(himawari_bands=["OBS_B13"])
+        cfg["model"]["image_channels"] = 2
+        with self.assertRaisesRegex(ValueError, "image_channels"):
+            _petdata.PipelineDataset("train", cfg)
+        cfg["model"]["image_channels"] = 3
+        _petdata.PipelineDataset("train", cfg)
+
+    def test_band_variable_lookup(self):
+        import xarray as xr
+        ds = xr.Dataset({"channel_0013_brightness_temperature": ("x", [1.0]),
+                         "channel_0003_scaled_radiance": ("x", [1.0])})
+        self.assertEqual(_petdata._band_variable(ds, "OBS_B13"),
+                         "channel_0013_brightness_temperature")
+        with self.assertRaises(_petdata.petdata.exceptions.DataNotFoundError):
+            _petdata._band_variable(ds, "OBS_B07")
+
+    # -- regrid ------------------------------------------------------------ #
+
+    _PROJ4 = "+proj=geos +lon_0=140.7 +h=35785863 +x_0=0 +y_0=0 +a=6378137 +b=6356752.3 +units=m +no_defs"
+
+    @staticmethod
+    def _native(res: int, field):
+        """A band on the AHI fixed grid at `res` metres, valued field(x, y)."""
+        import dask.array as dsa
+        import numpy as np
+        import xarray as xr
+        n = 11_000_000 // res
+        x = -5_500_000 + res / 2 + res * np.arange(n)
+        y = 5_500_000 - res / 2 - res * np.arange(n)
+        # Lazy, like the archive: only the box under the model grid is computed.
+        xx = dsa.from_array(x, chunks=2000)[None, :]
+        yy = dsa.from_array(y, chunks=2000)[:, None]
+        return xr.DataArray(field(xx, yy), dims=("y", "x"), coords={"x": x, "y": y})
+
+    def _grid(self):
+        import numpy as np
+        return np.linspace(-31.0, -30.0, 26), np.linspace(147.0, 148.0, 26)
+
+    def test_samples_the_native_pixel_under_each_model_pixel(self):
+        import numpy as np
+        import pyproj
+        lat, lon = self._grid()
+        # Value = the 2 km pixel's own (column, row), kept small enough to be
+        # exact in float32, so the answer is exact.
+        code = lambda x, y: (np.floor((x + 5.5e6) / 2000) % 1000 * 1000
+                             + np.floor((5.5e6 - y) / 2000) % 1000)
+        out = _petdata.BandRegridder(lat, lon)(self._native(2000, code), self._PROJ4)
+        tr = pyproj.Transformer.from_crs("EPSG:4326", pyproj.CRS.from_proj4(self._PROJ4),
+                                         always_xy=True)
+        LAT, LON = np.meshgrid(lat, lon, indexing="ij")
+        px, py = tr.transform(LON, LAT)
+        np.testing.assert_array_equal(out, code(px, py))
+
+    def test_fine_bands_are_block_averaged_onto_the_2km_cells(self):
+        import numpy as np
+        lat, lon = self._grid()
+        regrid = _petdata.BandRegridder(lat, lon)
+        # A field linear in x and y: the mean of the 4x4 500 m pixels in a
+        # 2 km cell is the field at that cell's centre, i.e. the 2 km value.
+        field = lambda x, y: 1e-6 * x + 3e-6 * y
+        coarse = regrid(self._native(2000, field), self._PROJ4)
+        fine = regrid(self._native(500, field), self._PROJ4)
+        np.testing.assert_allclose(fine, coarse, atol=1e-4)
+
+
+class InputsFileTests(unittest.TestCase):
+    """A model variant is an inputs file: input variables and nothing else."""
+
+    def setUp(self):
+        import yaml
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+        stats = self.root / "stats.json"
+        stats.write_text(json.dumps({v: {"mean": 0.0, "std": 1.0} for v in (
+            "surface_global_irradiance", "solar_elevation", "RH24mean", "OBS_B13")}))
+        base = {
+            "model": {"image_size": 256, "latent_channels": 4, "hidden_dim": 128,
+                      "diffusion": {"patch_size": 2, "embed_dim": 768,
+                                    "num_heads": 12, "window_size": 15}},
+            "data": {"n_prior_sat": 12, "n_post": 1,
+                     "stats_path": str(stats), "splits": {}},
+            "training": {"runs_root": str(self.root / "runs"), "stage_name": "stage1_vae"},
+            "optimiser": {"lr": 1e-4},
+            "logging": {},
+        }
+        (self.root / "base.yaml").write_text(yaml.safe_dump(base))
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def _inputs(self, name, payload):
+        import yaml
+        path = self.root / name
+        path.write_text(yaml.safe_dump(payload))
+        return path
+
+    def _load(self, inputs, **kw):
+        from src.training.config import load_config
+        return load_config(self.root / "base.yaml", inputs=inputs, **kw)
+
+    def test_inputs_set_the_channels_and_name_the_variant(self):
+        cfg = self._load(self._inputs("bands.yaml", {"data": {
+            "himawari_vars": ["surface_global_irradiance"],
+            "himawari_bands": ["OBS_B13"], "barra_vars": ["RH24mean"]}}))
+        self.assertEqual(cfg["model"]["image_channels"], 3)
+        self.assertEqual(cfg["run"]["variant"], "bands")
+
+    def test_an_inputs_file_states_the_complete_set(self):
+        # Omitted keys are empty, not inherited -- otherwise a variant's inputs
+        # would depend on what the stage config happened to list.
+        cfg = self._load(self._inputs("irr.yaml", {"data": {
+            "himawari_vars": ["surface_global_irradiance"]}}))
+        self.assertEqual(cfg["data"]["barra_vars"], [])
+        self.assertEqual(cfg["model"]["image_channels"], 1)
+
+    def test_anything_but_input_variables_is_rejected(self):
+        for payload in ({"data": {"himawari_vars": ["surface_global_irradiance"],
+                                  "bounds": [0, 1, 0, 1]}},
+                        {"data": {"himawari_vars": ["surface_global_irradiance"]},
+                         "training": {"max_epochs": 3}}):
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(KeyError, "may only set"):
+                    self._load(self._inputs("bad.yaml", payload))
+
+    def test_a_stated_channel_count_must_match_the_inputs(self):
+        import yaml
+        base = yaml.safe_load((self.root / "base.yaml").read_text())
+        base["model"]["image_channels"] = 5
+        (self.root / "base.yaml").write_text(yaml.safe_dump(base))
+        with self.assertRaisesRegex(ValueError, "image_channels"):
+            self._load(self._inputs("irr.yaml", {"data": {
+                "himawari_vars": ["surface_global_irradiance"]}}))
+
+    def test_missing_statistics_are_caught_at_load(self):
+        path = self._inputs("b07.yaml", {"data": {
+            "himawari_vars": ["surface_global_irradiance"], "himawari_bands": ["OBS_B07"]}})
+        with self.assertRaisesRegex(KeyError, "OBS_B07"):
+            self._load(path)
+        # ...except for the scripts that compute them.
+        self.assertEqual(self._load(path, require_stats=False)["model"]["image_channels"], 2)
+
+    def test_no_inputs_at_all_is_rejected(self):
+        from src.training.config import load_config
+        with self.assertRaisesRegex(KeyError, "--inputs"):
+            load_config(self.root / "base.yaml")
+
+    def test_latent_scale_accepts_only_numbers_null_or_auto(self):
+        import yaml
+        base = yaml.safe_load((self.root / "base.yaml").read_text())
+        base["model"]["latent_scale"] = "measured"
+        (self.root / "base.yaml").write_text(yaml.safe_dump(base))
+        with self.assertRaisesRegex(ValueError, "latent_scale"):
+            self._load(self._inputs("irr.yaml", {"data": {
+                "himawari_vars": ["surface_global_irradiance"]}}))
+
+
+class RunDirectoryTests(unittest.TestCase):
+    """Every run gets its own directory, and stages chain within a variant."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.root = Path(self._dir.name)
+
+    def tearDown(self):
+        import logging
+        # start_run attaches a file handler to the root logger.
+        for h in list(logging.getLogger().handlers):
+            if isinstance(h, logging.FileHandler) and str(self.root) in h.baseFilename:
+                logging.getLogger().removeHandler(h)
+                h.close()
+        self._dir.cleanup()
+
+    def _config(self, variant="bands", stage="stage1_vae", **training):
+        return {"run": {"variant": variant, "config": "x.yaml"},
+                "data": {"himawari_vars": ["surface_global_irradiance"]},
+                "training": {"runs_root": str(self.root), "stage_name": stage, **training}}
+
+    def _start(self, cfg, **kw):
+        from src.training import runs
+        run_dir = runs.prepare_run_dir(cfg, resume=kw.get("resume"))
+        runs.start_run(run_dir, cfg, **kw)
+        return run_dir
+
+    def test_runs_are_laid_out_by_variant_and_stage_and_never_shared(self):
+        from src.training import runs
+        a = runs.prepare_run_dir(self._config())
+        self.assertEqual(a.parent, self.root / "bands" / "stage1_vae")
+        a.mkdir(parents=True)
+        b = runs.prepare_run_dir(self._config())
+        self.assertNotEqual(a, b)
+
+    def test_a_run_records_its_config_and_provenance(self):
+        import yaml
+        run_dir = self._start(self._config())
+        info = json.loads((run_dir / "run_info.json").read_text())
+        self.assertEqual((info["variant"], info["stage"], info["status"]),
+                         ("bands", "stage1_vae", "running"))
+        self.assertEqual(info["channels"], ["surface_global_irradiance", "RH24mean"])
+        self.assertIn("commit", info["git"])
+        self.assertEqual(yaml.safe_load((run_dir / "config.yaml").read_text())["run"]["variant"],
+                         "bands")
+        self.assertTrue((run_dir / "train.log").exists())
+
+    def test_latest_follows_the_newest_run_and_init_from_resolves_it(self):
+        from src.training import runs
+        first = self._start(self._config())
+        second = self._start(self._config())
+        latest = self.root / "bands" / "stage1_vae" / "latest"
+        self.assertEqual(latest.resolve(), second.resolve())
+        (second / "best_model.pt").write_bytes(b"")
+        stage2 = self._config(stage="stage2_dit")
+        self.assertEqual(runs.resolve_init_from("stage1_vae", stage2),
+                         (second / "best_model.pt").resolve())
+        self.assertNotEqual(first, second)
+
+    def test_init_from_never_crosses_variants(self):
+        from src.training import runs
+        run_dir = self._start(self._config(variant="bands"))
+        (run_dir / "best_model.pt").write_bytes(b"")
+        with self.assertRaisesRegex(FileNotFoundError, "baseline"):
+            runs.resolve_init_from("stage1_vae", self._config(variant="baseline",
+                                                              stage="stage2_dit"))
+
+    def test_resume_continues_in_the_checkpoints_own_directory(self):
+        from src.training import runs
+        run_dir = self._start(self._config())
+        ckpt = run_dir / "checkpoint_epoch_005.pt"
+        ckpt.write_bytes(b"")
+        self._start(self._config(), resume=str(ckpt), link_latest=False)
+        self.assertEqual(runs.prepare_run_dir(self._config(), resume=str(ckpt)), run_dir.resolve())
+        info = json.loads((run_dir / "run_info.json").read_text())
+        self.assertEqual(len(info["resumes"]), 1)
+        self.assertEqual(info["run_id"], run_dir.name)
+
+    def test_progress_is_merged_into_run_info(self):
+        from src.training import runs
+        run_dir = self._start(self._config())
+        runs.update_run_info(run_dir, best_metric={"recon_loss": 0.5}, best_epoch=2)
+        runs.update_run_info(run_dir, status="finished")
+        info = json.loads((run_dir / "run_info.json").read_text())
+        self.assertEqual((info["best_epoch"], info["status"]), (2, "finished"))
+        self.assertEqual(info["variant"], "bands")
+
+    def test_an_explicit_checkpoint_dir_is_used_as_is(self):
+        from src.training import runs
+        fixed = self.root / "fixed"
+        self.assertEqual(runs.prepare_run_dir(self._config(checkpoint_dir=str(fixed))), fixed)

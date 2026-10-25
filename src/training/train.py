@@ -32,11 +32,17 @@ from src.models import LatentDiffusionTransformer
 from src.petdata import build_dataloader
 
 from .config import load_config
+from .runs import (
+    BEST_CHECKPOINT_NAME,
+    prepare_run_dir,
+    resolve_init_from,
+    start_run,
+    update_run_info,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BEST_CHECKPOINT_NAME = "best_model.pt"
 
 
 class Trainer:
@@ -47,9 +53,12 @@ class Trainer:
     `training.diffusion_loss_weight`, `training.freeze_vae` and
     `training.detach_latents` select which stage this run is:
 
-        stage 1  configs/stage1_vae.yaml     VAE alone
-        stage 2  configs/train_config.yaml   diffusion, frozen VAE
-        stage 3  configs/stage3_joint.yaml   joint fine-tune, both guards on
+        stage 1  configs/train_vae_extension.yaml     VAE alone
+        stage 2  configs/train_base.yaml              diffusion, frozen VAE
+        stage 3  configs/train_joint_extension.yaml   joint fine-tune, both guards on
+
+    Each is combined with an inputs file (configs/inputs/*.yaml) naming the
+    model variant; see src/training/runs.py for where each run is written.
 
     The staging is not stylistic. The diffusion objective reduces to
     epsilon-MSE, so an encoder that is free to shrink `mu` towards zero can
@@ -73,7 +82,11 @@ class Trainer:
         data_cfg        = config["data"]
 
         self.gradient_clip_norm = training_cfg.get("gradient_clip_norm", 1.0)
-        self.checkpoint_dir     = Path(training_cfg["checkpoint_dir"])
+        # Set by main() to this run's directory. Absent only for --benchmark,
+        # which writes nothing.
+        self.checkpoint_dir     = (Path(training_cfg["checkpoint_dir"])
+                                   if training_cfg.get("checkpoint_dir") else None)
+        self.run_dir            = self.checkpoint_dir
         self.save_every         = training_cfg.get("save_every_n_epochs", 5)
         self.keep_last_n        = training_cfg.get("keep_last_n_checkpoints", 3)
         self.vae_beta           = training_cfg.get("vae_beta", 0.01)
@@ -114,9 +127,11 @@ class Trainer:
 
         self._set_seed(training_cfg.get("seed", 42))
 
-        if self.is_primary:
+        self.latent_scale_auto     = model_cfg.get("latent_scale") == "auto"
+        self.latent_scale_batches  = int(training_cfg.get("latent_scale_batches", 32))
+
+        if self.is_primary and self.checkpoint_dir is not None:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            Path(training_cfg["log_dir"]).mkdir(parents=True, exist_ok=True)
 
         # ── Build model ────────────────────────────────────────────────────
         self.model = LatentDiffusionTransformer(
@@ -149,10 +164,17 @@ class Trainer:
             t_eps                  = diffusion_cfg.get("t_eps", None),
             loss_weighting         = diffusion_cfg.get("loss_weighting", "sigma2"),
             time_scale             = diffusion_cfg.get("time_scale", 1000.0),
-            latent_scale           = model_cfg.get("latent_scale", None),
+            # "auto" is measured from the loaded VAE in train(); see
+            # _measure_latent_scale.
+            latent_scale           = (None if self.latent_scale_auto
+                                      else model_cfg.get("latent_scale", None)),
             latent_scale_momentum  = model_cfg.get("latent_scale_momentum", 0.99),
             latent_norm            = model_cfg.get("latent_norm", "ema"),
         ).to(device)
+        if self.latent_scale_auto:
+            # Pinned from the start, so the EMA never moves it; the value is
+            # filled in by train() before the first (compiled) forward.
+            self.model.latent_scale_fixed = True
 
         # Freeze before the optimiser is built: AdamW below filters on
         # requires_grad, so this ordering is what keeps frozen VAE parameters
@@ -332,7 +354,12 @@ class Trainer:
             logger.info("Precision: %s", precision)
 
         logging_cfg         = config.get("logging", {})
-        self.run_name       = logging_cfg.get("project_name", "baseline")
+        run                 = config.get("run", {})
+        # variant/stage/run_id when there is a run directory, so a tracked
+        # run can be matched to the weights it produced.
+        self.run_name       = ("/".join(str(run[k]) for k in ("variant", "run_id"))
+                               if run.get("variant") and run.get("run_id")
+                               else logging_cfg.get("project_name", "baseline"))
         self.mlflow_enabled = HAS_MLFLOW and self.is_primary
         if self.mlflow_enabled:
             mlflow.set_tracking_uri(config.get("tracking_uri", "http://localhost:5000"))
@@ -896,6 +923,57 @@ class Trainer:
             if unexpected:
                 logger.info("  unexpected (ignored): %s", sorted(unexpected)[:8])
 
+    def _measure_latent_scale(self, loader: DataLoader, max_batches: int) -> float:
+        """
+        Pooled std of the VAE's latent means over `max_batches` batches per
+        rank, all-reduced so every rank pins the same value.
+
+        The same statistic as scripts/measure_latent_scale.py, measured in the
+        run that needs it, so each variant's stage 2 is scaled for its own VAE
+        rather than whichever VAE a number in a shared config came from.
+        """
+        inner = self._get_inner_model()
+        was_training = inner.training
+        inner.eval()
+        sums = torch.zeros(3, dtype=torch.float64, device=self.device)  # n, sum, sum sq
+        with torch.no_grad():
+            for i, (context, target) in enumerate(loader):
+                if i >= max_batches:
+                    break
+                frames = torch.cat([context, target], dim=1)
+                frames = frames.reshape(-1, *frames.shape[2:])
+                # Bounded chunks: a whole batch of frames at full resolution
+                # is the stage-1 memory problem vae_max_frames exists for.
+                for chunk in frames.split(16):
+                    mu, _ = inner.vae.encode(chunk.to(self.device, non_blocking=True))
+                    mu = mu.double()
+                    sums += torch.stack([
+                        torch.tensor(float(mu.numel()), dtype=torch.float64, device=self.device),
+                        mu.sum(), mu.pow(2).sum(),
+                    ])
+        inner.train(was_training)
+        if dist.is_initialized():
+            dist.all_reduce(sums)
+
+        n, total, total_sq = (float(v) for v in sums)
+        if n == 0:
+            raise RuntimeError(
+                "Measuring model.latent_scale: the training split yielded no "
+                "batches. Check data.splits and the frame cache."
+            )
+        mean = total / n
+        std  = (total_sq / n - mean ** 2) ** 0.5
+        if self.is_primary:
+            logger.info("Measured latent mean %.4g, std %.6g over %d elements", mean, std, int(n))
+            if abs(mean) > 0.5 * std:
+                logger.warning(
+                    "The latent mean (%.4f) is large relative to its std (%.4f). "
+                    "Scaling only divides, so the diffusion process will see "
+                    "off-centre data. Consider a stronger KL (training.vae_beta) "
+                    "in stage 1.", mean, std,
+                )
+        return std
+
     def _reapply_fixed_latent_scale(self) -> None:
         """
         Restore a config-pinned `latent_scale` after a state-dict load.
@@ -906,7 +984,7 @@ class Trainer:
         the sampler's prior back out of step with the data.
         """
         configured = self.config["model"].get("latent_scale")
-        if configured is None:
+        if configured is None or configured == "auto":
             return
         inner = self._get_inner_model()
         inner.latent_std.fill_(float(configured))
@@ -934,6 +1012,29 @@ class Trainer:
             start_epoch = self.load_checkpoint(resume_from)
         elif init_from is not None:
             self.init_from(init_from)
+
+        if self.latent_scale_auto:
+            inner = self._get_inner_model()
+            if resume_from is not None:
+                # The checkpoint's buffer holds the value measured when this
+                # run started; measuring again would change it mid-run.
+                scale = float(inner.latent_std)
+            elif init_from is not None:
+                scale = self._measure_latent_scale(train_loader, self.latent_scale_batches)
+            else:
+                raise ValueError(
+                    "model.latent_scale is 'auto', which measures the latent "
+                    "scale of a trained VAE, but there is nothing to measure: "
+                    "pass --init-from <stage-1 checkpoint, or 'stage1_vae'>."
+                )
+            inner.latent_std.fill_(scale)
+            inner.latent_scale_initialised.fill_(True)
+            # Checkpoints embed the config, and inference rebuilds the model
+            # from it, so they must carry the number rather than "auto".
+            self.config["model"]["latent_scale"] = scale
+            if self.is_primary:
+                logger.info("model.latent_scale pinned to %.6g", scale)
+                update_run_info(self.run_dir, latent_scale=scale)
 
         if self.mlflow_enabled:
             with mlflow.start_run(run_name=self.run_name):
@@ -1075,8 +1176,11 @@ class Trainer:
                 if is_best:
                     self.save_checkpoint(epoch + 1, val_metrics, is_best=True)
                     logger.info("New best model — %s: %.6f", monitor, best_metric)
+                    update_run_info(self.run_dir, best_metric={monitor: best_metric},
+                                    best_epoch=epoch + 1)
                 elif es_enabled and primary_metric is not None:
                     logger.info("No improvement (%d/%d)", es_counter, es_patience)
+                update_run_info(self.run_dir, epochs_completed=epoch + 1)
 
             if es_enabled and es_counter >= es_patience:
                 if self.is_primary:
@@ -1225,15 +1329,24 @@ def main():
     parser = argparse.ArgumentParser(
         description="Train the CPDiT latent diffusion transformer"
     )
-    parser.add_argument("--config", type=str, default="configs/train_config.yaml")
+    parser.add_argument("--config", type=str, default="configs/train_base.yaml",
+                        help="Stage config: train_vae_extension.yaml (stage 1), "
+                             "train_base.yaml (stage 2) or "
+                             "train_joint_extension.yaml (stage 3).")
+    parser.add_argument("--inputs", type=str, default=None,
+                        help="Inputs file naming the model variant, e.g. "
+                             "configs/inputs/bands.yaml. Its stem is the variant "
+                             "name in the run directory.")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a checkpoint to resume training from "
                              "(restores optimiser, scheduler and epoch)")
     parser.add_argument("--init-from", type=str, default=None,
-                        help="Path to a checkpoint to take WEIGHTS ONLY from, "
-                             "starting a fresh run at epoch 0 with a new "
-                             "optimiser. This is how stage 2 starts from a "
-                             "stage-1 VAE, and stage 3 from stage 2.")
+                        help="Checkpoint to take WEIGHTS ONLY from, starting "
+                             "a fresh run at epoch 0 with a new optimiser. This "
+                             "is how stage 2 starts from a stage-1 VAE, and "
+                             "stage 3 from stage 2. A stage name (e.g. "
+                             "stage1_vae) means that stage's latest best model "
+                             "for the same variant.")
     parser.add_argument("--device", type=str, default=None,
                         help="Override the device (e.g. cpu, cuda:0)")
     parser.add_argument("--prime-cache", action="store_true",
@@ -1269,7 +1382,7 @@ def main():
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    config  = load_config(args.config)
+    config  = load_config(args.config, inputs=args.inputs)
     if args.workers is not None:
         config.setdefault("dataloader", {})["num_workers"] = max(0, args.workers)
         logger.info("dataloader.num_workers overridden to %d", args.workers)
@@ -1286,13 +1399,42 @@ def main():
                 dist.destroy_process_group()
         return
 
+    if args.benchmark:
+        try:
+            Trainer(config, device=device).benchmark(
+                batch_sizes=[int(x) for x in args.benchmark.split(",") if x.strip()]
+            )
+        finally:
+            if distributed:
+                dist.destroy_process_group()
+        return
+
+    is_primary = not distributed or dist.get_rank() == 0
+    init_from  = resolve_init_from(args.init_from, config) if args.init_from else None
+    fresh_run  = args.resume is None and not config["training"].get("checkpoint_dir")
+
+    # Rank 0 names the run directory and every rank adopts it: the name has a
+    # timestamp in it, and ranks do not start in the same second.
+    run_dir = [str(prepare_run_dir(config, resume=args.resume)) if is_primary else None]
+    if distributed:
+        dist.broadcast_object_list(run_dir, src=0)
+    run_dir = Path(run_dir[0])
+    config["training"]["checkpoint_dir"] = str(run_dir)
+    config["run"].update(run_id=run_dir.name, dir=str(run_dir))
+    if is_primary:
+        start_run(run_dir, config, init_from=init_from, resume=args.resume,
+                  link_latest=fresh_run)
+
     trainer = Trainer(config, device=device)
     try:
-        if args.benchmark:
-            sizes = [int(x) for x in args.benchmark.split(",") if x.strip()]
-            trainer.benchmark(batch_sizes=sizes)
-        else:
-            trainer.train(resume_from=args.resume, init_from=args.init_from)
+        trainer.train(resume_from=args.resume,
+                      init_from=str(init_from) if init_from else None)
+        if is_primary:
+            update_run_info(run_dir, status="finished")
+    except BaseException as exc:
+        if is_primary:
+            update_run_info(run_dir, status="failed", error=f"{type(exc).__name__}: {exc}")
+        raise
     finally:
         if distributed:
             dist.destroy_process_group()
