@@ -1,0 +1,22 @@
+# Baseline plus three raw AHI bands: visible reflectance and two IR window
+# brightness temperatures.
+#
+#   OBS_B03   0.64 um visible, scaled radiance (500 m)
+#   OBS_B07   3.9  um shortwave IR, brightness temperature (2 km)
+#   OBS_B13   10.4 um clean longwave IR, brightness temperature (2 km)
+#
+# The bands live on the native geostationary grid, not lat/lon: each is block-
+# averaged to 2 km and sampled onto the irradiance grid (src/petdata, "Raw
+# Himawari bands"). They need entries in the stats file first:
+#   python scripts/calc_band_stats.py --config configs/train_base.yaml \
+#       --inputs configs/inputs/bands_b03_b07_b13.yaml
+data:
+  himawari_vars:
+    - surface_global_irradiance   # first: data.irradiance_channel is 0
+    - solar_elevation
+  himawari_bands:
+    - OBS_B03
+    - OBS_B07
+    - OBS_B13
+  barra_vars:
+    - RH24mean

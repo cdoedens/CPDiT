@@ -1,0 +1,12 @@
+# Baseline: heliosat irradiance + solar elevation, and BARRA relative humidity.
+#
+# solar_elevation comes from the same heliosat product as the irradiance.
+# Irradiance is z-scored globally, so the diurnal cycle dominates its variance;
+# without this channel the model has to infer time of day from the cloud field.
+data:
+  himawari_vars:
+    - surface_global_irradiance   # first: data.irradiance_channel is 0
+    - solar_elevation
+  himawari_bands: []
+  barra_vars:
+    - RH24mean

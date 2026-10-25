@@ -6,8 +6,8 @@
 # -----------------------------------------------------------------------------
 
 model:
-  # surface_global_irradiance + solar_elevation (Himawari) + RH24mean (BARRA)
-  image_channels: 3
+  # image_channels is not set here: it is derived from the inputs file
+  # (configs/inputs/*.yaml), one channel per input variable.
   image_size: 512                # Spatial size of input patches (H = W)
   latent_channels: 4
   hidden_dim: 128                # VAE conv base channel width (D -> 2D -> 4D)
@@ -15,15 +15,18 @@ model:
 
   # Latent scaling for the diffusion process.
   #
-  # >>> ACTION REQUIRED before stage 2: replace null with the value printed by
-  # >>>   python scripts/measure_latent_scale.py --checkpoint <stage-1 best_model.pt>
+  # auto: measured from the stage-1 VAE this run is initialised from (over
+  # training.latent_scale_batches batches per rank) and pinned before training.
+  # Each variant's VAE has its own latent spread, so one number in a shared
+  # config would be right for at most one variant. The measured value is
+  # logged, written to the run's run_info.json and embedded in its checkpoints;
+  # --resume keeps it rather than re-measuring.
   #
-  # Leaving it null makes the divisor an EMA — a moving target the sampler's
-  # N(0, I) prior cannot track, and with the VAE frozen there is nothing left to
-  # track anyway. Pinning it is what Stable Diffusion's fixed 0.18215 does.
-  # Both --resume and --init-from re-apply this value after loading, so a
-  # checkpoint's own drifted buffer cannot silently override it.
-  latent_scale: 3.37158
+  # null makes the divisor an EMA — a moving target the sampler's N(0, I) prior
+  # cannot track, and with the VAE frozen there is nothing left to track anyway.
+  # Pinning it is what Stable Diffusion's fixed 0.18215 does. A number pins it
+  # explicitly (3.37158 was measured for the 3-channel baseline VAE).
+  latent_scale: auto
   # MEASURED: while the VAE is still moving, 0.99 leaves the EMA 15-40% behind
   # the true latent std, which puts the sampler's N(0, I) prior out of step with
   # the data. 0.9 tracked to within 1% in the same test. Use 0.9 whenever the
@@ -129,23 +132,24 @@ data:
   # early-morning and late-evening samples. Widen it if you want those.
   skip_utc_hours: [9, 21]
 
+  # UTC times of known single-scan gaps. Himawari skips the 02:40 UTC scan every
+  # day (housekeeping), which otherwise discards every sample whose window
+  # touches it: 18 anchors around local midday, daily. A missing frame at one of
+  # these times is replaced by the mean of the frames 10 min either side (both
+  # must be real) and cached as <stamp>.interp.npy, so the existing cache stays
+  # valid. Context and training targets both use it; run_inference.py never
+  # verifies against an interpolated frame. [] disables.
+  interpolate_gap_times: ["02:40"]
+
   bounds:       [-35, -22, 138.5, 151.5]
   crop_offset:  10               # Pixels trimmed from the bounded region edge
   irradiance_channel: 0          # Channel scored by the pixel-space metrics
 
   barra_domain: "AUST-11"
   barra_freq:   "1hr"
-  # solar_elevation comes from the same heliosat product and already has
-  # statistics in combined_stats.json. Irradiance is z-scored globally, so the
-  # diurnal cycle dominates its variance; without this channel the model has to
-  # infer time of day from the cloud field alone.
-  # NOTE: changing this changes the frame cache namespace — re-prime with
-  #   python -m src.training.train --config <cfg> --prime-cache
-  himawari_vars:
-    - surface_global_irradiance
-    - solar_elevation
-  barra_vars:
-    - RH24mean
+  # INPUT VARIABLES (himawari_vars, himawari_bands, barra_vars) are not set
+  # here. Each model variant has its own inputs file in configs/inputs/, passed
+  # with --inputs; see configs/inputs/README.md.
 
   # ARCHIVE RANGE: petdata.archive.Himawari reads
   #   /g/data/rv74/.../himawari-ahi/solar/p1s/latest/   (latest -> v1.1)
@@ -317,10 +321,16 @@ training:
     # Needs evaluation.forecast_eval_batches > 0.
     monitor: forecast_rmse
 
-  checkpoint_dir: /scratch/er8/cd3022/CPDiT/stage2_checkpoints/
+  # Every run writes to its own directory:
+  #   <runs_root>/<variant>/<stage_name>/<run_id>/   (+ a `latest` link)
+  # holding its checkpoints, resolved config.yaml, run_info.json and train.log.
+  # List them with: python scripts/list_runs.py
+  runs_root: /scratch/er8/cd3022/CPDiT/runs
+  stage_name: stage2_dit
+  # Batches per rank used to measure model.latent_scale when it is "auto".
+  latent_scale_batches: 32
   save_every_n_epochs: 5
   keep_last_n_checkpoints: 3     # best_model.pt is never rotated away
-  log_dir: /scratch/er8/cd3022/CPDiT/logs/
 
 # -----------------------------------------------------------------------------
 # Evaluation
@@ -363,7 +373,6 @@ optimiser:
 logging:
   project_name: CPDiT
   experiment_name: 256px_12ctx_1fcast_dit
-  log_dir: /scratch/er8/cd3022/CPDiT/logs/
 
 # -----------------------------------------------------------------------------
 # HPC / Gadi job settings (used by scripts/train.pbs)

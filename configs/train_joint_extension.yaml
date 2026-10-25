@@ -18,9 +18,9 @@
 #                         cannot be gamed by shrinking. Measured separation
 #                         between an intact and a collapsed encoder: ~350x.
 #
-# Start from the stage-2 result and keep its number to beat:
-#   python -m src.training.train --config configs/stage3_joint.yaml \
-#          --init-from /scratch/er8/cd3022/CPDiT/testing_checkpoints/best_model.pt
+# Start from the same variant's stage-2 result and keep its number to beat:
+#   python -m src.training.train --config configs/train_joint_extension.yaml \
+#          --inputs configs/inputs/<variant>.yaml --init-from stage2_dit
 #
 # SHIPS ONLY IF forecast_rmse improves on stage 2 under the same sampler, step
 # count and validation subset. Abort if latent_scale_ratio drifts from 1.0.
@@ -28,7 +28,7 @@
 # model, not a route to one.
 # -----------------------------------------------------------------------------
 
-extends: train_config.yaml
+extends: train_base.yaml
 
 model:
   # Non-negotiable alongside detach_latents: false. load_config rejects the
@@ -83,7 +83,7 @@ training:
     patience: 8
     monitor: forecast_rmse
 
-  checkpoint_dir: /scratch/er8/cd3022/CPDiT/stage3_checkpoints/
+  stage_name: stage3_joint
 
 dataloader:
   # Throughput saturates at ~13.4 samples/s from batch 8 upward, so the largest

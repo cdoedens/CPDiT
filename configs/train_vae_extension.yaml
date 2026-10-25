@@ -1,12 +1,14 @@
 # -----------------------------------------------------------------------------
 # Stage 1 — train the VAE alone.
 #
-# Everything not named here is inherited from train_config.yaml
+# Everything not named here is inherited from train_base.yaml
 #
-# Run:
-#   python -m src.training.train --config configs/stage1_vae.yaml
-# then measure the latent scale for stage 2:
-#   python scripts/measure_latent_scale.py --checkpoint <best_model.pt>
+# Run, for one model variant:
+#   python -m src.training.train --config configs/train_vae_extension.yaml \
+#       --inputs configs/inputs/<variant>.yaml
+# then stage 2 picks up this variant's VAE and measures its latent scale:
+#   python -m src.training.train --config configs/train_base.yaml \
+#       --inputs configs/inputs/<variant>.yaml --init-from stage1_vae
 # -----------------------------------------------------------------------------
 
 extends: train_base.yaml
@@ -47,7 +49,7 @@ training:
     patience: 5
     monitor: recon_loss
 
-  checkpoint_dir: /scratch/er8/cd3022/CPDiT/stage1_checkpoints/
+  stage_name: stage1_vae
 
 optimiser:
   lr: 1.0e-3
