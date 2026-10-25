@@ -24,7 +24,13 @@ echo "Starting CPDiT DiT inference..."
 
 
 
+# The model to run, e.g. a variant's latest stage-2 weights:
+#   qsub -v CHECKPOINT=/scratch/er8/cd3022/CPDiT/runs/<variant>/stage2_dit/latest/best_model.pt scripts/inference.pbs
+# Forecasts are written to an inference/ folder beside the checkpoint.
+CHECKPOINT="${CHECKPOINT:?pass the model: qsub -v CHECKPOINT=<best_model.pt>}"
+
 python scripts/run_inference.py \
+    --checkpoint "$CHECKPOINT" \
     --batch-size 4
 
 echo "Inference job completed!"

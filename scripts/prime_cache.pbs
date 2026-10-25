@@ -18,4 +18,5 @@ cd /home/548/cd3022/repos/CPDiT
 # PBS Job Script for training CPDiT on HPC cluster
 source hpc_setup.sh
 
+# Variant to prime: qsub -v INPUTS=configs/inputs/<variant>.yaml scripts/prime_cache.pbs
 bash scripts/prime_cache.sh

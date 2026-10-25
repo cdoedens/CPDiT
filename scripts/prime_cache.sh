@@ -5,6 +5,7 @@
 # atomically and a partly-populated cache is simply a partly-warm one.
 #
 #   qsub -q normal -l ncpus=48,mem=190GB,walltime=4:00:00 scripts/prime_cache.sh
+#   INPUTS=configs/inputs/<variant>.yaml selects the model variant to prime.
 #
 # WORKER COUNT IS MEMORY-BOUND HERE, NOT CPU-BOUND. Each worker re-imports the
 # full pyearthtools/dask/xarray stack (measured: ~700 MB at import) and then
@@ -38,13 +39,15 @@ echo "Running prime_cache, make sure environment is set up beforehand"
 
 WORKERS="${WORKERS:-10}"
 CONFIG="${CONFIG:-configs/train_base.yaml}"
+# The model variant: each has its own cache namespace.
+INPUTS="${INPUTS:-configs/inputs/baseline.yaml}"
 
-echo "Priming $CONFIG with $WORKERS workers..."
+echo "Priming $CONFIG + $INPUTS with $WORKERS workers..."
 
 # If this sits at zero batches for minutes it is not being slow -- it is being
 # asked for dates the archive does not have. The dataset warns after 200
 # consecutive unusable anchors. See the ARCHIVE RANGE note in the config:
 # nothing exists before 2019-04-01.
-python -m src.training.train --config "$CONFIG" --prime-cache --workers "$WORKERS"
+python -m src.training.train --config "$CONFIG" --inputs "$INPUTS" --prime-cache --workers "$WORKERS"
 
 echo "Priming completed!"

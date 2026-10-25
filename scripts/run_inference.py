@@ -6,9 +6,15 @@ Forecasts are initialised at fixed local clock times, by default 11:00 and
 Using the same times every day gives each day of the split equal weight. It
 also keeps the forecasts independent: 10-minute-apart windows would share
 almost all of their context. The 11:00 forecast verifies 11:10-14:00 and the
-14:00 one verifies 14:10-17:00, so their lead times do not overlap. A day whose
-context window is unusable (missing archive frames) loses that forecast, and a
-warning is logged.
+14:00 one verifies 14:10-17:00, so their lead times do not overlap.
+
+Himawari skips one scan a day for housekeeping (02:40 UTC), which falls inside
+the 14:00 AEST context window (02:10-04:00 UTC) every single day. An isolated
+missing context frame -- both neighbours present -- is therefore filled by
+linear interpolation in time (--max-context-gaps, default 1 per forecast) and
+listed in the file's `context_interpolated` attribute. A context window with
+more or longer gaps loses that forecast, and a warning is logged. Missing
+truth frames never drop a forecast; they are stored as NaN.
 
 One file per forecast, named by its initialisation time (the last observed
 frame, in UTC) and grouped into year/month/day directories:
@@ -85,8 +91,6 @@ from src.petdata import (  # noqa: E402
 logger = logging.getLogger("run_inference")
 
 DEFAULT_CHECKPOINT = "/scratch/er8/cd3022/CPDiT/stage2_checkpoints/best_model.pt"
-DEFAULT_CONFIG = str(REPO_ROOT / "configs" / "train_base.yaml")
-DEFAULT_OUTPUT_DIR = "/scratch/er8/cd3022/CPDiT/inference"
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,11 +98,15 @@ def parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
-    p.add_argument("--config", default=DEFAULT_CONFIG,
-                   help="Training config YAML matching the checkpoint")
+    p.add_argument("--config", default=None,
+                   help="Override the config embedded in the checkpoint. By "
+                        "default the checkpoint's own config is used, which is "
+                        "the only one guaranteed to match its input variables.")
     p.add_argument("--horizon-minutes", type=int, default=180,
                    help="Forecast length; rolled out data.n_post frames per model call")
-    p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    p.add_argument("--output-dir", default=None,
+                   help="Default: an inference/ folder beside the checkpoint, so "
+                        "each model variant's forecasts stay with its weights.")
     p.add_argument("--split", default="test", help="Split name from data.splits in the checkpoint")
     p.add_argument("--start", default=None,
                    help="Override the split's start (e.g. 20250301T0000); useful for "
@@ -120,6 +128,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=32,
                    help="Forecasts per sampler call (the model sees batch_size * members)")
+    p.add_argument("--vae-chunk", type=int, default=16,
+                   help="Frames per VAE encoder/decoder call. Each rollout call "
+                        "encodes batch_size * members * n_prior_sat full-resolution "
+                        "frames, which overflows the GPU in one pass; lower this "
+                        "if it still runs out of memory")
+    p.add_argument("--max-context-gaps", type=int, default=1,
+                   help="Isolated missing context frames to fill by interpolating "
+                        "their neighbours, per forecast (0 disables)")
     p.add_argument("--workers", type=int, default=8,
                    help="DataLoader workers. Only the cold (uncached) pass benefits; "
                         "see the dataloader notes in configs/train_base.yaml")
@@ -164,27 +180,50 @@ class TimestampedDataset(PipelineDataset):
     the `n_prior_sat` frames strictly before it (see `frame_times`). Anchors
     are sharded across DDP ranks and DataLoader workers like the base stream.
 
-    The dataset itself is built for the trained horizon (`n_post` frames), so
-    only the context and the first `n_post` frames must be usable. The remaining
-    `n_truth - n_post` verification frames are optional: a frame the archive
-    lacks (e.g. the daily ~02:40 UTC gap) or that is NaN (night) is stored as
-    NaN rather than discarding the forecast, which would otherwise reject
-    nearly every anchor once the window is hours long.
+    Only the context must be usable. The `n_truth` verification frames are
+    optional: a frame the archive lacks (e.g. the daily 02:40 UTC gap) or that
+    is NaN (night) is stored as NaN rather than discarding the forecast, which
+    would otherwise reject nearly every anchor once the window is hours long.
+
+    Up to `max_context_gaps` isolated context frames (missing, with both
+    neighbours present) are filled by linear interpolation. Without this the
+    14:00 AEST forecast, whose context spans the 02:40 UTC housekeeping gap,
+    would be lost every day.
+
+    Frames are read with `_real_frame`, bypassing the dataset's own
+    `data.interpolate_gap_times` fill: the gaps are filled here instead so
+    every interpolated frame is reported, and a truth frame is never an
+    interpolated one.
     """
 
     n_truth = 0                    # total verification frames wanted; set by `build_loader`
+    max_context_gaps = 1           # set by `build_loader`
     anchors: list[str] = []        # set by `build_loader`
 
     def _sample(self, anchor: str):
-        tensor = super()._sample(anchor)
-        if tensor is None or self.n_truth <= self.forecast_length:
-            return tensor
-        stamps = frame_times(anchor, self.context_length, self.n_truth)
-        extra = []
-        for stamp in stamps[self.context_length + self.forecast_length:]:
-            frame = self._frame(stamp)
-            extra.append(torch.full_like(tensor[0], float("nan")) if frame is None else frame)
-        return torch.cat([tensor, torch.stack(extra)])
+        """Returns ((T_ctx + n_truth, C, H, W), interpolated context stamps),
+        or None when the context is unusable."""
+        stamps  = frame_times(anchor, self.context_length, max(self.n_truth, 1))
+        context = [self._real_frame(stamp) for stamp in stamps[:self.context_length]]
+
+        gaps = [k for k, frame in enumerate(context) if frame is None]
+        if len(gaps) > self.max_context_gaps:
+            return None
+        for k in gaps:
+            # Interior and isolated only: the last frame is the initial
+            # condition and must be real, and a longer gap is too much to guess.
+            if not 0 < k < self.context_length - 1:
+                return None
+            before, after = context[k - 1], context[k + 1]
+            if before is None or after is None:
+                return None
+            context[k] = 0.5 * (before + after)
+
+        truth = []
+        for stamp in stamps[self.context_length:self.context_length + self.n_truth]:
+            frame = self._real_frame(stamp)
+            truth.append(torch.full_like(context[0], float("nan")) if frame is None else frame)
+        return torch.stack(context + truth), [stamps[k] for k in gaps]
 
     def __iter__(self):
         shard_index, num_shards = _shard_info()
@@ -192,23 +231,26 @@ class TimestampedDataset(PipelineDataset):
         if not anchors:
             return
         # Built here, in the consuming process: the pipeline is not fork-safe.
-        self._sat_pipe, self._bar_pipe = _build_frame_pipelines(self.config)
-        self._bar_memo = {}
+        self._open_pipelines()
         for anchor in anchors:
-            tensor = self._sample(anchor)
-            if tensor is None:
+            sample = self._sample(anchor)
+            if sample is None:
                 logger.warning("No usable context for anchor %s; that forecast is skipped",
                                anchor)
                 continue
+            tensor, filled = sample
             self.n_yielded += 1
-            yield tensor[:self.context_length], tensor[self.context_length:], anchor
+            # Joined into one string so the default collate keeps it per sample.
+            yield (tensor[:self.context_length], tensor[self.context_length:], anchor,
+                   ",".join(filled))
 
 
 def build_loader(config: dict, split: str, batch_size: int, workers: int,
-                 n_truth: int, anchors: list[str]) -> DataLoader:
+                 n_truth: int, anchors: list[str], max_context_gaps: int) -> DataLoader:
     """Mirrors `build_dataloader`, over the timestamped dataset."""
     dataset = TimestampedDataset(split, config, shuffle=False)
     dataset.n_truth = n_truth
+    dataset.max_context_gaps = max_context_gaps
     dataset.anchors = anchors
     kwargs: dict = {}
     if workers > 0:
@@ -228,8 +270,8 @@ def grid_coords(config: dict, stamps: list[str]) -> tuple[np.ndarray, np.ndarray
     (BARRA is regridded onto this grid, so it is the grid of every channel).
 
     Frames served from the cache carry no coordinates, so one frame is fetched
-    from the archive. Any anchor in hand is known to be fetchable, as the
-    sample containing it passed the pipeline.
+    from the archive. Pass init times: the last context frame is never
+    interpolated, so it is known to be fetchable (truth frames may be missing).
     """
     data_cfg = config["data"]
     size     = config["model"].get("image_size", 256)
@@ -369,10 +411,13 @@ def main() -> None:
         format=f"%(asctime)s [rank {rank}] %(levelname)s %(message)s",
     )
 
-    config = load_config(args.config)
+    if args.config:
+        config = load_config(args.config)
+    else:
+        config = torch.load(args.checkpoint, map_location="cpu", weights_only=False)["config"]
     model, epoch = load_model(args.checkpoint, config, device)
-    logger.info("Loaded %s (epoch %s) with config %s on %s",
-                args.checkpoint, epoch, args.config, device)
+    logger.info("Loaded %s (epoch %s) with config %s on %s", args.checkpoint, epoch,
+                args.config or "embedded in the checkpoint", device)
 
     inf_cfg   = config["model"].get("inference", {})
     sampler   = args.sampler or inf_cfg.get("sampler", "pc")
@@ -412,7 +457,8 @@ def main() -> None:
     mean = np.array([stats[n]["mean"] for n in names], dtype=np.float32)[:, None, None]
     std  = np.array([stats[n]["std"] + 1e-8 for n in names], dtype=np.float32)[:, None, None]
 
-    output_dir = Path(args.output_dir)
+    output_dir = (Path(args.output_dir) if args.output_dir
+                  else Path(args.checkpoint).resolve().parent / "inference")
     attrs = {
         "title":       "CPDiT latent diffusion nowcast",
         "checkpoint":  str(args.checkpoint),
@@ -420,7 +466,9 @@ def main() -> None:
         "split":       args.split,
         "sampler":     sampler,
         "num_steps":   num_steps,
-        "config":      str(args.config),
+        "config":      str(args.config or "embedded in the checkpoint"),
+        "variant":     str(config.get("run", {}).get("variant", "unknown")),
+        "run_id":      str(config.get("run", {}).get("run_id", "unknown")),
         "forecast_method": f"autoregressive, {n_post} frames per model call, "
                            f"{n_lead // n_post} calls",
         "init_times_local": ",".join(init_times),
@@ -443,12 +491,12 @@ def main() -> None:
     )
 
     loader = build_loader(config, args.split, args.batch_size, args.workers,
-                          0 if args.no_truth else n_lead, anchors)
+                          0 if args.no_truth else n_lead, anchors, args.max_context_gaps)
     lat = lon = None
     n_written = n_skipped = 0
     t_start = time.time()
 
-    for batch_idx, (context, target, anchors) in enumerate(loader):
+    for batch_idx, (context, target, anchors, filled) in enumerate(loader):
         init_times = [pd.Timestamp(a) - step for a in anchors]
         paths      = [output_path(output_dir, t) for t in init_times]
         keep = [i for i, p in enumerate(paths) if args.overwrite or not p.exists()]
@@ -461,7 +509,8 @@ def main() -> None:
             continue
 
         if lat is None:
-            lat, lon = grid_coords(config, [anchors[i] for i in keep])
+            lat, lon = grid_coords(config, [init_times[i].strftime("%Y%m%dT%H%M")
+                                            for i in keep])
 
         ctx = context[keep].to(device)
         generator = torch.Generator(device=ctx.device).manual_seed(
@@ -473,6 +522,7 @@ def main() -> None:
                 sampler   = sampler,
                 num_steps = num_steps,
                 generator = generator,
+                vae_chunk = args.vae_chunk,
             )
         # repeat_interleave order: members of one forecast are contiguous.
         pred = pred.float().cpu().numpy().reshape(len(keep), members, *pred.shape[1:])
@@ -482,7 +532,8 @@ def main() -> None:
         for j, i in enumerate(keep):
             ds = to_dataset(
                 pred[j], None if obs is None else obs[j],
-                init_times[i], step, names, lat, lon, attrs,
+                init_times[i], step, names, lat, lon,
+                {**attrs, "context_interpolated": filled[i]},
             )
             write_atomic(ds, paths[i])
         n_written += len(keep)
