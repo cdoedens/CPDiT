@@ -23,6 +23,10 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 import pyearthtools.data as petdata
 import pyearthtools.pipeline as petpipe
 
+# Defined with the config so the channel count can be derived without importing
+# pyearthtools; re-exported here, where the data pipeline's users look for it.
+from src.training.config import channel_names
+
 my_site = 'site_archive_nci'  # 'site_archive_nci' | 'site_archive_jasmin' | 'site_archive_met_office'
 import importlib
 
@@ -86,6 +90,28 @@ def blocked_utc_hours(data_cfg: dict) -> set[int]:
     if lo <= hi:
         return set(range(lo, hi + 1))
     return set(range(lo, 24)) | set(range(0, hi + 1))    # wraps midnight
+
+
+def gap_utc_times(data_cfg: dict) -> set[str]:
+    """
+    UTC clock times (``"HH:MM"``) from ``data.interpolate_gap_times`` whose
+    frame, when missing, is filled by linear interpolation between the frames
+    one step either side.
+
+    Himawari skips the 02:40 UTC scan every day for housekeeping. Without
+    filling it, every sample whose window touches 02:40 is lost -- 18
+    consecutive anchors, three hours of local midday, every day. Empty/None
+    disables interpolation.
+    """
+    times = set()
+    for spec in data_cfg.get("interpolate_gap_times") or []:
+        try:
+            times.add(pd.Timestamp(f"2000-01-01 {spec}").strftime("%H:%M"))
+        except ValueError as exc:
+            raise ValueError(
+                f"data.interpolate_gap_times entries must be 'HH:MM' UTC, got {spec!r}."
+            ) from exc
+    return times
 
 
 def frame_times(anchor: str, context_length: int, forecast_length: int,
@@ -164,25 +190,6 @@ def _build_date_range(
     )
 
 
-def channel_names(config: dict) -> list[str]:
-    """
-    The channel order of every frame this module produces, as variable names.
-
-    Satellite variables first, then BARRA, each in the order the config lists
-    them -- so `data.irradiance_channel` (default 0) is `himawari_vars[0]`.
-
-    This is the single definition of that order. It is NOT the order the
-    archive hands the variables back in: the Himawari accessor's `data_vars`
-    order varies between fetches of the very same timestamp (MEASURED: two runs
-    over 20240101T0000 gave ['surface_global_irradiance', 'solar_elevation']
-    and the reverse), so stacking in `data_vars` order silently permuted the
-    channels of an arbitrary subset of frames.
-    """
-    data_cfg = config["data"]
-    return (list(data_cfg.get("himawari_vars", ["surface_global_irradiance"]))
-            + list(data_cfg.get("barra_vars", ["RH24mean"])))
-
-
 def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipeline]:
     """
     Two pipelines that each return a SINGLE timestamp.
@@ -227,6 +234,150 @@ def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipe
 
 
 # ---------------------------------------------------------------------------
+# Raw Himawari bands
+# ---------------------------------------------------------------------------
+# The AHI band files are not on a lat/lon grid. They sit on the satellite's
+# fixed geostationary grid (5500 x 5500 at 2 km, 22000 x 22000 for B03 at
+# 500 m), so `Bounding` cannot cut them and they cannot be `interp`'d onto the
+# irradiance grid by coordinate.
+#
+# The ancillary GEOM_SENSOR files store a lat/lon for every native pixel, and
+# a KD-tree over them recovers the nearest native pixel for each model pixel.
+# That works but means scanning ~4 GB of lat/lon for the 500 m grid. Instead
+# the model grid is projected forward into the satellite's own coordinates
+# with the projection stored in each band file, which makes the nearest native
+# pixel a rounding. MEASURED over the training domain: identical to the
+# ancillary KD-tree for 97% of pixels and never more than one pixel off (the
+# KD-tree measures distance in degrees, not on the projected grid, so it is
+# the less accurate of the two at ties).
+#
+# Every band is reduced onto the 2 km grid before sampling. The 1 km and
+# 500 m pixels nest exactly inside the 2 km ones, so a block mean is a proper
+# area average, and the model grid (0.02 deg, ~2 km) is too coarse to resolve
+# anything finer -- nearest-neighbour sampling at 500 m would only alias.
+
+BAND_GRID_METRES = 2000
+# Native resolution of the bands that are not at 2 km.
+_BAND_RESOLUTION = {"B01": 1000, "B02": 1000, "B03": 500}
+
+
+def band_groups(bands: list[str]) -> list[list[str]]:
+    """
+    Split bands into the groups one `HimawariChannels` accessor can serve.
+
+    The accessor refuses to mix resolutions. Products are separated too: the
+    file variables are named by channel number alone, so ``OBS_B03`` and
+    ``BRF_B03`` would collide in one dataset.
+    """
+    groups: dict[tuple[str, int], list[str]] = {}
+    for band in bands:
+        product, number = band.rsplit("_", 1)
+        key = (product, _BAND_RESOLUTION.get(number, BAND_GRID_METRES))
+        groups.setdefault(key, []).append(band)
+    return list(groups.values())
+
+
+def _build_band_accessors(config: dict) -> list[tuple[list[str], petdata.archive.HimawariChannels]]:
+    """One (bands, accessor) pair per resolution/product group."""
+    bands = list(config["data"].get("himawari_bands", []))
+    return [(group, petdata.archive.HimawariChannels(bands=group))
+            for group in band_groups(bands)]
+
+
+def _band_variable(ds: xr.Dataset, band: str) -> str:
+    """The file variable holding a band, e.g. OBS_B13 -> channel_0013_brightness_temperature."""
+    prefix = f"channel_{int(band.rsplit('_B', 1)[1]):04d}_"
+    matches = [v for v in ds.data_vars if str(v).startswith(prefix)]
+    if len(matches) != 1:
+        # Deterministic for this timestamp, so reported as missing data and the
+        # frame is remembered as bad rather than retried every epoch.
+        raise petdata.exceptions.DataNotFoundError(
+            f"Expected one variable for band {band} ({prefix}*), found {matches}."
+        )
+    return matches[0]
+
+
+class BandRegridder:
+    """
+    Nearest native pixel for every model pixel, for any AHI resolution.
+
+    The index arrays depend only on the model grid and the native grid, so
+    they are built once per resolution and reused for every frame.
+    """
+
+    def __init__(self, latitude: np.ndarray, longitude: np.ndarray):
+        self.latitude  = np.asarray(latitude)
+        self.longitude = np.asarray(longitude)
+        self._maps: dict = {}
+
+    def matches(self, latitude: np.ndarray, longitude: np.ndarray) -> bool:
+        return (np.array_equal(self.latitude, latitude)
+                and np.array_equal(self.longitude, longitude))
+
+    def _index(self, x: np.ndarray, y: np.ndarray, proj4: str):
+        dx, dy = float(x[1] - x[0]), float(y[1] - y[0])       # y descends: dy < 0
+        key = (proj4, float(x[0]), float(y[0]), dx, dy)
+        if key in self._maps:
+            return self._maps[key]
+
+        import pyproj
+
+        transformer = pyproj.Transformer.from_crs(
+            "EPSG:4326", pyproj.CRS.from_proj4(proj4), always_xy=True
+        )
+        lat, lon = np.meshgrid(self.latitude, self.longitude, indexing="ij")
+        px, py = transformer.transform(lon, lat)
+        if not (np.isfinite(px).all() and np.isfinite(py).all()):
+            raise ValueError("Part of the model grid lies off the Himawari disk.")
+
+        # Index of the 2 km cell containing each model pixel, counted from the
+        # outer edge of the native grid, which every resolution shares.
+        factor = int(round(BAND_GRID_METRES / abs(dx)))
+        yb = np.floor((py - (y[0] - dy / 2)) / (dy * factor)).astype(np.int64)
+        xb = np.floor((px - (x[0] - dx / 2)) / (dx * factor)).astype(np.int64)
+        y0, x0 = int(yb.min()), int(xb.min())
+        entry = (
+            slice(y0 * factor, (int(yb.max()) + 1) * factor),
+            slice(x0 * factor, (int(xb.max()) + 1) * factor),
+            factor, yb - y0, xb - x0,
+        )
+        self._maps[key] = entry
+        return entry
+
+    def __call__(self, da: xr.DataArray, proj4: str) -> np.ndarray:
+        """Resample one native (y, x) band onto the model grid."""
+        y_slice, x_slice, factor, yi, xi = self._index(da["x"].values, da["y"].values, proj4)
+        # Only the box under the model grid is read from disk.
+        arr = da.isel(y=y_slice, x=x_slice).values.astype(np.float32)
+        if factor > 1:
+            h, w = arr.shape
+            arr = arr.reshape(h // factor, factor, w // factor, factor).mean(axis=(1, 3))
+        return arr[yi, xi]
+
+
+def _read_bands(accessor, stamp: str) -> xr.Dataset:
+    """
+    Open one timestamp of a band group, lazily and in the file's own chunks.
+
+    By default pyearthtools opens with ``chunks='auto'``, which on the 500 m
+    file gives full-width (1520, 22000) dask chunks: reading the ~1000 x 1000
+    box under the model grid then decodes most of the 1.9 GB disk, MEASURED
+    11 s per frame. Without dask-level chunks each read only touches the
+    file's own (20, 2000) chunks it overlaps, ~1 s.
+    """
+    import pyearthtools.utils
+
+    try:
+        with pyearthtools.utils.config.set({"data.open.xarray.chunks": None,
+                                            "data.open.xarray_mf.chunks": None}):
+            return accessor[stamp]
+    except FileNotFoundError as exc:
+        # The accessor lists the timestamp's directory directly, so a missing
+        # scan surfaces as FileNotFoundError rather than DataNotFoundError.
+        raise petdata.exceptions.DataNotFoundError(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
 # Transparent frame cache
 # ---------------------------------------------------------------------------
 # Building one sample from the archive costs ~16-20s, which is ~7x slower than
@@ -256,6 +407,11 @@ def _cache_namespace(config: dict) -> str:
     stats_path = data_cfg["stats_path"]
     with open(stats_path) as f:
         stats = json.load(f)
+    # Only the statistics of channels this config uses. Adding statistics for
+    # a new variable to the shared file must not invalidate caches built
+    # without it.
+    names = set(channel_names(config))
+    stats = {k: v for k, v in stats.items() if k in names}
 
     recipe = {
         "himawari_vars": list(data_cfg.get("himawari_vars", [])),
@@ -278,6 +434,10 @@ def _cache_namespace(config: dict) -> str:
         #    fetches, so a fraction of them have their channels permuted.
         "version":       3,
     }
+    # Added only when set, so configs without bands keep their existing cache.
+    bands = list(data_cfg.get("himawari_bands", []))
+    if bands:
+        recipe["himawari_bands"] = bands
     blob = json.dumps(recipe, sort_keys=True).encode()
     return hashlib.sha1(blob).hexdigest()[:16]
 
@@ -333,6 +493,35 @@ class FrameCache:
         stamp = str(date).replace("-", "").replace(":", "").replace("T", "")[:12]
         day = self.root / stamp[:8]
         return day / f"{stamp}.npy", day / f"{stamp}.bad"
+
+    def _interp_path(self, date) -> Path:
+        # Interpolated frames live beside the frame's `.bad` marker under their
+        # own name, so they are served only while gap interpolation is enabled
+        # and switching it off needs no new cache namespace.
+        path, _ = self._paths(date)
+        return path.with_name(path.stem + ".interp.npy")
+
+    def has_interpolated(self, date) -> bool:
+        return self.enabled and self._interp_path(date).exists()
+
+    def load_interpolated(self, date) -> Optional[torch.Tensor]:
+        if not self.enabled:
+            return None
+        path = self._interp_path(date)
+        try:
+            arr = np.load(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except Exception as exc:  # noqa: BLE001 - a corrupt entry must not be fatal
+            logger.warning("Discarding unreadable cache entry %s: %s", path, exc)
+            path.unlink(missing_ok=True)
+            return None
+        return torch.from_numpy(arr).float()
+
+    def store_interpolated(self, date, tensor: torch.Tensor) -> None:
+        if not self.enabled:
+            return
+        self._atomic_write(self._interp_path(date), tensor.numpy().astype(self.dtype))
 
     def exists(self, date) -> tuple[bool, bool]:
         """
@@ -479,6 +668,17 @@ class PipelineDataset(IterableDataset):
         self.forecast_length = data_cfg.get("n_post", 1)
         self.image_size      = config["model"].get("image_size", 256)
         self.crop_offset     = data_cfg.get("crop_offset", 10)
+        self.bands           = list(data_cfg.get("himawari_bands", []))
+
+        # Adding a variable or band to the data block without updating the
+        # model would otherwise only fail at the VAE's first conv, after the
+        # workers have spawned and the first frames have been fetched.
+        n_channels = config["model"].get("image_channels")
+        if n_channels is not None and int(n_channels) != len(channel_names(config)):
+            raise ValueError(
+                f"model.image_channels is {n_channels} but the data block produces "
+                f"{len(channel_names(config))} channels: {channel_names(config)}."
+            )
 
         # Load normalisation statistics once, not once per epoch.
         with open(data_cfg["stats_path"]) as f:
@@ -511,6 +711,10 @@ class PipelineDataset(IterableDataset):
 
         # UTC hours whose samples are never usable (local night for this domain).
         self.blocked_hours = blocked_utc_hours(data_cfg)
+
+        # UTC clock times of known single-scan gaps, filled by interpolation.
+        self.gap_times = gap_utc_times(data_cfg)
+        self.n_interpolated = 0
         self.n_skipped_hour = 0
 
         # Diagnostics — reported once per epoch instead of printed per sample.
@@ -557,9 +761,35 @@ class PipelineDataset(IterableDataset):
             ds[var] = (ds[var] - mean) / (std + 1e-8)
         return ds
 
+    def _open_pipelines(self) -> None:
+        """
+        Build the archive pipelines. Must run in the consuming process: the
+        pipeline is not fork-safe.
+        """
+        self._sat_pipe, self._bar_pipe = _build_frame_pipelines(self.config)
+        self._band_accessors = _build_band_accessors(self.config)
+        self._band_regridder: Optional[BandRegridder] = None
+        self._bar_memo = {}
+
+    def _fetch_bands(self, stamp: str, latitude: np.ndarray,
+                     longitude: np.ndarray) -> xr.Dataset:
+        """The configured raw bands at one timestamp, in physical units, on the given grid."""
+        if self._band_regridder is None or not self._band_regridder.matches(latitude, longitude):
+            self._band_regridder = BandRegridder(latitude, longitude)
+
+        out = {}
+        for group, accessor in self._band_accessors:
+            ds = _read_bands(accessor, stamp)
+            proj4 = ds["geostationary"].attrs["proj4"]
+            for band in group:
+                da = ds[_band_variable(ds, band)].isel(time=0, drop=True)
+                out[band] = (("latitude", "longitude"), self._band_regridder(da, proj4))
+        return xr.Dataset(out, coords={"latitude": latitude, "longitude": longitude})
+
     def _fetch_frame(self, stamp: str) -> Optional[torch.Tensor]:
         """
-        Build one (C, H, W) frame: fetch, normalise, regrid BARRA, crop, stack.
+        Build one (C, H, W) frame: fetch, normalise, regrid BARRA, crop, add
+        the raw bands, stack.
 
         Returns None when the frame is unusable (wrong shape, or NaN — which is
         what the irradiance field is at night). Raises only on genuinely
@@ -593,6 +823,14 @@ class PipelineDataset(IterableDataset):
             longitude = slice(o, o + self.image_size),
         )
 
+        # The bands are sampled straight onto the cropped grid: they have no
+        # lat/lon coordinates of their own to bound or crop by.
+        if self.bands:
+            bands = self._fetch_bands(
+                stamp, combined["latitude"].values, combined["longitude"].values
+            )
+            combined = combined.assign(self._normalise(bands).data_vars)
+
         # Explicit channel order. `combined.data_vars` is not reproducible --
         # see channel_names() -- so ordering by it gives frames whose channels
         # are permuted at random relative to each other.
@@ -624,14 +862,51 @@ class PipelineDataset(IterableDataset):
         construction.
         """
         present, known_bad = self.cache.exists(stamp)
-        if known_bad:
-            return False
         if present:
             return True
-        return self._frame(stamp) is not None
+        if not known_bad and self._real_frame(stamp) is not None:
+            return True
+        if not self._is_gap_time(stamp):
+            return False
+        return self.cache.has_interpolated(stamp) or self._interpolate_gap(stamp) is not None
 
     def _frame(self, stamp: str) -> Optional[torch.Tensor]:
-        """Cache-first access to a single frame."""
+        """
+        Cache-first access to a single frame. A frame missing at one of
+        `gap_times` is filled by interpolation (see `_interpolate_gap`).
+        """
+        frame = self._real_frame(stamp)
+        if frame is None and self._is_gap_time(stamp):
+            frame = self.cache.load_interpolated(stamp)
+            if frame is None:
+                frame = self._interpolate_gap(stamp)
+        return frame
+
+    def _is_gap_time(self, stamp: str) -> bool:
+        return bool(self.gap_times) and pd.Timestamp(stamp).strftime("%H:%M") in self.gap_times
+
+    def _interpolate_gap(self, stamp: str) -> Optional[torch.Tensor]:
+        """
+        Linear interpolation in time across one missing frame: the mean of the
+        frames one step either side, which must both be real (never themselves
+        interpolated). Interpolating the z-scored values equals interpolating
+        the physical ones, as the normalisation is affine. The result is cached.
+        """
+        t     = pd.Timestamp(stamp)
+        step  = pd.Timedelta(minutes=SAT_TIMESTEP_MINUTES)
+        before = self._real_frame((t - step).strftime("%Y%m%dT%H%M"))
+        if before is None:
+            return None
+        after  = self._real_frame((t + step).strftime("%Y%m%dT%H%M"))
+        if after is None:
+            return None
+        frame = 0.5 * (before + after)
+        self.cache.store_interpolated(stamp, frame)
+        self.n_interpolated += 1
+        return frame
+
+    def _real_frame(self, stamp: str) -> Optional[torch.Tensor]:
+        """Cache-first access to a single observed frame; never interpolated."""
         frame, known_bad = self.cache.load(stamp)
         if known_bad:
             return None
@@ -698,8 +973,7 @@ class PipelineDataset(IterableDataset):
             return
 
         # Built here, in the consuming process: the pipeline is not fork-safe.
-        self._sat_pipe, self._bar_pipe = _build_frame_pipelines(self.config)
-        self._bar_memo = {}
+        self._open_pipelines()
 
         for date in dates:
             stamp = str(date)
@@ -759,8 +1033,7 @@ class PipelineDataset(IterableDataset):
         needs only its context, so a gap in the truth should not stop one being
         made -- the missing frame just has nothing to be compared against.
         """
-        self._sat_pipe, self._bar_pipe = _build_frame_pipelines(self.config)
-        self._bar_memo = {}
+        self._open_pipelines()
         if not allow_missing_target:
             tensor = self._sample(anchor)
             if tensor is None:
@@ -828,9 +1101,11 @@ class PipelineDataset(IterableDataset):
 
     def log_epoch_summary(self) -> None:
         logger.info(
-            "[%s] yielded=%d  skipped: night-hour=%d nan=%d fetch=%d shape=%d | %s",
+            "[%s] yielded=%d  skipped: night-hour=%d nan=%d fetch=%d shape=%d | "
+            "gap frames interpolated=%d | %s",
             self.split, self.n_yielded, self.n_skipped_hour, self.n_skipped_nan,
-            self.n_skipped_error, self.n_skipped_shape, self.cache.summary(),
+            self.n_skipped_error, self.n_skipped_shape, self.n_interpolated,
+            self.cache.summary(),
         )
         attempted = self.n_yielded + self.n_skipped_nan + self.n_skipped_error
         if attempted and self.n_yielded < 0.5 * attempted:
