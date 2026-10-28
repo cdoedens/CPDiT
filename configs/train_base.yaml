@@ -106,7 +106,7 @@ model:
     # pc  reverse-time SDE + Langevin corrector (stochastic; use for ensembles)
     # ode probability-flow ODE (deterministic given the initial noise)
     sampler: pc
-    num_steps: 100               # reverse integration steps
+    num_steps: 25               # ensemble spread and error similar at 25, 50, and 100
     num_ensemble_members: 1
 
 # -----------------------------------------------------------------------------
@@ -343,7 +343,7 @@ evaluation:
   num_steps: 50
   # ODE by default: deterministic, so the metric tracks the model rather than
   # the sampler's noise draw.
-  sampler: ode
+  sampler: pc
   # Cap on validation batches per epoch. The val split at sample_stride 3 over a
   # full year produced 2664 batches against 2658 training batches, so half of
   # every epoch was spent revalidating a number that had already converged.
