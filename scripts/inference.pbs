@@ -1,6 +1,6 @@
 #!/bin/bash 
 #PBS -l walltime=24:00:00 
-#PBS -l mem=96GB 
+#PBS -l mem=256GB 
 #PBS -l ncpus=12
 #PBS -l ngpus=1
 #PBS -l jobfs=256GB 
