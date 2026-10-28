@@ -151,17 +151,14 @@ data:
   # here. Each model variant has its own inputs file in configs/inputs/, passed
   # with --inputs; see configs/inputs/README.md.
 
-  # ARCHIVE RANGE: petdata.archive.Himawari reads
-  #   /g/data/rv74/.../himawari-ahi/solar/p1s/latest/   (latest -> v1.1)
-  # whose first date is 2019-04-01. The v1.0 tree does hold 2015-2019/03 and
-  # does contain solar_elevation, but `latest` does not point at it, so the
-  # accessor cannot see it and every request before 2019-04-01 raises
-  # DataNotFoundError.
-  #
-  # PET dataloader uses "latest" dir in rv74, so limited to 2019-04-01 onward
+  # ARCHIVE RANGE: 2015-07-07 onward. The stock petdata.archive.Himawari reads
+  # only /g/data/rv74/.../himawari-ahi/solar/p1s/latest/ (latest -> v1.1, from
+  # 2019-04-01), so the pipeline uses src.petdata.HimawariSolar, which reads
+  # the v1.0 tree for 2015-07-07 to 2019-03-31. v1.0 uses GFS water vapour and
+  # bias correction, v1.1 ACCESS-G3; stats_path was computed on 2020-01 (v1.1).
   splits:
     train:
-      start: "20190401T0000"
+      start: "20150707T0000"
       end:   "20240101T0000"
     val:
       start: "20240101T0000"

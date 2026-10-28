@@ -10,6 +10,7 @@ import math
 import os
 import random
 import traceback
+from glob import glob
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -190,6 +191,36 @@ def _build_date_range(
     )
 
 
+# The stock accessor reads only p1s/latest/, a symlink to v1.1, which starts
+# 2019-04-01. The v1.0 tree holds 2015-07-07 to 2019-03-31 with the same file
+# names, grid and variables, so it is the same product under another root.
+HIMAWARI_SOLAR_ROOT = Path("/g/data/rv74/satellite-products/arc/der/himawari-ahi/solar/p1s")
+# Day directory D holds scans from (D-1) 18:30 to D 11:30 UTC, so the first v1.1
+# scan (in 2019/04/01/) is 2019-03-31T18:30 UTC; the last v1.0 one is 11:30.
+HIMAWARI_V11_START = pd.Timestamp("2019-03-31T18:30")
+
+
+class HimawariSolar(petdata.archive.Himawari):
+    """`petdata.archive.Himawari`, extended back to 2015 through the v1.0 tree."""
+
+    def filesystem(self, basetime):
+        basetime = petdata.time.Petdt(basetime)
+        version = "v1.0" if pd.Timestamp(str(basetime)) < HIMAWARI_V11_START else "latest"
+        name = self.file_regex.format(
+            date_info=basetime.strftime("%Y%m%d"),
+            time_info=basetime.strftime("%H%M"),
+        )
+        # A scan sits in its own UTC day's directory, or the next one from 18:30.
+        one_day = petdata.time.TimeDelta(1, "day")
+        for day in (basetime, basetime + one_day, basetime - one_day):
+            matches = glob(str(HIMAWARI_SOLAR_ROOT / version / day.strftime("%Y/%m/%d") / name))
+            if matches:
+                return Path(matches[0])
+        raise petdata.exceptions.DataNotFoundError(
+            f"Unable to find Himawari solar data for {basetime} under {HIMAWARI_SOLAR_ROOT / version}"
+        )
+
+
 def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipeline]:
     """
     Two pipelines that each return a SINGLE timestamp.
@@ -207,7 +238,7 @@ def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipe
     bounds   = data_cfg.get("bounds", [-35, -28.5, 145, 151.5])
 
     sat = petpipe.Pipeline(
-        petdata.archive.Himawari(
+        HimawariSolar(
             data_cfg.get("himawari_vars", ["surface_global_irradiance"])
         ),
         petpipe.operations.xarray.Sort(order=['time', 'latitude', 'longitude']),
