@@ -141,6 +141,10 @@ def parse_args() -> argparse.Namespace:
                         "see the dataloader notes in configs/train_base.yaml")
     p.add_argument("--max-samples", type=int, default=None,
                    help="Stop after this many forecasts (per rank); for quick checks")
+    p.add_argument("--matmul-precision", default="high", choices=["highest", "high", "medium"],
+                   help="torch.set_float32_matmul_precision on Ampere and newer. "
+                        "'high' runs fp32 matmuls on TF32 tensor cores, as training "
+                        "does; 'highest' is full fp32")
     p.add_argument("--no-truth", action="store_true", help="Do not store the observed frames")
     p.add_argument("--overwrite", action="store_true", help="Recompute existing files")
     p.add_argument("--device", default="cuda")
@@ -410,6 +414,12 @@ def main() -> None:
         level=logging.INFO,
         format=f"%(asctime)s [rank {rank}] %(levelname)s %(message)s",
     )
+    # The sampler state stays fp32; only the matmul inputs are rounded to TF32's
+    # 10 mantissa bits, with fp32 accumulation. Ignored on pre-Ampere cards.
+    matmul_precision = "highest"
+    if device.startswith("cuda") and torch.cuda.get_device_capability(device)[0] >= 8:
+        matmul_precision = args.matmul_precision
+    torch.set_float32_matmul_precision(matmul_precision)
 
     if args.config:
         config = load_config(args.config)
@@ -466,7 +476,8 @@ def main() -> None:
         "split":       args.split,
         "sampler":     sampler,
         "num_steps":   num_steps,
-        "config":      str(args.config or "embedded in the checkpoint"),
+        "matmul_precision": matmul_precision,
+        "config":    str(args.config or "embedded in the checkpoint"),
         "variant":     str(config.get("run", {}).get("variant", "unknown")),
         "run_id":      str(config.get("run", {}).get("run_id", "unknown")),
         "forecast_method": f"autoregressive, {n_post} frames per model call, "
@@ -484,10 +495,10 @@ def main() -> None:
 
     logger.info(
         "Split %r %s .. %s | %d forecasts at local %s (UTC%+g) | "
-        "sampler=%s steps=%d members=%d lead frames=%d (%d calls) | -> %s",
+        "sampler=%s steps=%d members=%d lead frames=%d (%d calls) matmul=%s | -> %s",
         args.split, split_cfg["start"], split_cfg["end"],
         len(anchors), ",".join(init_times), args.utc_offset_hours,
-        sampler, num_steps, members, n_lead, n_lead // n_post, output_dir,
+        sampler, num_steps, members, n_lead, n_lead // n_post, matmul_precision, output_dir,
     )
 
     loader = build_loader(config, args.split, args.batch_size, args.workers,
