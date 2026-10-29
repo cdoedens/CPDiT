@@ -127,18 +127,20 @@ diurnal cycle dominates its variance, and without this the model has to infer
 time of day from the cloud field alone. It comes from the same heliosat product
 and already has statistics in `combined_stats.json`.
 
-> **The archive starts on 2019-04-01.** `petdata.archive.Himawari` reads
-> `/g/data/rv74/.../himawari-ahi/solar/p1s/latest/`, and `latest` is a symlink
-> to `v1.1`, whose first day is 2019-04-01. The `v1.0` tree does hold 2015 to
-> 2019-03 and does contain `solar_elevation`, but the accessor cannot see it, so
-> every request before that date raises `DataNotFoundError`.
+> **The archive runs from 2015-07-07.** The stock `petdata.archive.Himawari`
+> reads only `/g/data/rv74/.../himawari-ahi/solar/p1s/latest/`, a symlink to
+> `v1.1`, which starts 2019-04-01. The pipeline therefore uses
+> `src.petdata.HimawariSolar`, which serves scans before 2019-03-31T18:30 UTC
+> from the `v1.0` tree (2015-07-07 to 2019-03-31; same file names, grid and
+> variables). Note that v1.0 was produced with GFS water vapour and bias
+> correction, v1.1 with ACCESS-G3, so the two are not guaranteed to be
+> statistically identical.
 >
-> This is easy to lose hours to, because it does not look like an error. A
-> priming run with `train.start: 2016-01-01` spent 3.2 of its 3.4 minutes
-> writing 26,232 "known bad" markers, produced nothing, and showed zero batches
-> on the progress bar throughout. The dataset now warns after 200 consecutive
-> unusable anchors, and `--prime-cache` logs an error if a split yields nothing
-> at all. `scripts/probe_data.py` answers the same question in seconds.
+> A split that starts before the archive does not look like an error: every
+> anchor is marked "known bad" and nothing is produced. The dataset warns after
+> 200 consecutive unusable anchors, and `--prime-cache` logs an error if a
+> split yields nothing at all. `scripts/probe_data.py` answers the same
+> question in seconds.
 
 > **Changing the variable list changes the frame cache namespace.** The cache
 > key hashes the full recipe, so new entries land in a fresh directory rather
