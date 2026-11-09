@@ -48,6 +48,56 @@ def channel_names(config: dict) -> list[str]:
             + list(data_cfg.get("barra_vars", ["RH24mean"])))
 
 
+# Pixel pitch of the Himawari solar (p1s) grid, in degrees. The grid is also
+# the model grid: BARRA and the raw bands are regridded onto it.
+DEFAULT_GRID_STEP = 0.02
+
+# Degrees added on every side of `data.region` when fetching from the archives.
+# BARRA (AUST-11, 0.11 deg) is regridded onto the satellite pixels by nearest
+# neighbour, which returns NaN for any pixel beyond the outermost BARRA cell
+# centre. Bounding BARRA to the region itself therefore leaves a strip of NaN
+# along the edges; fetching a margin around it and selecting the region after
+# the regrid does not. One BARRA cell would do; 0.5 deg leaves room.
+DEFAULT_FETCH_MARGIN = 0.5
+
+
+def model_region(config: dict) -> tuple[float, float, float, float]:
+    """
+    ``data.region`` as ``(lat_min, lat_max, lon_min, lon_max)``.
+
+    The values are the centres of the outermost pixels, inclusive, so the
+    region is exactly the frame the model sees -- no further cropping.
+    """
+    data_cfg = config["data"]
+    if "region" not in data_cfg:
+        raise KeyError(
+            "data.region is not set. Give the model domain as [lat_min, lat_max, "
+            "lon_min, lon_max]: the centres of the outermost pixels, inclusive."
+        )
+    region = data_cfg["region"]
+    if len(region) != 4:
+        raise ValueError(f"data.region must be [lat_min, lat_max, lon_min, lon_max], got {region}.")
+    lat_min, lat_max, lon_min, lon_max = (float(v) for v in region)
+    if not (lat_min < lat_max and lon_min < lon_max):
+        raise ValueError(f"data.region must have min < max on both axes, got {region}.")
+    return lat_min, lat_max, lon_min, lon_max
+
+
+def region_shape(config: dict) -> tuple[int, int]:
+    """(n_lat, n_lon) pixels `data.region` spans on the `data.grid_step` grid."""
+    lat_min, lat_max, lon_min, lon_max = model_region(config)
+    step = float(config["data"].get("grid_step", DEFAULT_GRID_STEP))
+    return (int(round((lat_max - lat_min) / step)) + 1,
+            int(round((lon_max - lon_min) / step)) + 1)
+
+
+def fetch_bounds(config: dict) -> list[float]:
+    """`data.region` grown by `data.fetch_margin` on every side, for `Bounding`."""
+    lat_min, lat_max, lon_min, lon_max = model_region(config)
+    m = float(config["data"].get("fetch_margin", DEFAULT_FETCH_MARGIN))
+    return [lat_min - m, lat_max + m, lon_min - m, lon_max + m]
+
+
 def load_config(
     yaml_path: str | Path,
     inputs:    str | Path | None = None,
@@ -176,6 +226,41 @@ def _load_merged(path: Path, _seen: tuple[Path, ...] = ()) -> Dict[str, Any]:
     return _deep_merge(base, config)
 
 
+def _validate_region(config: Dict[str, Any], image_size: int) -> None:
+    """
+    The spatial domain: `data.region` must span exactly image_size pixels.
+
+    Checked here, before any data is touched, because the dataset can only
+    discover a mismatch frame by frame -- and it records each mismatched frame
+    as unusable in the cache, so a typo in the region would quietly poison a
+    whole namespace.
+    """
+    data_cfg = config["data"]
+    legacy = [k for k in ("bounds", "crop_offset") if k in data_cfg]
+    if legacy:
+        raise KeyError(
+            f"data.{' and data.'.join(legacy)} {'is' if len(legacy) == 1 else 'are'} no "
+            "longer used. Set data.region to the model domain itself "
+            "([lat_min, lat_max, lon_min, lon_max], outermost pixel centres, "
+            "inclusive); the pipeline fetches data.fetch_margin degrees around it "
+            "and selects the region after regridding BARRA."
+        )
+    if "region" not in data_cfg:
+        return                      # the dataset insists on it when it is built
+    shape = region_shape(config)
+    if shape != (image_size, image_size):
+        step = float(data_cfg.get("grid_step", DEFAULT_GRID_STEP))
+        raise ValueError(
+            f"data.region {data_cfg['region']} spans {shape[0]} x {shape[1]} pixels "
+            f"at grid_step {step}, but model.image_size is {image_size}. Each "
+            f"side must cover (image_size - 1) * grid_step = "
+            f"{(image_size - 1) * step:.4g} degrees between the outermost pixel centres."
+        )
+    margin = float(data_cfg.get("fetch_margin", DEFAULT_FETCH_MARGIN))
+    if margin < 0:
+        raise ValueError(f"data.fetch_margin must be >= 0, got {margin}.")
+
+
 def _validate(config: Dict[str, Any], require_stats: bool = True) -> None:
     for section in _REQUIRED_SECTIONS:
         if section not in config:
@@ -210,6 +295,8 @@ def _validate(config: Dict[str, Any], require_stats: bool = True) -> None:
     image_size = int(model_cfg["image_size"])
     if image_size % 8 != 0:
         raise ValueError(f"model.image_size must be divisible by 8, got {image_size}.")
+
+    _validate_region(config, image_size)
 
     # The VAE downsamples by 8; the DiT then patchifies the latent map.
     latent_size = image_size // 8
