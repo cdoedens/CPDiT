@@ -26,7 +26,9 @@ import pyearthtools.pipeline as petpipe
 
 # Defined with the config so the channel count can be derived without importing
 # pyearthtools; re-exported here, where the data pipeline's users look for it.
-from src.training.config import channel_names
+from src.training.config import (
+    DEFAULT_FETCH_MARGIN, DEFAULT_GRID_STEP, channel_names, fetch_bounds, model_region,
+)
 
 my_site = 'site_archive_nci'  # 'site_archive_nci' | 'site_archive_jasmin' | 'site_archive_met_office'
 import importlib
@@ -132,22 +134,22 @@ def frame_times(anchor: str, context_length: int, forecast_length: int,
     ]
 
 
-def nearest_hour(stamp: str) -> str:
+def bracketing_hours(stamp: str) -> tuple[str, str, float]:
     """
-    Round a timestamp to the nearest hour.
+    The two BARRA hours either side of a timestamp, and the weight of the later.
 
-    BARRA is hourly and the archive floors a request to the containing hour, so
-    rounding here reproduces the ``method='nearest'`` temporal interpolation the
-    windowed pipeline used to do — and makes each BARRA hour reusable across the
-    six satellite frames that share it.
+    BARRA is hourly, so a 10-minute frame takes ``(1 - w) * h0 + w * h1``:
+    linear interpolation in time. Holding the nearest hour instead gave a flat
+    field with a step between :30 and :40 — a clock artefact the model, which
+    forecasts the BARRA channels too, would otherwise learn to predict.
 
-    Ties round *down*, matching scipy's 'nearest' (which xarray uses) rather
-    than pandas' ``.round``, which is banker's rounding and would send 12:30 to
-    12:00 but 13:30 to 14:00. Satellite frames land exactly on :30 once an hour,
-    so this tie-break decides one frame in six.
+    On the hour, w is 0 and h1 need not be fetched.
     """
-    t = pd.Timestamp(stamp) + pd.Timedelta(minutes=30) - pd.Timedelta(nanoseconds=1)
-    return t.floor("h").strftime("%Y%m%dT%H%M")
+    t  = pd.Timestamp(stamp)
+    h0 = t.floor("h")
+    w  = (t - h0) / pd.Timedelta(hours=1)
+    h1 = h0 + pd.Timedelta(hours=1)
+    return h0.strftime("%Y%m%dT%H%M"), h1.strftime("%Y%m%dT%H%M"), float(w)
 
 
 def _build_date_range(
@@ -221,6 +223,33 @@ class HimawariSolar(petdata.archive.Himawari):
         )
 
 
+def select_region(ds: xr.Dataset, config: dict) -> xr.Dataset:
+    """
+    Cut `data.region` out of a dataset on the satellite grid, by coordinate.
+
+    The region names the outermost pixel centres, inclusive. Matching allows a
+    quarter-pixel tolerance: the grid is stored as float32, so -24.78 comes back
+    as -24.780001 or so, but neighbouring pixels are a whole step away and can
+    never be caught by mistake. The coordinates must be ascending, which the
+    pipelines' `Sort` guarantees.
+    """
+    lat_min, lat_max, lon_min, lon_max = model_region(config)
+    tol = 0.25 * float(config["data"].get("grid_step", DEFAULT_GRID_STEP))
+
+    def _span(coord: str, lo: float, hi: float) -> slice:
+        values = ds[coord].values
+        idx = np.flatnonzero((values >= lo - tol) & (values <= hi + tol))
+        if idx.size == 0:
+            raise ValueError(
+                f"data.region {coord} [{lo}, {hi}] lies outside the fetched grid "
+                f"[{values.min():.4f}, {values.max():.4f}]."
+            )
+        return slice(int(idx[0]), int(idx[-1]) + 1)
+
+    return ds.isel(latitude=_span("latitude", lat_min, lat_max),
+                   longitude=_span("longitude", lon_min, lon_max))
+
+
 def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipeline]:
     """
     Two pipelines that each return a SINGLE timestamp.
@@ -232,10 +261,13 @@ def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipe
     frames individually lets the cache store each timestamp once, which removes
     that redundancy from the expensive cold pass.
 
+    Both are bounded to `data.region` plus `data.fetch_margin` on every side;
+    `select_region` cuts the region itself out once BARRA has been regridded.
+
     Must be called inside the consuming process: the pipeline is not fork-safe.
     """
     data_cfg = config["data"]
-    bounds   = data_cfg.get("bounds", [-35, -28.5, 145, 151.5])
+    bounds   = fetch_bounds(config)
 
     sat = petpipe.Pipeline(
         HimawariSolar(
@@ -449,8 +481,11 @@ def _cache_namespace(config: dict) -> str:
         "barra_vars":    list(data_cfg.get("barra_vars", [])),
         "barra_domain":  data_cfg.get("barra_domain"),
         "barra_freq":    data_cfg.get("barra_freq"),
-        "bounds":        list(data_cfg.get("bounds", [])),
-        "crop_offset":   data_cfg.get("crop_offset", 10),
+        # The frame is exactly data.region. The margin is included because
+        # too small a margin changes the edge pixels (NaN BARRA), even though
+        # an adequate one never changes anything.
+        "region":        [float(v) for v in model_region(config)],
+        "fetch_margin":  float(data_cfg.get("fetch_margin", DEFAULT_FETCH_MARGIN)),
         "image_size":    config["model"].get("image_size", 256),
         # NB: n_prior_sat / n_post are deliberately NOT part of the key. A
         # frame is independent of the window it lands in, so changing the
@@ -463,7 +498,10 @@ def _cache_namespace(config: dict) -> str:
         # 3: channels stacked in the configured order. Version 2 frames were
         #    stacked in the archive's `data_vars` order, which varies between
         #    fetches, so a fraction of them have their channels permuted.
-        "version":       3,
+        # 4: BARRA interpolated linearly in time, not held at the nearest hour.
+        # 5: the frame is data.region selected by coordinate, replacing
+        #    bounds + crop_offset index slicing.
+        "version":       5,
     }
     # Added only when set, so configs without bands keep their existing cache.
     bands = list(data_cfg.get("himawari_bands", []))
@@ -698,7 +736,7 @@ class PipelineDataset(IterableDataset):
         self.context_length  = data_cfg.get("n_prior_sat", 12)
         self.forecast_length = data_cfg.get("n_post", 1)
         self.image_size      = config["model"].get("image_size", 256)
-        self.crop_offset     = data_cfg.get("crop_offset", 10)
+        self.region          = model_region(config)   # fails early when unset
         self.bands           = list(data_cfg.get("himawari_bands", []))
 
         # Adding a variable or band to the data block without updating the
@@ -817,44 +855,61 @@ class PipelineDataset(IterableDataset):
                 out[band] = (("latitude", "longitude"), self._band_regridder(da, proj4))
         return xr.Dataset(out, coords={"latitude": latitude, "longitude": longitude})
 
+    def _barra_hour(self, hour: str) -> xr.Dataset:
+        """
+        One normalised BARRA hour. Each hour feeds the twelve satellite frames
+        either side of it, so it is memoised rather than refetched per frame.
+        """
+        bar = self._bar_memo.get(hour)
+        if bar is None:
+            bar = self._bar_pipe[hour].isel(time=0, drop=True)
+            bar = self._normalise(bar.copy())
+            if len(self._bar_memo) >= 8:        # a couple of hours either side
+                self._bar_memo.clear()
+            self._bar_memo[hour] = bar
+        return bar
+
     def _fetch_frame(self, stamp: str) -> Optional[torch.Tensor]:
         """
-        Build one (C, H, W) frame: fetch, normalise, regrid BARRA, crop, add
-        the raw bands, stack.
+        Build one (C, H, W) frame: fetch, select `data.region`, normalise,
+        regrid BARRA onto it, add the raw bands, stack.
 
         Returns None when the frame is unusable (wrong shape, or NaN — which is
         what the irradiance field is at night). Raises only on genuinely
         unexpected errors; missing data is reported as None by the caller.
         """
         sat = self._sat_pipe[stamp].isel(time=0, drop=True)
-
-        # BARRA is hourly and shared by the six satellite frames in each hour,
-        # so it is memoised per hour rather than refetched per frame.
-        hour = nearest_hour(stamp)
-        bar = self._bar_memo.get(hour)
-        if bar is None:
-            bar = self._bar_pipe[hour].isel(time=0, drop=True)
-            if len(self._bar_memo) >= 8:        # a couple of hours either side
-                self._bar_memo.clear()
-            self._bar_memo[hour] = bar
-
+        # The satellite grid is the model grid, so the region is cut here and
+        # everything else is regridded straight onto it. BARRA was fetched with
+        # a margin, so it covers every region pixel (see DEFAULT_FETCH_MARGIN).
+        sat = select_region(sat, self.config)
         sat = self._normalise(sat.copy())
-        bar = self._normalise(bar.copy())
 
-        # Spatial regrid only: the temporal 'nearest' is already handled by
-        # rounding the request to the nearest hour.
+        # Linear in time between the bracketing hours. The z-score is affine,
+        # so blending normalised fields equals blending the raw ones.
+        h0, h1, w = bracketing_hours(stamp)
+        bar = self._barra_hour(h0)
+        if w > 0:
+            bar = (1 - w) * bar + w * self._barra_hour(h1)
+
+        # Spatial regrid only: the temporal interpolation is done above.
         bar_interp = bar.interp(
             latitude=sat.latitude, longitude=sat.longitude, method="nearest"
         )
+        # NaN BARRA on the region means the fetch margin did not cover it -- a
+        # configuration error affecting every frame alike. Raised rather than
+        # returned as None, so it is not written to the cache as a bad frame.
+        nan_vars = [v for v in bar_interp.data_vars
+                    if bool(np.isnan(bar_interp[v].values).any())]
+        if nan_vars:
+            raise ValueError(
+                f"BARRA {nan_vars} has NaN on data.region at {stamp}. Either the "
+                f"fetched BARRA does not cover the region (increase "
+                f"data.fetch_margin) or the variable itself is undefined there."
+            )
         combined = xr.merge([sat, bar_interp])
 
-        o = self.crop_offset
-        combined = combined.isel(
-            latitude  = slice(o, o + self.image_size),
-            longitude = slice(o, o + self.image_size),
-        )
-
-        # The bands are sampled straight onto the cropped grid: they have no
+        # The bands are sampled straight onto the region's grid: they have no
         # lat/lon coordinates of their own to bound or crop by.
         if self.bands:
             bands = self._fetch_bands(
