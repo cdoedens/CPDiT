@@ -28,7 +28,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.petdata import PipelineDataset, blocked_utc_hours   # noqa: E402
+from src.petdata import PipelineDataset, blocked_utc_hours, select_region   # noqa: E402
 from src.training.config import load_config                  # noqa: E402
 
 logger = logging.getLogger("calc_band_stats")
@@ -70,7 +70,6 @@ def main() -> None:
     config["model"].pop("image_channels", None)
     ds = PipelineDataset("train", config, shuffle=False)
     ds._open_pipelines()
-    size, o = ds.image_size, ds.crop_offset
 
     total = {b: 0.0 for b in bands}
     total_sq = {b: 0.0 for b in bands}
@@ -83,7 +82,7 @@ def main() -> None:
             # The irradiance frame supplies the model grid and, being NaN at
             # night, keeps the sample to frames training would accept.
             sat = ds._sat_pipe[stamp].isel(time=0, drop=True)
-            sat = sat.isel(latitude=slice(o, o + size), longitude=slice(o, o + size))
+            sat = select_region(sat, config)
             if np.isnan(sat[ds.config["data"]["himawari_vars"][0]].values).any():
                 continue
             raw = ds._fetch_bands(stamp, sat["latitude"].values, sat["longitude"].values)
