@@ -141,12 +141,27 @@ data:
   # verifies against an interpolated frame. [] disables.
   interpolate_gap_times: ["02:40"]
 
-  bounds:       [-35, -22, 138.5, 151.5]
-  crop_offset:  10               # Pixels trimmed from the bounded region edge
+  # Model domain: [lat_min, lat_max, lon_min, lon_max], the centres of the
+  # outermost pixels, inclusive. This IS the frame, with no further cropping:
+  # each side must span (image_size - 1) * grid_step degrees, which load_config
+  # checks. MEASURED on the Himawari solar grid (v1.0 and v1.1): exactly
+  # 512 x 512 pixels, no NaN — Sydney and as much ocean as fits inside the
+  # product's fixed open-ocean NaN footprint.
+  region:       [-35.0, -24.78, 141.68, 151.90]
+  grid_step:    0.02             # Himawari solar p1s pixel pitch, degrees
+  # Degrees fetched beyond the region on every side. BARRA is regridded onto
+  # the satellite pixels by nearest neighbour, which is NaN past the outermost
+  # BARRA cell centre, so BARRA must extend past the region before it is cut.
+  # One AUST-11 cell (0.11 deg) is enough.
+  fetch_margin: 0.5
   irradiance_channel: 0          # Channel scored by the pixel-space metrics
 
   barra_domain: "AUST-11"
   barra_freq:   "1hr"
+  # BARRA is interpolated linearly in time onto the satellite timestep, which
+  # reads up to 50 min past each frame. That suits instantaneous fields stamped
+  # on the hour. Hourly means/accumulations may be stamped at their interval
+  # centre or end (check time_bnds): those would be shifted by up to 30 min.
   # INPUT VARIABLES (himawari_vars, himawari_bands, barra_vars) are not set
   # here. Each model variant has its own inputs file in configs/inputs/, passed
   # with --inputs; see configs/inputs/README.md.
