@@ -1,0 +1,18 @@
+# Combined: uses all variables from the other configs
+
+data:
+  himawari_vars:
+    - surface_global_irradiance   # first: data.irradiance_channel is 0
+    - solar_elevation
+  himawari_bands:
+    - OBS_B04
+    - OBS_B06
+    - OBS_B08
+    - OBS_B09
+    - OBS_B10
+    - OBS_B13
+  barra_vars: 
+    - k-index   # need to add calculation of k-index to dataloading pipeline
+    - hus500
+    - TCD       # need to add calculation of TCD to dataloading pipeline
+    - zg500

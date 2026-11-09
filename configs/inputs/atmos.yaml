@@ -1,0 +1,12 @@
+# Atmos: adds BARRA variables to the baseline config
+
+data:
+  himawari_vars:
+    - surface_global_irradiance   # first: data.irradiance_channel is 0
+    - solar_elevation
+  himawari_bands: []
+  barra_vars: 
+    - k-index   # need to add calculation of k-index to dataloading pipeline
+    - hus500
+    - TCD       # need to add calculation of TCD to dataloading pipeline
+    - zg500

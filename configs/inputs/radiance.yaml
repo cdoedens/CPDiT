@@ -1,0 +1,14 @@
+# Radiance: include himawari bands in addition to the baseline config
+
+data:
+  himawari_vars:
+    - surface_global_irradiance   # first: data.irradiance_channel is 0
+    - solar_elevation
+  himawari_bands:
+    - OBS_B04
+    - OBS_B06
+    - OBS_B08
+    - OBS_B09
+    - OBS_B10
+    - OBS_B13
+  barra_vars: []
