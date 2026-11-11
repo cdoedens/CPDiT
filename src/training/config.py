@@ -112,8 +112,8 @@ def load_config(
     used for the run directory. ``model.image_channels`` is derived from the
     resulting channel list, so it never has to be kept in step by hand.
 
-    ``require_stats=False`` skips the check that every channel has
-    normalisation statistics, for the scripts that compute them.
+    ``require_stats=False`` skips the check that the statistics file exists
+    and covers every channel, for the script that computes it.
 
     Returns the raw nested dict. All downstream code accesses it via
     config["section"]["key"] — no dataclass translation layer.
@@ -420,6 +420,8 @@ def _validate(config: Dict[str, Any], require_stats: bool = True) -> None:
             f"model.latent_scale must be a number, null or 'auto'; got {latent_scale!r}."
         )
 
+    if not require_stats:
+        return
     stats_path = Path(config["data"]["stats_path"])
     if not stats_path.exists():
         raise FileNotFoundError(
@@ -427,8 +429,6 @@ def _validate(config: Dict[str, Any], require_stats: bool = True) -> None:
             f"Run scripts/calc_norm_stats.py first."
         )
 
-    if not require_stats:
-        return
     # Caught here rather than in the dataloader, where a missing entry fails
     # every frame inside a worker and reads as a stream that yields nothing.
     import json
@@ -438,7 +438,6 @@ def _validate(config: Dict[str, Any], require_stats: bool = True) -> None:
     missing = [v for v in channel_names(config) if v not in stats]
     if missing:
         raise KeyError(
-            f"No normalisation statistics for {missing} in {stats_path}. For "
-            f"Himawari bands run: python scripts/calc_band_stats.py --config "
-            f"<cfg> --inputs <inputs>."
+            f"No normalisation statistics for {missing} in {stats_path}. Run: "
+            f"python scripts/calc_norm_stats.py --config <cfg> --inputs <inputs>."
         )

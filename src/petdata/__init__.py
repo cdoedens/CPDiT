@@ -250,9 +250,10 @@ def select_region(ds: xr.Dataset, config: dict) -> xr.Dataset:
                    longitude=_span("longitude", lon_min, lon_max))
 
 
-def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipeline]:
+def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, "BarraSource"]:
     """
-    Two pipelines that each return a SINGLE timestamp.
+    The two sources that each return a SINGLE timestamp: the Himawari solar
+    pipeline and the BARRA source.
 
     This is the change that makes frame-level caching possible. The previous
     design fetched a whole 15-frame window per sample via TemporalWindow, but
@@ -280,20 +281,164 @@ def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipe
         petdata.transform.region.Bounding(*bounds),
         exceptions_to_ignore=petdata.exceptions.DataNotFoundError,
     )
+    return sat, BarraSource(config)
 
-    bar = petpipe.Pipeline(
-        petdata.archive.BARRA_V2(
-            data_cfg.get("barra_vars", ["RH24mean"]),
-            domain_id = data_cfg.get("barra_domain", "AUST-11"),
-            frequency = data_cfg.get("barra_freq", "1hr"),
-        ),
-        petdata.transforms.coordinates.Drop("crs"),
-        petpipe.operations.xarray.Sort(order=['time', 'latitude', 'longitude']),
-        petpipe.operations.xarray.AlignDataVariableDimensionsToDatasetCoords(),
-        petdata.transform.region.Bounding(*bounds),
-        exceptions_to_ignore=petdata.exceptions.DataNotFoundError,
+
+# ---------------------------------------------------------------------------
+# BARRA
+# ---------------------------------------------------------------------------
+# `data.barra_vars` names what the model is fed, which is not always what the
+# archive stores:
+#
+#   * Some inputs are DERIVED from several archive fields (BARRA_DERIVED).
+#   * The archive splits BARRA-R2 over two domain ids on the same 0.11 deg
+#     grid: the convective diagnostics (RH24mean, MUEL, MULCL, ...) are under
+#     AUST-11 and the pressure-level fields (ta500, hus700, zg500, ...) under
+#     AUS-11. MEASURED over the training region: identical lat/lon.
+#   * The accessor renames a pressure-level field to its base name with a
+#     `pressure` dimension (hus500 -> `hus`), and refuses a request that mixes
+#     levels (['ta500', 'ta700'] raises DataNotFoundError).
+#
+# So every archive field gets its own single-variable pipeline, on whichever
+# domain serves it, and comes back under the name it was asked for.
+
+# Domains tried for each archive field, after `data.barra_domain`.
+BARRA_DOMAINS = ("AUST-11", "AUS-11")
+
+# Derived inputs -> the archive fields each is computed from.
+BARRA_DERIVED: dict[str, tuple[str, ...]] = {
+    # K-index: (T850 - T500) + Td850 - (T700 - Td700).
+    "KI":  ("ta850", "ta700", "ta500", "hus850", "hus700"),
+    # Total cloud depth: most-unstable equilibrium level - lifting condensation level.
+    "TCD": ("MUEL", "MULCL"),
+}
+# Part of the frame-cache key for configs that use a derived input. Bump it
+# when a definition in `derive_barra` changes.
+BARRA_DERIVED_VERSION = 1
+
+
+def barra_archive_vars(variables: list[str]) -> list[str]:
+    """The archive fields needed to produce `variables`, each listed once."""
+    needed: list[str] = []
+    for var in variables:
+        for raw in BARRA_DERIVED.get(var, (var,)):
+            if raw not in needed:
+                needed.append(raw)
+    return needed
+
+
+def _dewpoint(hus: np.ndarray, pressure_hpa: float) -> np.ndarray:
+    """Dew point (K) from specific humidity (kg/kg) on one pressure level."""
+    from metpy.calc import dewpoint_from_specific_humidity
+    from metpy.units import units
+
+    dewpoint = dewpoint_from_specific_humidity(
+        pressure_hpa * units.hPa, units.Quantity(hus, "dimensionless")
     )
-    return sat, bar
+    return np.asarray(dewpoint.to("K").magnitude)
+
+
+def derive_barra(name: str, raw: dict[str, np.ndarray]) -> np.ndarray:
+    """
+    One derived BARRA input from its archive fields (see BARRA_DERIVED).
+
+    Temperatures and dew points are all in kelvin, so KI is the conventional
+    (Celsius) K-index plus 273.15. The offset is absorbed by the z-score.
+    """
+    if name == "KI":
+        dp850 = _dewpoint(raw["hus850"], 850)
+        dp700 = _dewpoint(raw["hus700"], 700)
+        return raw["ta850"] - raw["ta500"] + dp850 - (raw["ta700"] - dp700)
+    if name == "TCD":
+        # MUEL is NaN wherever the most-unstable parcel has no CAPE and hence
+        # no equilibrium level (MEASURED: 56% of the region at 20200105T0300),
+        # and a NaN anywhere would reject the whole frame. No equilibrium
+        # level means no convective cloud layer, so the depth there is 0.
+        depth = raw["MUEL"] - raw["MULCL"]
+        return np.where(np.isnan(raw["MUEL"]), 0.0, depth)
+    raise KeyError(f"No definition for derived BARRA variable {name!r}.")
+
+
+class BarraSource:
+    """
+    The configured `data.barra_vars` at one BARRA time, in physical units.
+
+    ``source[hour]`` returns a (latitude, longitude) dataset holding exactly
+    the configured variables: archive fields under their config names, and the
+    derived ones computed from theirs. An archive field needed more than once
+    is fetched once.
+
+    Must be built inside the consuming process: the pipelines are not fork-safe.
+    """
+
+    def __init__(self, config: dict):
+        data_cfg = config["data"]
+        self.variables = list(data_cfg.get("barra_vars", ["RH24mean"]))
+        self._frequency = data_cfg.get("barra_freq", "1hr")
+        self._bounds = fetch_bounds(config)
+        preferred = data_cfg.get("barra_domain", BARRA_DOMAINS[0])
+        self._domains = [preferred] + [d for d in BARRA_DOMAINS if d != preferred]
+        self.domains: dict[str, str] = {}      # archive field -> domain serving it
+        self._pipes = {var: self._pipeline(var)
+                       for var in barra_archive_vars(self.variables)}
+
+    def _pipeline(self, var: str) -> petpipe.Pipeline:
+        first_error: Optional[Exception] = None
+        for domain in self._domains:
+            try:
+                accessor = petdata.archive.BARRA_V2(
+                    [var], domain_id=domain, frequency=self._frequency
+                )
+            except Exception as exc:  # noqa: BLE001 - not served by this domain
+                first_error = first_error or exc
+                continue
+            self.domains[var] = domain
+            return petpipe.Pipeline(
+                accessor,
+                petdata.transforms.coordinates.Drop("crs"),
+                petpipe.operations.xarray.Sort(order=['time', 'latitude', 'longitude']),
+                petpipe.operations.xarray.AlignDataVariableDimensionsToDatasetCoords(),
+                petdata.transform.region.Bounding(*self._bounds),
+                exceptions_to_ignore=petdata.exceptions.DataNotFoundError,
+            )
+        raise ValueError(
+            f"BARRA variable {var!r} is not served by any of the domains "
+            f"{self._domains} at frequency {self._frequency!r}: {first_error}"
+        ) from first_error
+
+    def _field(self, var: str, time: str) -> xr.DataArray:
+        ds = self._pipes[var][time]
+        names = list(ds.data_vars)
+        if len(names) != 1:
+            raise petdata.exceptions.DataNotFoundError(
+                f"Expected one variable for BARRA {var} at {time}, found {names}."
+            )
+        da = ds[names[0]]
+        # Drop time and the length-1 level dimension of pressure-level fields.
+        for dim in [d for d in da.dims if d not in ("latitude", "longitude")]:
+            da = da.isel({dim: 0}, drop=True)
+        return da.transpose("latitude", "longitude")
+
+    def __getitem__(self, time: str) -> xr.Dataset:
+        raw: dict[str, np.ndarray] = {}
+        latitude = longitude = None
+        for var in self._pipes:
+            da = self._field(var, time)
+            if latitude is None:
+                latitude, longitude = da["latitude"].values, da["longitude"].values
+            elif not (da.shape == (latitude.size, longitude.size)
+                      and np.allclose(da["latitude"].values, latitude)
+                      and np.allclose(da["longitude"].values, longitude)):
+                raise ValueError(
+                    f"BARRA {var} ({self.domains[var]}) is not on the same grid "
+                    f"as the other BARRA variables at {time}."
+                )
+            raw[var] = da.values.astype(np.float64)
+
+        out = {var: (("latitude", "longitude"),
+                     derive_barra(var, raw) if var in BARRA_DERIVED else raw[var])
+               for var in self.variables}
+        return xr.Dataset(out, coords={"latitude": latitude, "longitude": longitude})
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +465,10 @@ def _build_frame_pipelines(config: dict) -> tuple[petpipe.Pipeline, petpipe.Pipe
 # anything finer -- nearest-neighbour sampling at 500 m would only alias.
 
 BAND_GRID_METRES = 2000
-# Native resolution of the bands that are not at 2 km.
-_BAND_RESOLUTION = {"B01": 1000, "B02": 1000, "B03": 500}
+# Native resolution of the bands that are not at 2 km. A band missing from here
+# is grouped with the 2 km ones, and the accessor does not refuse the mix: it
+# outer-joins the two grids, leaving every band NaN at the other's pixels.
+_BAND_RESOLUTION = {"B01": 1000, "B02": 1000, "B03": 500, "B04": 1000}
 
 
 def band_groups(bands: list[str]) -> list[list[str]]:
@@ -507,6 +654,9 @@ def _cache_namespace(config: dict) -> str:
     bands = list(data_cfg.get("himawari_bands", []))
     if bands:
         recipe["himawari_bands"] = bands
+    # Likewise for derived BARRA inputs, whose definitions are code.
+    if any(v in BARRA_DERIVED for v in recipe["barra_vars"]):
+        recipe["barra_derived"] = BARRA_DERIVED_VERSION
     blob = json.dumps(recipe, sort_keys=True).encode()
     return hashlib.sha1(blob).hexdigest()[:16]
 
@@ -724,7 +874,7 @@ class PipelineDataset(IterableDataset):
     """
 
     def __init__(self, split: str, config: dict, shuffle: bool = False,
-                 prime_mode: bool = False):
+                 prime_mode: bool = False, stats: Optional[dict] = None):
         super().__init__()
         self.split  = split
         self.config = config
@@ -749,9 +899,12 @@ class PipelineDataset(IterableDataset):
                 f"{len(channel_names(config))} channels: {channel_names(config)}."
             )
 
-        # Load normalisation statistics once, not once per epoch.
-        with open(data_cfg["stats_path"]) as f:
-            self.stats = json.load(f)
+        # Load normalisation statistics once, not once per epoch. `stats`
+        # overrides the file, for the script that computes it.
+        if stats is None:
+            with open(data_cfg["stats_path"]) as f:
+                stats = json.load(f)
+        self.stats = stats
 
         loader_cfg          = config.get("dataloader", {})
         self.shuffle        = shuffle
@@ -823,7 +976,7 @@ class PipelineDataset(IterableDataset):
                 raise KeyError(
                     f"No normalisation statistics for variable '{var}' in "
                     f"{self.config['data']['stats_path']}. "
-                    f"Re-run scripts/calc_norm_stats.py."
+                    f"Run scripts/calc_norm_stats.py --only-missing."
                 )
             mean = self.stats[var]["mean"]
             std  = self.stats[var]["std"]
@@ -835,7 +988,7 @@ class PipelineDataset(IterableDataset):
         Build the archive pipelines. Must run in the consuming process: the
         pipeline is not fork-safe.
         """
-        self._sat_pipe, self._bar_pipe = _build_frame_pipelines(self.config)
+        self._sat_pipe, self._bar_source = _build_frame_pipelines(self.config)
         self._band_accessors = _build_band_accessors(self.config)
         self._band_regridder: Optional[BandRegridder] = None
         self._bar_memo = {}
@@ -857,13 +1010,13 @@ class PipelineDataset(IterableDataset):
 
     def _barra_hour(self, hour: str) -> xr.Dataset:
         """
-        One normalised BARRA hour. Each hour feeds the twelve satellite frames
+        One normalised BARRA hour: the configured variables, derived ones
+        included (they are computed per hour, then blended). Each hour feeds the twelve satellite frames
         either side of it, so it is memoised rather than refetched per frame.
         """
         bar = self._bar_memo.get(hour)
         if bar is None:
-            bar = self._bar_pipe[hour].isel(time=0, drop=True)
-            bar = self._normalise(bar.copy())
+            bar = self._normalise(self._bar_source[hour])
             if len(self._bar_memo) >= 8:        # a couple of hours either side
                 self._bar_memo.clear()
             self._bar_memo[hour] = bar
@@ -885,29 +1038,31 @@ class PipelineDataset(IterableDataset):
         sat = select_region(sat, self.config)
         sat = self._normalise(sat.copy())
 
-        # Linear in time between the bracketing hours. The z-score is affine,
-        # so blending normalised fields equals blending the raw ones.
-        h0, h1, w = bracketing_hours(stamp)
-        bar = self._barra_hour(h0)
-        if w > 0:
-            bar = (1 - w) * bar + w * self._barra_hour(h1)
+        combined = sat
+        if self._bar_source.variables:
+            # Linear in time between the bracketing hours. The z-score is
+            # affine, so blending normalised fields equals blending the raw ones.
+            h0, h1, w = bracketing_hours(stamp)
+            bar = self._barra_hour(h0)
+            if w > 0:
+                bar = (1 - w) * bar + w * self._barra_hour(h1)
 
-        # Spatial regrid only: the temporal interpolation is done above.
-        bar_interp = bar.interp(
-            latitude=sat.latitude, longitude=sat.longitude, method="nearest"
-        )
-        # NaN BARRA on the region means the fetch margin did not cover it -- a
-        # configuration error affecting every frame alike. Raised rather than
-        # returned as None, so it is not written to the cache as a bad frame.
-        nan_vars = [v for v in bar_interp.data_vars
-                    if bool(np.isnan(bar_interp[v].values).any())]
-        if nan_vars:
-            raise ValueError(
-                f"BARRA {nan_vars} has NaN on data.region at {stamp}. Either the "
-                f"fetched BARRA does not cover the region (increase "
-                f"data.fetch_margin) or the variable itself is undefined there."
+            # Spatial regrid only: the temporal interpolation is done above.
+            bar_interp = bar.interp(
+                latitude=sat.latitude, longitude=sat.longitude, method="nearest"
             )
-        combined = xr.merge([sat, bar_interp])
+            # NaN BARRA on the region means the fetch margin did not cover it --
+            # a configuration error affecting every frame alike. Raised rather
+            # than returned as None, so it is not cached as a bad frame.
+            nan_vars = [v for v in bar_interp.data_vars
+                        if bool(np.isnan(bar_interp[v].values).any())]
+            if nan_vars:
+                raise ValueError(
+                    f"BARRA {nan_vars} has NaN on data.region at {stamp}. Either the "
+                    f"fetched BARRA does not cover the region (increase "
+                    f"data.fetch_margin) or the variable itself is undefined there."
+                )
+            combined = xr.merge([sat, bar_interp])
 
         # The bands are sampled straight onto the region's grid: they have no
         # lat/lon coordinates of their own to bound or crop by.
