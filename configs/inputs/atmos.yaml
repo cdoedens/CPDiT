@@ -2,11 +2,11 @@
 
 data:
   himawari_vars:
-    - surface_global_irradiance   # first: data.irradiance_channel is 0
+    - surface_global_irradiance
     - solar_elevation
   himawari_bands: []
   barra_vars: 
-    - k-index   # need to add calculation of k-index to dataloading pipeline
-    - hus500
-    - TCD       # need to add calculation of TCD to dataloading pipeline
-    - zg500
+    - KI        # k-index = T850 - T500 + Td850 - (T700 - Td700)
+    - hus500    # 500 hPa specific humidity
+    - TCD       # Total cloud depth = equillibrium level - lifting condensation level
+    - zg500     # 500 hPa geopotential height

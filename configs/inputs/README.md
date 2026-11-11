@@ -19,9 +19,16 @@ per stage; `--init-from stage1_vae` resolves to that variant's latest stage-1
 
 A new variant needs, before training:
 
-1. Statistics for any variable not yet in `data.stats_path`. For Himawari bands,
-   `scripts/calc_band_stats.py --config configs/train_base.yaml --inputs <file>`.
-   `load_config` refuses a config whose channels have no statistics.
+1. Statistics for any variable not yet in `data.stats_path`:
+   `python scripts/calc_norm_stats.py --inputs <file> --only-missing`
+   (without arguments it recomputes every variable of every variant here, which
+   starts a new frame cache for all of them). `load_config` refuses a config
+   whose channels have no statistics.
 2. A primed frame cache (optional but ~20x faster): the input list is part of
    the cache key, so each variant has its own.
    `INPUTS=configs/inputs/<variant>.yaml bash scripts/prime_cache.sh`
+
+`barra_vars` takes any BARRA-R2 hourly variable, from either the AUST-11
+(convective diagnostics) or AUS-11 (pressure levels, e.g. `hus500`) domain, and
+the derived variables `KI` and `TCD`, which the dataloader computes from their
+archive fields (see `BARRA_DERIVED` in `src/petdata/__init__.py`).

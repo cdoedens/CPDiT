@@ -2,13 +2,13 @@
 
 data:
   himawari_vars:
-    - surface_global_irradiance   # first: data.irradiance_channel is 0
+    - surface_global_irradiance
     - solar_elevation
   himawari_bands:
-    - OBS_B04
-    - OBS_B06
-    - OBS_B08
-    - OBS_B09
-    - OBS_B10
-    - OBS_B13
+    - OBS_B04     # 0.86 µm
+    - OBS_B06     # 2.3 µm
+    - OBS_B08     # 6.2 µm
+    - OBS_B09     # 6.9 µm
+    - OBS_B10     # 7.3 µm
+    - OBS_B13     # 10.4 µm
   barra_vars: []
